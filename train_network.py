@@ -30,6 +30,7 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.custom_train_functions import (
+    apply_p2_weight,
     apply_snr_weight,
     get_weighted_text_embeddings,
     prepare_scheduler_for_custom_training,
@@ -849,7 +850,7 @@ class NetworkTrainer:
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, noise_scheduler, latents, global_step
                     )
 
                     # ensure the hidden state will require grad
@@ -888,13 +889,26 @@ class NetworkTrainer:
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
 
+                    skip_double_debiased = False
+
+                    if args.p2_loss_weight:
+                        if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
+                            skip_double_debiased = True
+                        else:
+                            loss = apply_p2_weight(loss, timesteps, noise_scheduler, args.p2_loss_weight, args.v_parameterization)
                     if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+                        if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
+                            skip_double_debiased = True
+                        else:
+                            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
                     if args.scale_v_pred_loss_like_noise_pred:
                         loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
                     if args.v_pred_like_loss:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                    if args.debiased_estimation_loss:
+                    if skip_double_debiased == True:
+                        if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
+                            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                    if args.debiased_estimation_loss and skip_double_debiased == False:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
