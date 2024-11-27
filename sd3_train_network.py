@@ -312,6 +312,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        global_step=None
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
@@ -380,7 +381,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
         return model_pred, target, timesteps, weighting
 
-    def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+    def post_process_loss(self, loss, args, timesteps, noise_scheduler, global_step=None):
         return loss
 
     def get_sai_model_spec(self, args):

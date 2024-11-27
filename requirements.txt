@@ -7,7 +7,10 @@ opencv-python==4.8.1.78
 einops==0.7.0
 pytorch-lightning==1.9.0
 bitsandbytes==0.44.0
-prodigyopt==1.0
+# prodigyopt==1.0
+git+https://github.com/konstmish/prodigy
+# For prodigy plus schedule free.
+git+https://github.com/LoganBooker/prodigy-plus-schedule-free
 lion-pytorch==0.0.6
 schedulefree==1.4
 tensorboard
@@ -33,7 +36,7 @@ imagesize==1.4.1
 # for cuda 12.1(default 11.8)
 # onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
-# this is for onnx: 
+# this is for onnx:
 # protobuf==3.20.3
 # open clip for SDXL
 # open-clip-torch==2.20.0

@@ -4887,7 +4887,7 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             import schedulefree as sf
         except ImportError:
             raise ImportError("No schedulefree / schedulefreeがインストールされていないようです")
-        
+
         if optimizer_type == "RAdamScheduleFree".lower():
             optimizer_class = sf.RAdamScheduleFree
             logger.info(f"use RAdamScheduleFree optimizer | {optimizer_kwargs}")
@@ -4897,6 +4897,10 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         elif optimizer_type == "SGDScheduleFree".lower():
             optimizer_class = sf.SGDScheduleFree
             logger.info(f"use SGDScheduleFree optimizer | {optimizer_kwargs}")
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            import prodigyplus as pf
+            optimizer_class = pf.ProdigyPlusScheduleFree
+            logger.info(f"use ProdigyPlusSchudleFree optimizer | {optimizer_kwargs}")
         else:
             optimizer_class = None
 
@@ -5838,13 +5842,25 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep, max_timestep, b_size, device):
+def get_timesteps(min_timestep, max_timestep, b_size, device, loss_type=None, global_step=None):
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+
+    if loss_type == "l2":
+        if global_step:
+            m = torch.distributions.LogNormal(0 + (0.65 - 0) * (global_step / args.max_train_steps), 1)
+        else:
+            m = torch.distributions.LogNormal(0.65, 1)
+        timesteps = m.sample((b_size,)).to(device) * 250
+        while torch.any(timesteps > max_timestep - 1):
+            timesteps = m.sample((b_size,)).to(device) * 250
+        timesteps = torch.round(timesteps)
+
     timesteps = timesteps.long().to(device)
+
     return timesteps
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, global_step=None):
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
@@ -5863,7 +5879,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.loss_type, global_step)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
