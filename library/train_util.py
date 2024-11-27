@@ -4884,6 +4884,10 @@ def get_optimizer(args, trainable_params):
         elif optimizer_type == "SGDScheduleFree".lower():
             optimizer_class = sf.SGDScheduleFree
             logger.info(f"use SGDScheduleFree optimizer | {optimizer_kwargs}")
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            import prodigyplus as pf
+            optimizer_class = pf.ProdigyPlusScheduleFree
+            logger.info(f"use ProdigyPlusSchudleFree optimizer | {optimizer_kwargs}")
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -5821,7 +5825,7 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device):
+def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device, global_step=None):
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
 
     if args.loss_type == "huber" or args.loss_type == "smooth_l1":
@@ -5839,6 +5843,15 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
         huber_c = huber_c.to(device)
     elif args.loss_type == "l2":
         huber_c = None  # may be anything, as it's not used
+
+        if global_step:
+            m = torch.distributions.LogNormal(0 + (0.65 - 0) * (global_step / args.max_train_steps), 1)
+        else:
+            m = torch.distributions.LogNormal(0.65, 1)
+        timesteps = m.sample((b_size,)).to(device) * 250
+        while torch.any(timesteps > max_timestep - 1):
+            timesteps = m.sample((b_size,)).to(device) * 250
+        timesteps = torch.round(timesteps)
     else:
         raise NotImplementedError(f"Unknown loss type {args.loss_type}")
 
@@ -5846,7 +5859,7 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     return timesteps, huber_c
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, global_step=None):
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
@@ -5865,7 +5878,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
+    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device, global_step)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)

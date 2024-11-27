@@ -28,7 +28,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
 
     def assert_extra_args(self, args, train_dataset_group):
-        super().assert_extra_args(args, train_dataset_group)
+        # super().assert_extra_args(args, train_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
 
         if args.fp8_base_unet:
@@ -330,6 +330,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        global_step=None
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
@@ -470,7 +471,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         return model_pred, target, timesteps, None, weighting
 
-    def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+    def post_process_loss(self, loss, args, timesteps, noise_scheduler, global_step=None):
         return loss
 
     def get_sai_model_spec(self, args):
