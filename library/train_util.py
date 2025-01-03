@@ -5892,12 +5892,12 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep, max_timestep, b_size, device, loss_type=None, global_step=None):
+def get_timesteps(min_timestep, max_timestep, b_size, device, loss_type=None, global_step=None, max_train_steps=None):
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
 
     if loss_type == "l2":
-        if global_step:
-            m = torch.distributions.LogNormal(0 + (0.65 - 0) * (global_step / args.max_train_steps), 1)
+        if global_step and max_train_steps:
+            m = torch.distributions.LogNormal(0 + (0.65 * global_step / max_train_steps), 1)
         else:
             m = torch.distributions.LogNormal(0.65, 1)
         timesteps = m.sample((b_size,)).to(device) * 250
@@ -5929,7 +5929,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, global
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.loss_type, global_step)
+    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.loss_type, global_step, args.max_train_steps)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
