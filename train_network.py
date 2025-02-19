@@ -279,6 +279,8 @@ class NetworkTrainer:
         return noise_pred, target, timesteps, None
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler, global_step=None) -> torch.FloatTensor:
+        skip_double_debiased = False
+
         if args.min_snr_gamma:
             if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
                 skip_double_debiased = True
