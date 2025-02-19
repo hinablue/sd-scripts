@@ -420,7 +420,7 @@ class NetworkTrainer:
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
 
-        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, global_step)
 
         return loss.mean()
 
