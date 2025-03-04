@@ -13,17 +13,7 @@ import re
 import shutil
 import time
 import typing
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    NamedTuple,
-    Optional,
-    Sequence,
-    Tuple,
-    Union
-)
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
 import glob
 import math
@@ -146,12 +136,13 @@ IMAGE_TRANSFORMS = transforms.Compose(
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX_SD3 = "_sd3_te.npz"
 
+
 def split_train_val(
     paths: List[str],
     sizes: List[Optional[Tuple[int, int]]],
     is_training_dataset: bool,
     validation_split: float,
-    validation_seed: int | None
+    validation_seed: int | None,
 ) -> Tuple[List[str], List[Optional[Tuple[int, int]]]]:
     """
     Split the dataset into train and validation
@@ -1999,11 +1990,7 @@ class DreamBoothDataset(BaseDataset):
                     # required for training images dataset of regularization images
                 else:
                     img_paths, sizes = split_train_val(
-                        img_paths,
-                        sizes,
-                        self.is_training_dataset,
-                        self.validation_split,
-                        self.validation_seed
+                        img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
                     )
 
             logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
@@ -5965,7 +5952,9 @@ def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: tor
     return timesteps
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents: torch.FloatTensor, global_step=None) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
+def get_noise_noisy_latents_and_timesteps(
+    args, noise_scheduler, latents: torch.FloatTensor, global_step=None
+) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
@@ -6475,11 +6464,18 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
 
         if "wandb" in [tracker.name for tracker in accelerator.trackers]:
             import wandb
+<<<<<<< HEAD
+=======
+
+>>>>>>> sd3
             wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
 
             # Define specific metrics to handle validation and epochs "steps"
             wandb_tracker.define_metric("epoch", hidden=True)
             wandb_tracker.define_metric("val_step", hidden=True)
+
+            wandb_tracker.define_metric("global_step", hidden=True)
+
 
 # endregion
 

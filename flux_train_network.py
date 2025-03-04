@@ -36,7 +36,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_schnell: Optional[bool] = None
         self.is_swapping_blocks: bool = False
 
-    def assert_extra_args(self, args, train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset], val_dataset_group: Optional[train_util.DatasetGroup]):
+    def assert_extra_args(
+        self,
+        args,
+        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
+        val_dataset_group: Optional[train_util.DatasetGroup],
+    ):
         # super().assert_extra_args(args, train_dataset_group, val_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
 
@@ -323,7 +328,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.noise_scheduler_copy = copy.deepcopy(noise_scheduler)
         return noise_scheduler
 
-    def encode_images_to_latents(self, args, accelerator, vae, images):
+    def encode_images_to_latents(self, args, vae, images):
         return vae.encode(images)
 
     def shift_scale_latents(self, args, latents):
@@ -341,8 +346,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+<<<<<<< HEAD
         global_step=None,
         is_train=True
+=======
+        is_train=True,
+>>>>>>> sd3
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
@@ -377,8 +386,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             t5_attn_mask = None
 
         def call_dit(img, img_ids, t5_out, txt_ids, l_pooled, timesteps, guidance_vec, t5_attn_mask):
-            # if not args.split_mode:
-            # normal forward
+            # grad is enabled even if unet is not in train mode, because Text Encoder is in train mode
             with torch.set_grad_enabled(is_train), accelerator.autocast():
                 # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
                 model_pred = unet(
@@ -391,6 +399,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     guidance=guidance_vec,
                     txt_attention_mask=t5_attn_mask,
                 )
+<<<<<<< HEAD
             """
             else:
                 # split forward to reduce memory usage
@@ -429,6 +438,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                         model_pred = unet(img=intermediate_img, txt=intermediate_txt, vec=vec, pe=pe, txt_attention_mask=t5_attn_mask)
             """
 
+=======
+>>>>>>> sd3
             return model_pred
 
         model_pred = call_dit(
@@ -546,6 +557,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 logger.info(f"prepare T5XXL for fp8: set to {te_weight_dtype}, set embeddings to {weight_dtype}, add hooks")
                 text_encoder.to(te_weight_dtype)  # fp8
                 prepare_fp8(text_encoder, weight_dtype)
+
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+        if self.is_swapping_blocks:
+            # prepare for next forward: because backward pass is not called, we need to prepare it here
+            accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
