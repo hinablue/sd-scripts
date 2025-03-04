@@ -6464,10 +6464,6 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
 
         if "wandb" in [tracker.name for tracker in accelerator.trackers]:
             import wandb
-<<<<<<< HEAD
-=======
-
->>>>>>> sd3
             wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
 
             # Define specific metrics to handle validation and epochs "steps"
