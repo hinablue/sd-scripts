@@ -2381,7 +2381,7 @@ class ControlNetDataset(BaseDataset):
         bucket_no_upscale: bool,
         debug_dataset: bool,
         validation_split: float,
-        validation_seed: Optional[int],        
+        validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
     ) -> None:
         super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
@@ -2444,7 +2444,7 @@ class ControlNetDataset(BaseDataset):
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
         self.validation_split = validation_split
-        self.validation_seed = validation_seed 
+        self.validation_seed = validation_seed
         self.resize_interpolation = resize_interpolation
 
         # assert all conditioning data exists
@@ -5960,10 +5960,13 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device, loss_type=None, global_step=None, max_train_steps=None) -> torch.Tensor:
-    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device, use_log_norm_timesteps=None, loss_type=None, global_step=None, max_train_steps=None) -> torch.Tensor:
+    if min_timestep < max_timestep:
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+    else:
+        timesteps = torch.full((b_size,), max_timestep, device="cpu")
 
-    if loss_type == "l2":
+    if use_log_norm_timesteps and loss_type == "l2":
         if global_step and max_train_steps:
             m = torch.distributions.LogNormal(0 + (0.65 * global_step / max_train_steps), 1)
         else:
@@ -5999,7 +6002,7 @@ def get_noise_noisy_latents_and_timesteps(
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.loss_type, global_step, args.max_train_steps)
+    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.use_log_norm_timesteps,args.loss_type, global_step, args.max_train_steps)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)

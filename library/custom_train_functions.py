@@ -123,7 +123,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--min_snr_gamma_mix_debiased",
         type=float,
         default=None,
-        help="",
+        help="Set % of total train steps for Debiased estimation loss / Debiased estimation lossを組み合わせる",
+    )
+    parser.add_argument(
+        "--use_log_norm_timesteps",
+        action="store_true",
+        help="Using logNorm 0.65 for timesteps / timestepsをlogNorm 0.65で使用する",
     )
     parser.add_argument(
         "--scale_v_pred_loss_like_noise_pred",

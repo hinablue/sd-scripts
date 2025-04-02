@@ -466,7 +466,7 @@ def train(args):
                     )
 
                 # Sample a random timestep for each image
-                timesteps = train_util.get_timesteps(0, noise_scheduler.config.num_train_timesteps, b_size, latents.device, None, None)
+                timesteps = train_util.get_timesteps(0, noise_scheduler.config.num_train_timesteps, b_size, latents.device, None, None, None)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
