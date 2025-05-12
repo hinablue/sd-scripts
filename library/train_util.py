@@ -4797,6 +4797,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "Automagic_CameAMP".lower():
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+
         logger.info(f"use Automagic_CameAMP optimizer | {optimizer_kwargs}")
         optimizer_class = Automagic_CameAMP
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)

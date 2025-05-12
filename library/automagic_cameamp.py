@@ -1,8 +1,8 @@
 import torch
 from typing import List
 import bitsandbytes.functional as F
-from .optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
-from optimum.quanto import QBytesTensor
+# from .optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
+# from optimum.quanto import QBytesTensor
 from torch.nn.functional import normalize
 
 class Automagic_CameAMP(torch.optim.Optimizer):
@@ -127,7 +127,7 @@ class Automagic_CameAMP(torch.optim.Optimizer):
                 if len(state) == 0:
                     self._init_state(p, group)
 
-                if 'step' not in state: 
+                if 'step' not in state:
                     state['step'] = 0
                 state["step"] += 1
                 if state["step"] == group["warmup_steps"]:
@@ -143,7 +143,7 @@ class Automagic_CameAMP(torch.optim.Optimizer):
 
                 if state["step"] == group["warmup_steps"] * 2:
                     self._del_Lookahead_state(p, group)
-                    
+
                 beta1, beta2, beta3 = group["betas"]
                 eps1, eps2 = group["eps"]
 
@@ -151,8 +151,8 @@ class Automagic_CameAMP(torch.optim.Optimizer):
                 update = grad.pow(2) + eps1
                 exp_avg_sq = state["exp_avg_sq"]
                 exp_avg_sq.mul_(beta2).add_(update, alpha=1 - beta2)
-                scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt()) 
-                
+                scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
+
                 scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
 
                 # TAM
@@ -170,8 +170,8 @@ class Automagic_CameAMP(torch.optim.Optimizer):
                 exp_avg_res = state["exp_avg_res"]
                 res = (scaled_grad - exp_avg).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0-beta3)
-                update = exp_avg.clone().mul_(exp_avg_res.rsqrt()) 
-                
+                update = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+
                 if state["step"] < group["warmup_steps"]:
                     # == lrmask ==
                     last_polarity = state['last_polarity']
@@ -197,7 +197,7 @@ class Automagic_CameAMP(torch.optim.Optimizer):
                     update.abs_().mul_(grad.sign())
                 else:
                     mask = (update * grad > 0).to(grad.dtype)
-                    mask.div_(mask.mean().clamp_(min=1e-3)) 
+                    mask.div_(mask.mean().clamp_(min=1e-3))
                     update = (update * mask)
                 update = update.mul(new_lr)
 
