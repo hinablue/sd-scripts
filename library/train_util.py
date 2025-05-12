@@ -29,6 +29,8 @@ import toml
 from tqdm import tqdm
 from packaging.version import Version
 
+from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit
+
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
@@ -4794,6 +4796,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "Automagic_CameAMP".lower():
+        logger.info(f"use Automagic_CameAMP optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_CameAMP
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type.endswith("8bit".lower()):
         try:
             import bitsandbytes as bnb
@@ -4803,6 +4810,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         if optimizer_type == "AdamW8bit".lower():
             logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = bnb.optim.AdamW8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "Automagic_CameAMP8bit".lower():
+            logger.info(f"use 8-bit Automagic_CameAMP optimizer | {optimizer_kwargs}")
+            optimizer_class = bnb.optim.Automagic_CameAMP8bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "SGDNesterov8bit".lower():
@@ -5502,11 +5514,11 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
 
 def patch_accelerator_for_fp16_training(accelerator):
-    
+
     from accelerate import DistributedType
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         return
-    
+
     org_unscale_grads = accelerator.scaler._unscale_grads_
 
     def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
