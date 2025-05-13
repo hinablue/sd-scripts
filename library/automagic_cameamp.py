@@ -19,6 +19,7 @@ class OptimizerConfig:
     la_layers: int = 3
     alphas: Tuple[float, ...] = (0.6, 0.75, 0.85, 0.85)
     ks: Tuple[int, ...] = (5, 5, 3, 3)
+    cautious: bool = True
     full_finetune: bool = False
     verbose: bool = False
 
@@ -211,9 +212,10 @@ class Automagic_CameAMP(BaseOptimizer):
                 if state["step"] < group["warmup_steps"] / 2:
                     update.abs_().mul_(grad.sign())
                 else:
-                    mask = (update * grad > 0).to(grad.dtype)
-                    mask.div_(mask.mean().clamp_(min=1e-3))
-                    update = (update * mask)
+                    if self.config.cautious:
+                        mask = (update * grad > 0).to(grad.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
+                        update = (update * mask)
                 update = update.mul(new_lr)
 
                 # SPD
