@@ -75,7 +75,6 @@ class BaseOptimizer(torch.optim.Optimizer):
         # Basic state initialization
         state.setdefault("lr_max", 1e-6)
         state.setdefault("step", 0)
-        state.setdefault("step2", 0)
 
         # Learning rate mask initialization
         state.setdefault('lr_mask', torch.ones(shape, device=device, dtype=torch.float32) * self.config.lr)
