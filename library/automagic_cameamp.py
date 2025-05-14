@@ -292,7 +292,7 @@ class Automagic_CameAMP(BaseOptimizer):
                                     stepk = f"step{l}"
                                     if slowk in state and stepk in state:
                                         state[stepk] += 1
-                                        if state[stepk] % self.ks[l-1] == 0:
+                                        if state[stepk] % self.config.ks[l-1] == 0:
                                             state[slowk].add_(
                                                 state[f"slow{l-1}"] - state[slowk],
                                                 alpha=self.config.alphas[l-1],
