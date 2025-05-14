@@ -73,6 +73,7 @@ class BaseOptimizer(torch.optim.Optimizer):
         state = self.state[p]
 
         # Basic state initialization
+        state.setdefault("lr_max", 1e-6)
         state.setdefault("step", 0)
         state.setdefault("step2", 0)
 
