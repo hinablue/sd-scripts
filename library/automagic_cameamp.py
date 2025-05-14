@@ -117,7 +117,7 @@ class Automagic_CameAMP(BaseOptimizer):
     def _del_Lookahead_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """Delete Lookahead state for a parameter."""
         state = self.state[p]
-        for i in range(1, self.la_layers + 1):
+        for i in range(1, self.config.la_layers + 1):
             if i > keep_layers:
                 if f"slow{i}" in state:
                     del state[f"slow{i}"]
