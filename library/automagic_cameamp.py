@@ -19,7 +19,6 @@ class OptimizerConfig:
     la_layers: int = 3
     alphas: Tuple[float, ...] = (0.6, 0.75, 0.85, 0.85)
     ks: Tuple[int, ...] = (5, 5, 3, 3)
-    cautious: bool = True
     full_finetune: bool = False
     verbose: bool = False
 
@@ -118,12 +117,12 @@ class Automagic_CameAMP(BaseOptimizer):
     def _del_Lookahead_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """Delete Lookahead state for a parameter."""
         state = self.state[p]
-        for i in range(1, self.config.la_layers + 1):
-            if f"slow{i}" in state:
-                del state[f"slow{i}"]
-        for i in range(2, self.config.la_layers + 1):
-            if f"step{i}" in state:
-                del state[f"step{i}"]
+        for i in range(1, self.la_layers + 1):
+            if i > keep_layers:
+                if f"slow{i}" in state:
+                    del state[f"slow{i}"]
+                if f"step{i}" in state:
+                    del state[f"step{i}"]
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
@@ -131,23 +130,37 @@ class Automagic_CameAMP(BaseOptimizer):
         loss = closure() if closure is not None else None
 
         for group in self.param_groups:
+            grads_this_group = []
+            for p in group["params"]:
+                if p.grad is None or not p.requires_grad:
+                    continue
+                grads_this_group.append(p.grad.view(-1))
+            all_group_grads = torch.cat(grads_this_group)
+            sum_abs_all_group_grads = torch.sum(torch.abs(all_group_grads))
+
             for p in group["params"]:
                 if p.grad is None or not p.requires_grad:
                     continue
 
                 grad = p.grad
-                state = self.state[p]
-                factored = len(p.shape) >= 2
+                """
+                ==== AGR自適應梯度正則 ====
+                Adaptive Gradient Regularization: A Faster and Generalizable Optimization Technique for Deep Neural Networks
+                https://arxiv.org/pdf/2407.16944
+                """
+                abs_grad = torch.abs(grad)
+                alpha = abs_grad / sum_abs_all_group_grads
+                grad = grad * (1 - alpha)
 
-                # Initialize state if needed
+                state = self.state[p]
+
+                # state initialization
                 if len(state) == 0:
                     self._init_state(p, group)
 
                 if 'step' not in state:
                     state['step'] = 0
                 state["step"] += 1
-
-                # Handle warmup steps
                 if state["step"] == group["warmup_steps"]:
                     if 's' in state:
                         del state['s']
@@ -155,6 +168,8 @@ class Automagic_CameAMP(BaseOptimizer):
                         del state['last_polarity']
                     if 'pre' in state and state["pre"] is not None:
                         del state['pre']
+
+                if state["step"] == group["warmup_steps"]:
                     self._init_Lookahead_state(p, group)
 
                 if state["step"] == group["warmup_steps"] * 2:
@@ -163,14 +178,23 @@ class Automagic_CameAMP(BaseOptimizer):
                 beta1, beta2, beta3 = group["betas"]
                 eps1, eps2 = group["eps"]
 
-                # Adafactor/RMS core
+                """
+                ==== Adafactor/RMS核心部分 (always non-factored) ====
+                CAME: Confidence-guided Adaptive Memory Efficient Optimization
+                https://arxiv.org/abs/2307.02047
+                https://github.com/yangluo7/CAME
+                """
                 update = grad.pow(2) + eps1
                 exp_avg_sq = state["exp_avg_sq"]
                 exp_avg_sq.mul_(beta2).add_(update, alpha=1 - beta2)
                 scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
                 scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
 
-                # TAM
+                """
+                ==== Torque-Aware Momentum ====
+                https://arxiv.org/abs/2412.18790
+                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/tam.py
+                """
                 if state["step"] < group["warmup_steps"] / 2:
                     decay_rate = 0.9
                     s, exp_avg = state['s'], state['exp_avg']
@@ -180,19 +204,22 @@ class Automagic_CameAMP(BaseOptimizer):
                     exp_avg.mul_(beta1).add_(d)
                 else:
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(beta1).add_(scaled_grad, alpha=1-beta1)
+                    exp_avg.mul_(beta1).add_(scaled_grad, alpha=1 - beta1)
 
                 # CAME core
                 exp_avg_res = state["exp_avg_res"]
                 res = (scaled_grad - exp_avg).pow(2) + eps2
-                exp_avg_res.mul_(beta3).add_(res, alpha=1.0-beta3)
+                exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
                 update = exp_avg.clone().mul_(exp_avg_res.rsqrt())
 
-                # Learning rate mask
+                """
+                ==== Automagic lrmask ====
+                https://github.com/ostris/ai-toolkit/blob/main/toolkit/optimizers/automagic.py
+                """
                 if state["step"] < group["warmup_steps"]:
                     last_polarity = state['last_polarity']
                     current_polarity = (grad > 0)
-                    sign_agree = torch.where(last_polarity == current_polarity, 1, -1)
+                    sign_agree = torch.where(last_polarity == current_polarity, 1.0, -1.0)
                     state['last_polarity'] = current_polarity
                     lr_mask = state['lr_mask']
                     new_lr = torch.where(
@@ -200,25 +227,38 @@ class Automagic_CameAMP(BaseOptimizer):
                         lr_mask + self.config.lr_bump,
                         lr_mask - self.config.lr_bump
                     )
+                    if group["lr"] > state["lr_max"]:
+                        new_lr = new_lr + (group["lr"] - state["lr_max"])
+                        state["lr_max"] = group["lr"]
                     new_lr = torch.clamp(new_lr, min=self.config.min_lr, max=self.config.max_lr)
                     state['lr_mask'] = new_lr
                     state['avg_lr'] = torch.mean(new_lr).item()
                 else:
                     new_lr = state['lr_mask']
-                    if group["lr"] < 1e-6:
-                        new_lr = new_lr * (group["lr"] / 1e-6)
+                    if group["lr"] > state["lr_max"]:
+                        state["lr_max"] = group["lr"]
+                    if group["lr"] < state["lr_max"]:
+                        new_lr = new_lr * (group["lr"] / state["lr_max"])
 
-                # Grams or Cautious
+                """
+                === Grams ===
+                Grams: Gradient Descent with Adaptive Momentum Scaling
+                https://arxiv.org/abs/2412.17107
+                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
+                """
                 if state["step"] < group["warmup_steps"] / 2:
                     update.abs_().mul_(grad.sign())
-                else:
-                    if self.config.cautious:
-                        mask = (update * grad > 0).to(grad.dtype)
-                        mask.div_(mask.mean().clamp_(min=1e-3))
-                        update = (update * mask)
+
                 update = update.mul(new_lr)
 
-                # SPD
+                """
+                === SPD 選擇性投影decay ===
+                Rethinking Weight Decay for Robust Fine-Tuning of Foundation Models
+                https://arxiv.org/abs/2411.01713
+                https://github.com/GT-RIPL/Selective-Projection-Decay/tree/main
+                Mirror, Mirror of the Flow: How Does Regularization Shape Implicit Bias?
+                https://arxiv.org/abs/2504.12883
+                """
                 do_spd = False
                 if state["step"] < group["warmup_steps"]:
                     pre = state["pre"] if state["pre"] is not None else torch.zeros_like(p)
@@ -232,23 +272,35 @@ class Automagic_CameAMP(BaseOptimizer):
                 if not do_spd:
                     p.add_(-update)
 
-                # Lookahead sync
-                if state["step"] >= group["warmup_steps"] and state["step"] < group["warmup_steps"] * 2:
-                    if self.config.la_layers > 0:
-                        if state["step"] % self.config.ks[0] == 0:
-                            state["slow1"].add_(p.data - state["slow1"], alpha=self.config.alphas[0])
-                            p.data.copy_(state["slow1"])
-                            for l in range(2, self.config.la_layers + 1):
-                                state[f"step{l}"] += 1
-                                if state[f"step{l}"] % self.config.ks[l-1] == 0:
-                                    state[f"slow{l}"].add_(state[f"slow{l-1}"] - state[f"slow{l}"], alpha=self.config.alphas[l-1])
-                                    state[f"slow{l-1}"].copy_(state[f"slow{l}"])
-                                else:
-                                    break
+                """
+                === Lookahead動態同步及釋放多餘層 ===
+                Multilayer Lookahead: a Nested Version of Lookahead
+                https://arxiv.org/abs/2110.14254
+                """
+                if state["step"] >= group["warmup_steps"]:
+                    N = group["warmup_steps"]
+                    lookahead_active_layers = self.config.la_layers
+                    if lookahead_active_layers < self.config.la_layers:
+                        self._del_Lookahead_state_till(p, lookahead_active_layers, group)
+                    if lookahead_active_layers > 0:
+                        if f"slow1" in state:
+                            if state["step"] % self.config.ks[0] == 0:
+                                state["slow1"].add_(p.data - state["slow1"], alpha=self.config.alphas[0])
+                                p.data.copy_(state["slow1"])
+                                for l in range(2, lookahead_active_layers + 1):
+                                    slowk = f"slow{l}"
+                                    stepk = f"step{l}"
+                                    if slowk in state and stepk in state:
+                                        state[stepk] += 1
+                                        if state[stepk] % self.ks[l-1] == 0:
+                                            state[slowk].add_(
+                                                state[f"slow{l-1}"] - state[slowk],
+                                                alpha=self.config.alphas[l-1],
+                                            )
+                                            state[f"slow{l-1}"].copy_(state[slowk])
+                                        else:
+                                            break
 
-        # Update group learning rates
-        for group in self.param_groups:
-            group["lr"] = self._get_group_lr(group)
         if self.config.verbose:
             print([group["lr"] for group in self.param_groups])
         return loss
