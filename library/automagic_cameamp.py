@@ -16,7 +16,7 @@ class OptimizerConfig:
     betas: Tuple[float, float, float] = (0.9, 0.999, 0.9999)
     weight_decay: float = 2.5
     warmup_steps: int = 500
-    la_layers: int = 3
+    la_layers: int = 2
     alphas: Tuple[float, ...] = (0.6, 0.75, 0.85, 0.85)
     ks: Tuple[int, ...] = (5, 5, 3, 3)
     full_finetune: bool = False
@@ -116,6 +116,19 @@ class Automagic_CameAMP(BaseOptimizer):
 
     def _del_Lookahead_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """Delete Lookahead state for a parameter."""
+        state = self.state[p]
+        for i in range(1, self.config.la_layers + 1):
+            if f"slow{i}" in state:
+                del state[f"slow{i}"]
+        for i in range(2, self.config.la_layers + 1):
+            if f"step{i}" in state:
+                del state[f"step{i}"]
+
+    def _del_Lookahead_state_till(self, p: torch.Tensor, keep_layers: int, group: Optional[Dict[str, Any]] = None) -> None:
+        """
+        只保留前 keep_layers 層 lookahead，其餘全部清除
+        keep_layers=0 代表全清
+        """
         state = self.state[p]
         for i in range(1, self.config.la_layers + 1):
             if i > keep_layers:
