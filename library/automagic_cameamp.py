@@ -16,9 +16,7 @@ class OptimizerConfig:
     betas: Tuple[float, float, float] = (0.9, 0.999, 0.9999)
     weight_decay: float = 2.5
     warmup_steps: int = 500
-    la_layers: int = 2
-    alphas: Tuple[float, ...] = (0.6, 0.75, 0.85, 0.85)
-    ks: Tuple[int, ...] = (5, 5, 3, 3)
+    cautious: bool = True
     full_finetune: bool = False
     verbose: bool = False
 
@@ -34,6 +32,7 @@ class BaseOptimizer(torch.optim.Optimizer):
             betas=config.betas,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
+            cautious=config.cautious,
             full_finetune=config.full_finetune,
         )
         super().__init__(params, defaults)
@@ -87,12 +86,6 @@ class BaseOptimizer(torch.optim.Optimizer):
         state.setdefault("exp_avg_sq", torch.zeros_like(p))
         state.setdefault("exp_avg_res", torch.zeros_like(p))
 
-        # Lookahead initialization
-        for i in range(1, self.config.la_layers + 1):
-            state.setdefault(f"slow{i}", p.data.clone())
-        for i in range(2, self.config.la_layers + 1):
-            state.setdefault(f"step{i}", 0)
-
         # Full finetune initialization
         if group is not None and group.get('full_finetune', False):
             state.setdefault("pre", p.clone())
@@ -105,37 +98,6 @@ class Automagic_CameAMP(BaseOptimizer):
     def __init__(self, params, **kwargs):
         config = OptimizerConfig(**kwargs)
         super().__init__(params, config)
-
-    def _init_Lookahead_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
-        """Initialize Lookahead state for a parameter."""
-        state = self.state[p]
-        for i in range(1, self.config.la_layers + 1):
-            state[f"slow{i}"] = p.data.clone()
-        for i in range(2, self.config.la_layers + 1):
-            state[f"step{i}"] = 0
-
-    def _del_Lookahead_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
-        """Delete Lookahead state for a parameter."""
-        state = self.state[p]
-        for i in range(1, self.config.la_layers + 1):
-            if f"slow{i}" in state:
-                del state[f"slow{i}"]
-        for i in range(2, self.config.la_layers + 1):
-            if f"step{i}" in state:
-                del state[f"step{i}"]
-
-    def _del_Lookahead_state_till(self, p: torch.Tensor, keep_layers: int, group: Optional[Dict[str, Any]] = None) -> None:
-        """
-        只保留前 keep_layers 層 lookahead，其餘全部清除
-        keep_layers=0 代表全清
-        """
-        state = self.state[p]
-        for i in range(1, self.config.la_layers + 1):
-            if i > keep_layers:
-                if f"slow{i}" in state:
-                    del state[f"slow{i}"]
-                if f"step{i}" in state:
-                    del state[f"step{i}"]
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
@@ -181,12 +143,6 @@ class Automagic_CameAMP(BaseOptimizer):
                         del state['last_polarity']
                     if 'pre' in state and state["pre"] is not None:
                         del state['pre']
-
-                if state["step"] == group["warmup_steps"]:
-                    self._init_Lookahead_state(p, group)
-
-                if state["step"] == group["warmup_steps"] * 2:
-                    self._del_Lookahead_state(p, group)
 
                 beta1, beta2, beta3 = group["betas"]
                 eps1, eps2 = group["eps"]
@@ -253,14 +209,25 @@ class Automagic_CameAMP(BaseOptimizer):
                     if group["lr"] < state["lr_max"]:
                         new_lr = new_lr * (group["lr"] / state["lr_max"])
 
-                """
-                === Grams ===
-                Grams: Gradient Descent with Adaptive Momentum Scaling
-                https://arxiv.org/abs/2412.17107
-                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
-                """
                 if state["step"] < group["warmup_steps"] / 2:
+                    """
+                    === Grams ===
+                    Grams: Gradient Descent with Adaptive Momentum Scaling
+                    https://arxiv.org/abs/2412.17107
+                    https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
+                    """
                     update.abs_().mul_(grad.sign())
+                else:
+                    if self.config.cautious:
+                        """
+                        === Cautious ===
+                        Cautious Optimizers: Improving Training with One Line of Code
+                        https://arxiv.org/abs/2411.16085
+                        https://github.com/kyleliang919/C-Optim
+                        """
+                        mask = (update * grad > 0).to(grad.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
+                        update = (update * mask)
 
                 update = update.mul(new_lr)
 
@@ -284,35 +251,6 @@ class Automagic_CameAMP(BaseOptimizer):
                         p.copy_(new_p)
                 if not do_spd:
                     p.add_(-update)
-
-                """
-                === Lookahead動態同步及釋放多餘層 ===
-                Multilayer Lookahead: a Nested Version of Lookahead
-                https://arxiv.org/abs/2110.14254
-                """
-                if state["step"] >= group["warmup_steps"]:
-                    N = group["warmup_steps"]
-                    lookahead_active_layers = self.config.la_layers
-                    if lookahead_active_layers < self.config.la_layers:
-                        self._del_Lookahead_state_till(p, lookahead_active_layers, group)
-                    if lookahead_active_layers > 0:
-                        if f"slow1" in state:
-                            if state["step"] % self.config.ks[0] == 0:
-                                state["slow1"].add_(p.data - state["slow1"], alpha=self.config.alphas[0])
-                                p.data.copy_(state["slow1"])
-                                for l in range(2, lookahead_active_layers + 1):
-                                    slowk = f"slow{l}"
-                                    stepk = f"step{l}"
-                                    if slowk in state and stepk in state:
-                                        state[stepk] += 1
-                                        if state[stepk] % self.config.ks[l-1] == 0:
-                                            state[slowk].add_(
-                                                state[f"slow{l-1}"] - state[slowk],
-                                                alpha=self.config.alphas[l-1],
-                                            )
-                                            state[f"slow{l-1}"].copy_(state[slowk])
-                                        else:
-                                            break
 
         if self.config.verbose:
             print([group["lr"] for group in self.param_groups])
