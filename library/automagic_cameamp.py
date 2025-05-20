@@ -13,7 +13,8 @@ class OptimizerConfig:
     lr_bump: float = 3e-6
     eps: Tuple[float, float] = (1e-30, 1e-16)
     clip_threshold: float = 1.0
-    betas: Tuple[float, float, float] = (0.9, 0.999, 0.9999)
+    betas: Tuple[float, float, float] = (0.8, 0.99, 0.999)
+    beta1_decay: float = 0.9995
     weight_decay: float = 2.5
     warmup_steps: int = 500
     cautious: bool = True
@@ -30,6 +31,7 @@ class BaseOptimizer(torch.optim.Optimizer):
             eps=config.eps,
             clip_threshold=config.clip_threshold,
             betas=config.betas,
+            beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
             cautious=config.cautious,
@@ -144,7 +146,7 @@ class Automagic_CameAMP(BaseOptimizer):
                     if 'pre' in state and state["pre"] is not None:
                         del state['pre']
 
-                beta1, beta2, beta3 = group["betas"]
+                beta1, beta2, beta3 = 0.9, 0.999, 0.9999
                 eps1, eps2 = group["eps"]
 
                 """
@@ -170,10 +172,19 @@ class Automagic_CameAMP(BaseOptimizer):
                     corr = normalize(exp_avg, p=2.0, dim=0).mul_(normalize(scaled_grad, p=2.0, dim=0))
                     s.mul_(decay_rate).add_(corr, alpha=1.0 - decay_rate)
                     d = ((1.0 + s) / 2.0).add_(eps1).mul_(scaled_grad)
+                    exp_avg_bar = exp_avg * beta1 + scaled_grad * (1 - beta1)
                     exp_avg.mul_(beta1).add_(d)
                 else:
+                    beta1, beta2, beta3 = group["betas"]
+                    beta1_t = max(beta1 * group['beta1_decay'] ** state["step"], 0.4)
+                    beta1_factor = (1 - beta1) / (1 - beta1_t) if beta1_t < 1 else 1.0
+                    """
+                    Towards Faster Training of Diffusion Models: An Inspiration of A Consistency Phenomenon
+                    https://arxiv.org/abs/2404.07946
+                    """
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(beta1).add_(scaled_grad, alpha=1 - beta1)
+                    exp_avg_bar = exp_avg * beta1 + scaled_grad * (1 - beta1)
+                    exp_avg.mul_(beta1_t).add_(scaled_grad, alpha=1 - beta1_t)
 
                 # CAME core
                 exp_avg_res = state["exp_avg_res"]
