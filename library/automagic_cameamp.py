@@ -14,6 +14,7 @@ class OptimizerConfig:
     eps: Tuple[float, float] = (1e-30, 1e-16)
     clip_threshold: float = 1.0
     betas: Tuple[float, float, float] = (0.8, 0.99, 0.999)
+    eta: int = 2,
     beta1_decay: float = 0.9995
     weight_decay: float = 2.5
     warmup_steps: int = 500
@@ -31,6 +32,7 @@ class BaseOptimizer(torch.optim.Optimizer):
             eps=config.eps,
             clip_threshold=config.clip_threshold,
             betas=config.betas,
+            eta=config.eta,
             beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
@@ -93,6 +95,14 @@ class BaseOptimizer(torch.optim.Optimizer):
             state.setdefault("pre", p.clone())
         else:
             state.setdefault("pre", None)
+            """
+            ==== ALLoRA ====
+            ALLoRA: Adaptive Learning Rate Mitigates LoRA Fatal Flaws
+            https://arxiv.org/abs/2410.09692
+            """
+            if len(p.shape) == 2:
+                row_norm = p.norm(dim=1, keepdim=True)
+                state["row_scaling"] = 1.0 / torch.sqrt(row_norm + 1.0 / (group['eta']**2))
 
 class Automagic_CameAMP(BaseOptimizer):
     """Automagic_CameAMP optimizer implementation."""
@@ -119,19 +129,8 @@ class Automagic_CameAMP(BaseOptimizer):
                 if p.grad is None or not p.requires_grad:
                     continue
 
-                grad = p.grad
-                """
-                ==== AGR自適應梯度正則 ====
-                Adaptive Gradient Regularization: A Faster and Generalizable Optimization Technique for Deep Neural Networks
-                https://arxiv.org/pdf/2407.16944
-                """
-                abs_grad = torch.abs(grad)
-                alpha = abs_grad / sum_abs_all_group_grads
-                grad = grad * (1 - alpha)
-
+                # === state 初始化 ===
                 state = self.state[p]
-
-                # state initialization
                 if len(state) == 0:
                     self._init_state(p, group)
 
@@ -146,27 +145,42 @@ class Automagic_CameAMP(BaseOptimizer):
                     if 'pre' in state and state["pre"] is not None:
                         del state['pre']
 
-                beta1, beta2, beta3 = 0.9, 0.999, 0.9999
+                """
+                === grad 初始化 ===
+                ==== AGR自適應梯度正則 ====
+                Adaptive Gradient Regularization: A Faster and Generalizable Optimization Technique for Deep Neural Networks
+                https://arxiv.org/pdf/2407.16944
+                """
+                grad = p.grad
+                abs_grad = torch.abs(grad)
+                alpha = abs_grad / sum_abs_all_group_grads
+                grad = grad * (1 - alpha)
+
+                beta1, beta2, beta3 = group["betas"]
                 eps1, eps2 = group["eps"]
 
                 """
-                ==== Adafactor/RMS核心部分 (always non-factored) ====
-                CAME: Confidence-guided Adaptive Memory Efficient Optimization
-                https://arxiv.org/abs/2307.02047
-                https://github.com/yangluo7/CAME
+                ADOPT: Modified Adam Can Converge with Any β_2 with the Optimal Rate
+                https://arxiv.org/abs/2411.02853
+                https://github.com/iShohei220/adopt
                 """
-                update = grad.pow(2) + eps1
                 exp_avg_sq = state["exp_avg_sq"]
-                exp_avg_sq.mul_(beta2).add_(update, alpha=1 - beta2)
-                scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
-                scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+                grad_p2 = (grad**2) + eps1
+                if state['step'] == 1:
+                    exp_avg_sq.mul_(beta2).add_(grad_p2, alpha=1.0 - beta2)
+                    continue
+                scaled_grad  = exp_avg_sq.rsqrt().mul_(grad)
+                clip = state['step'] ** 0.25
+                scaled_grad.clamp_(-clip, clip)
+                exp_avg_sq.mul_(beta2).add_(grad_p2, alpha=1.0 - beta2)
 
-                """
-                ==== Torque-Aware Momentum ====
-                https://arxiv.org/abs/2412.18790
-                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/tam.py
-                """
                 if state["step"] < group["warmup_steps"] / 2:
+                    """
+                    ==== Torque-Aware Momentum ====
+                    https://arxiv.org/abs/2412.18790
+                    https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/tam.py
+                    """
+                    beta1, beta2, beta3 = 0.9, 0.999, 0.9999
                     decay_rate = 0.9
                     s, exp_avg = state['s'], state['exp_avg']
                     corr = normalize(exp_avg, p=2.0, dim=0).mul_(normalize(scaled_grad, p=2.0, dim=0))
@@ -175,7 +189,6 @@ class Automagic_CameAMP(BaseOptimizer):
                     exp_avg_bar = exp_avg * beta1 + scaled_grad * (1 - beta1)
                     exp_avg.mul_(beta1).add_(d)
                 else:
-                    beta1, beta2, beta3 = group["betas"]
                     beta1_t = max(beta1 * group['beta1_decay'] ** state["step"], 0.4)
                     beta1_factor = (1 - beta1) / (1 - beta1_t) if beta1_t < 1 else 1.0
                     """
@@ -186,7 +199,12 @@ class Automagic_CameAMP(BaseOptimizer):
                     exp_avg_bar = exp_avg * beta1 + scaled_grad * (1 - beta1)
                     exp_avg.mul_(beta1_t).add_(scaled_grad, alpha=1 - beta1_t)
 
-                # CAME core
+                """
+                ==== CAME 核心區塊 (always non-factored) ====
+                CAME: Confidence-guided Adaptive Memory Efficient Optimization
+                https://arxiv.org/pdf/2411.02853
+                https://github.com/yangluo7/CAME
+                """
                 exp_avg_res = state["exp_avg_res"]
                 res = (scaled_grad - exp_avg).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
@@ -218,7 +236,7 @@ class Automagic_CameAMP(BaseOptimizer):
                     if group["lr"] > state["lr_max"]:
                         state["lr_max"] = group["lr"]
                     if group["lr"] < state["lr_max"]:
-                        new_lr = new_lr * (group["lr"] / state["lr_max"])
+                        new_lr = new_lr * max((group["lr"] / state["lr_max"]), 0.1)
 
                 if state["step"] < group["warmup_steps"] / 2:
                     """
