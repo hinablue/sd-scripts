@@ -14,9 +14,9 @@ class OptimizerConfig:
     eps: Tuple[float, float] = (1e-30, 1e-16)
     clip_threshold: float = 1.0
     betas: Tuple[float, float, float] = (0.8, 0.99, 0.999)
-    eta: int = 2,
+    eta: float = 2.0
     beta1_decay: float = 0.9995
-    weight_decay: float = 2.5
+    weight_decay: float = 1.0
     warmup_steps: int = 500
     cautious: bool = True
     full_finetune: bool = False
@@ -27,12 +27,15 @@ class BaseOptimizer(torch.optim.Optimizer):
 
     def __init__(self, params, config: OptimizerConfig):
         self.config = config
+        # Handle eta value: if not float use 2.0
+        eta_value = float(config.eta) if isinstance(config.eta, (int, float)) else 2.0
+
         defaults = dict(
             lr=config.lr,
             eps=config.eps,
             clip_threshold=config.clip_threshold,
             betas=config.betas,
-            eta=config.eta,
+            eta=eta_value,
             beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
@@ -54,6 +57,30 @@ class BaseOptimizer(torch.optim.Optimizer):
         c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
         return torch.mul(r_factor, c_factor)
 
+    @staticmethod
+    def _ratio(new_p: torch.Tensor, p: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+        """Calculate the ratio for selective projection decay."""
+        curr_norm, prev_norm = torch.norm(new_p - pre), torch.norm(p - pre)
+        ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
+        return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
+
+    # Implementation from: https://github.com/LucasPrietoAl/grokking-at-the-edge-of-numerical-stability/blob/main/orthograd.py
+    @staticmethod
+    def orthograd_(p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+        if p.norm(2) <= 1e-30:
+            return grad
+
+        G_shape = grad.shape
+        w = p.view(-1)
+        g = grad.view(-1)
+        g_norm = g.norm(2)
+
+        proj = torch.dot(w, g) / torch.dot(w, w).add(1e-30)
+        g_orth = g.sub_(w, alpha=proj)
+        g_orth_scaled = g_orth.mul_(g_norm / g_orth.norm(2).add(1e-30))
+
+        return g_orth_scaled.view(G_shape)
+
     def _get_group_lr(self, group: Dict[str, Any]) -> float:
         """Get the average learning rate for a parameter group."""
         group_lrs = []
@@ -62,12 +89,6 @@ class BaseOptimizer(torch.optim.Optimizer):
             if 'avg_lr' in state:
                 group_lrs.append(state['avg_lr'])
         return float(torch.mean(torch.tensor(group_lrs))) if group_lrs else self.config.lr
-
-    def _ratio(self, new_p: torch.Tensor, p: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
-        """Calculate the ratio for selective projection decay."""
-        curr_norm, prev_norm = torch.norm(new_p - pre), torch.norm(p - pre)
-        ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
-        return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
 
     def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """Initialize optimizer state for a parameter."""
@@ -165,14 +186,16 @@ class Automagic_CameAMP(BaseOptimizer):
                 https://github.com/iShohei220/adopt
                 """
                 exp_avg_sq = state["exp_avg_sq"]
-                grad_p2 = (grad**2) + eps1
+
                 if state['step'] == 1:
-                    exp_avg_sq.mul_(beta2).add_(grad_p2, alpha=1.0 - beta2)
+                    exp_avg_sq.addcmul_(grad, grad.conj())
                     continue
-                scaled_grad  = exp_avg_sq.rsqrt().mul_(grad)
+
+                de_nom = exp_avg_sq.sqrt().clamp_(min=1e-6)
+                scaled_grad = grad.div(de_nom)
                 clip = state['step'] ** 0.25
                 scaled_grad.clamp_(-clip, clip)
-                exp_avg_sq.mul_(beta2).add_(grad_p2, alpha=1.0 - beta2)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
 
                 if state["step"] < group["warmup_steps"] / 2:
                     """
@@ -257,6 +280,18 @@ class Automagic_CameAMP(BaseOptimizer):
                         mask = (update * grad > 0).to(grad.dtype)
                         mask.div_(mask.mean().clamp_(min=1e-3))
                         update = (update * mask)
+
+                """
+                === 正交梯度 ===
+                Grokking at the Edge of Numerical Stability
+
+                https://arxiv.org/abs/2501.04697
+                https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
+                """
+                if state["step"] < group["warmup_steps"] / 2:
+                    update = self.orthograd_(p, update)
+                if "row_scaling" in state:
+                    update = update * state["row_scaling"]
 
                 update = update.mul(new_lr)
 
