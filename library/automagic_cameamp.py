@@ -112,9 +112,7 @@ class BaseOptimizer(torch.optim.Optimizer):
         state.setdefault("exp_avg_res", torch.zeros_like(p))
 
         # Full finetune initialization
-        if group is not None and group.get('full_finetune', False):
-            state.setdefault("pre", p.clone())
-        else:
+        if group is not None and group['full_finetune'] is False:
             state.setdefault("pre", None)
             """
             ==== ALLoRA ====
@@ -124,6 +122,8 @@ class BaseOptimizer(torch.optim.Optimizer):
             if len(p.shape) == 2:
                 row_norm = p.norm(dim=1, keepdim=True)
                 state["row_scaling"] = 1.0 / torch.sqrt(row_norm + 1.0 / (group['eta']**2))
+        else:
+            state.setdefault("pre", p.clone())
 
 class Automagic_CameAMP(BaseOptimizer):
     """Automagic_CameAMP optimizer implementation."""
