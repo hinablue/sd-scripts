@@ -6095,6 +6095,34 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
+    elif loss_type == "stable_max":
+        """
+        基於 https://arxiv.org/pdf/2501.04697 的數值穩定版 Softmax (StableMax) [1, 2]。
+        使用 s(x) 替換 exp(x)。s(x) = x + 1 如果 x >= 0，1 / (1 - x) 如果 x < 0 [2]。
+        """
+        # 應用 s(x) 元素 wise [3]
+        s_model_pred = torch.where(model_pred >= 0, model_pred + 1.0, 1.0 / (1.0 - model_pred))
+
+        # 計算 StableMax: s(xi) / sum(s(xj)) [2]
+        probabilities = s_model_pred / torch.sum(s_model_pred, dim=-1, keepdim=True)
+
+        """
+        基於 https://arxiv.org/pdf/2501.04697 的 StableMax 交叉熵損失 (StCE) [1, 2]。
+        在交叉熵計算中使用 StableMax 替換標準 Softmax [2]。
+        """
+        # 計算真實類別的負對數似然
+        eps = 1e-9
+        log_probabilities = torch.log(probabilities + eps)
+        true_class_log_prob = torch.gather(log_probabilities, -1, target.unsqueeze(-1)).squeeze(-1)
+
+        # 交叉熵損失是 -log(P(true_class))
+        loss = -true_class_log_prob
+
+        # 應用 reduction 方式
+        if reduction == 'mean':
+            loss = loss.mean()
+        elif reduction == 'sum':
+            loss = loss.sum()
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     return loss
