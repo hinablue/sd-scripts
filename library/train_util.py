@@ -4796,6 +4796,15 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "CAME".lower():
+        try:
+            from came_pytorch import CAME
+        except ImportError:
+            raise ImportError("No came-pytorch / came-pytorchがインストールされていないようです")
+        logger.info(f"use CAME optimizer | {optimizer_kwargs}")
+        optimizer_class = CAME
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type == "Automagic_CameAMP".lower():
         try:
             import bitsandbytes as bnb
