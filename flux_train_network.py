@@ -346,12 +346,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
-<<<<<<< HEAD
         global_step=None,
         is_train=True
-=======
-        is_train=True,
->>>>>>> sd3
     ):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
@@ -399,47 +395,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     guidance=guidance_vec,
                     txt_attention_mask=t5_attn_mask,
                 )
-<<<<<<< HEAD
-            """
-            else:
-                # split forward to reduce memory usage
-                assert network.train_blocks == "single", "train_blocks must be single for split mode"
-                with accelerator.autocast():
-                    # move flux lower to cpu, and then move flux upper to gpu
-                    unet.to("cpu")
-                    clean_memory_on_device(accelerator.device)
-                    self.flux_upper.to(accelerator.device)
-
-                    # upper model does not require grad
-                    with torch.no_grad():
-                        intermediate_img, intermediate_txt, vec, pe = self.flux_upper(
-                            img=packed_noisy_model_input,
-                            img_ids=img_ids,
-                            txt=t5_out,
-                            txt_ids=txt_ids,
-                            y=l_pooled,
-                            timesteps=timesteps / 1000,
-                            guidance=guidance_vec,
-                            txt_attention_mask=t5_attn_mask,
-                        )
-
-                    # move flux upper back to cpu, and then move flux lower to gpu
-                    self.flux_upper.to("cpu")
-                    clean_memory_on_device(accelerator.device)
-                    unet.to(accelerator.device)
-
-                    # lower model requires grad
-                    intermediate_img.requires_grad_(True)
-                    intermediate_txt.requires_grad_(True)
-                    vec.requires_grad_(True)
-                    pe.requires_grad_(True)
-
-                    with torch.set_grad_enabled(is_train and train_unet):
-                        model_pred = unet(img=intermediate_img, txt=intermediate_txt, vec=vec, pe=pe, txt_attention_mask=t5_attn_mask)
-            """
-
-=======
->>>>>>> sd3
             return model_pred
 
         model_pred = call_dit(
