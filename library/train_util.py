@@ -6075,6 +6075,68 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
 
     return result
 
+def stable_mse_loss(model_pred: torch.Tensor, target: torch.Tensor, reduction: str = 'none') -> torch.Tensor:
+    """
+    基於 https://arxiv.org/pdf/2501.04697 的數值穩定版 MSE Loss (StableMSE)。
+
+    參考 StableMax 的概念，在 MSE 計算中引入數值穩定性改進。
+    這種方法可以防止在大預測誤差時出現的數值不穩定問題。
+
+    Args:
+        model_pred (torch.Tensor): 模型預測值，shape 為 (batch_size, ...)
+        target (torch.Tensor): 目標值，shape 與 model_pred 相同
+        reduction (str): 損失縮減方式，'none' | 'mean' | 'sum'
+
+    Returns:
+        torch.Tensor: 穩定化的 MSE 損失
+
+    數學原理:
+        傳統 MSE: L = (pred - target)²
+        穩定 MSE: L = (stable_pred - target)²
+        其中 stable_pred = pred - pred.detach() + pred.detach().clamp(-clip_value, clip_value)
+    """
+
+    # 1. 計算原始誤差
+    raw_diff = model_pred - target
+
+    # 2. 應用 StableMax 概念：創建穩定化的預測值
+    # 使用 detach 避免梯度傳播到穩定化項
+    pred_detached = model_pred.detach()
+
+    # 3. 設定穩定化的裁剪範圍（可調整）
+    # 根據輸入數值範圍自適應調整裁剪值
+    with torch.no_grad():
+        pred_std = torch.std(pred_detached)
+        clip_value = 3.0 * pred_std + 1e-8  # 3-sigma 規則
+
+    # 4. 創建穩定化的預測值
+    # 保持梯度流動但限制數值範圍
+    stable_pred_detached = torch.clamp(pred_detached, -clip_value, clip_value)
+    stable_pred = model_pred - pred_detached + stable_pred_detached
+
+    # 5. 計算穩定化的誤差
+    stable_diff = stable_pred - target
+
+    # 6. 計算平方誤差（MSE 的核心）
+    squared_error = stable_diff.pow(2)
+
+    # 7. 應用額外的數值穩定性檢查
+    # 防止極端值影響訓練
+    squared_error = torch.where(
+        torch.isfinite(squared_error),
+        squared_error,
+        torch.zeros_like(squared_error)
+    )
+
+    # 8. 應用 reduction 策略
+    if reduction == 'none':
+        return squared_error
+    elif reduction == 'mean':
+        return squared_error.mean()
+    elif reduction == 'sum':
+        return squared_error.sum()
+    else:
+        raise ValueError(f"不支援的 reduction 方式: {reduction}")
 
 def conditional_loss(
     model_pred: torch.Tensor, target: torch.Tensor, loss_type: str, reduction: str, huber_c: Optional[torch.Tensor] = None
@@ -6104,17 +6166,27 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
-    elif loss_type == "stable_max":
+    elif loss_type == "stable_mse":
         """
-        基於 https://arxiv.org/pdf/2501.04697 的數值穩定版 Softmax (StableMax) [1, 2]。
-        在交叉熵計算中使用 StableMax 替換標準 Softmax [2]。
+        進階版穩定 MSE Loss，具有自適應穩定性控制。
         """
-        stable_logits = model_pred - model_pred.detach()
-        probs = torch.nn.functional.softmax(stable_logits, dim=-1)
 
-        # 計算交叉熵
-        log_probs = torch.log(probs + 1e-8)
-        loss = torch.nn.functional.null_loss(log_probs, target)
+        # 計算標準 MSE
+        standard_mse = F.mse_loss(model_pred, target, reduction=reduction)
+
+        # 計算穩定化 MSE
+        stable_mse = stable_mse_loss(model_pred, target, reduction=reduction)
+
+        # 自適應混合兩種損失
+        # 當誤差較大時，更多使用穩定化版本
+        with torch.no_grad():
+            error_magnitude = torch.abs(model_pred - target)
+            error_std = torch.std(error_magnitude)
+            adaptive_weight = torch.sigmoid((error_magnitude - error_std) / (error_std + 1e-8))
+            adaptive_weight = adaptive_weight * stability_factor
+
+        # 混合損失
+        loss = (1 - adaptive_weight) * standard_mse + adaptive_weight * stable_mse
 
         # 應用 reduction 方式
         if reduction == 'mean':
