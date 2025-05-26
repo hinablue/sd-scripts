@@ -1,6 +1,5 @@
 import torch
 from typing import List, Dict, Any, Optional, Tuple
-import bitsandbytes.functional as F
 from torch.nn.functional import normalize
 from dataclasses import dataclass
 import math
@@ -17,9 +16,8 @@ class OptimizerConfig:
     betas: Tuple[float, float, float] = (0.8, 0.99, 0.999)
     eta: float = 2.0
     beta1_decay: float = 0.9995
-    weight_decay: float = 1.0
+    weight_decay: float = 5e-4
     warmup_steps: int = 500
-    cautious: bool = True
     came: bool = True
     full_finetune: bool = False
     verbose: bool = False
@@ -41,7 +39,6 @@ class BaseOptimizer(torch.optim.Optimizer):
             beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
-            cautious=config.cautious,
             came=config.came,
             full_finetune=config.full_finetune,
         )
@@ -142,6 +139,7 @@ class BaseOptimizer(torch.optim.Optimizer):
             Tuple[torch.Tensor, torch.Tensor]: Updated momentum average
         """
         # Calculate time-dependent beta1
+        beta1, beta2, beta3 = group["betas"]
         beta1_t = max(beta1 * group['beta1_decay'] ** state["step"], 0.4)
 
         # Get momentum state
@@ -309,7 +307,11 @@ class Automagic_CameAMP(BaseOptimizer):
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
         """Perform a single optimization step."""
-        loss = closure() if closure is not None else None
+        loss = None
+
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             grads_this_group = []
@@ -441,6 +443,9 @@ class Automagic_CameAMP(BaseOptimizer):
 
         if self.config.verbose:
             print([group["lr"] for group in self.param_groups])
+
+        torch.cuda.synchronize()
+
         return loss
 
     def state_dict(self) -> Dict[str, Any]:
@@ -456,11 +461,47 @@ class Automagic_CameAMP(BaseOptimizer):
         super().load_state_dict(state_dict)
 
 class Automagic_CameAMP8bit(BaseOptimizer):
-    """8-bit version of Automagic_CameAMP optimizer."""
+    """8-bit version of Automagic_CameAMP optimizer using bitsandbytes."""
 
     def __init__(self, params, **kwargs):
         config = OptimizerConfig(**kwargs)
         super().__init__(params, config)
+        self._step = 0
+
+        # Check if bitsandbytes is available and supports CUDA
+        try:
+            import bitsandbytes.functional as F
+            self.F = F
+            # Test if quantization works
+            test_tensor = torch.randn(10, 10, dtype=torch.float32)
+            _, _ = F.quantize_blockwise(test_tensor, blocksize=256)
+        except Exception as e:
+            raise RuntimeError(f"bitsandbytes 8-bit quantization not available: {e}")
+
+    def _quantize_tensor(self, tensor: torch.Tensor, blocksize: int = 4096) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a tensor using bitsandbytes blockwise quantization.
+
+        Args:
+            tensor: Input tensor to quantize
+            blocksize: Block size for quantization (default: 4096)
+
+        Returns:
+            Tuple of (quantized_tensor, scale_tensor)
+        """
+        return self.F.quantize_blockwise(tensor, blocksize=blocksize)
+
+    def _dequantize_tensor(self, quantized: torch.Tensor, scale: torch.Tensor, blocksize: int = 4096) -> torch.Tensor:
+        """Dequantize a tensor using bitsandbytes blockwise dequantization.
+
+        Args:
+            quantized: Quantized tensor
+            scale: Scale tensor from quantization
+            blocksize: Block size for dequantization (default: 4096)
+
+        Returns:
+            Dequantized tensor
+        """
+        return self.F.dequantize_blockwise(quantized, scale, blocksize=blocksize)
 
     def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """Initialize 8-bit optimizer state for a parameter.
@@ -477,77 +518,59 @@ class Automagic_CameAMP8bit(BaseOptimizer):
         state.setdefault("lr_max", 1e-6)
         state.setdefault("step", 0)
 
-        # Learning rate mask initialization
+        # Learning rate mask initialization with quantization
         lr_mask_init = torch.ones(shape, device=device, dtype=torch.float32) * self.config.lr
-        q_lr_mask, q_lr_mask_scale = F.quantize_blockwise(lr_mask_init, blocksize=4096)
+        q_lr_mask, q_lr_mask_scale = self._quantize_tensor(lr_mask_init)
         state.setdefault('lr_mask_q', q_lr_mask)
         state.setdefault('lr_mask_q_scale', q_lr_mask_scale)
         state.setdefault('avg_lr', float(self.config.lr))
 
-        last_polarity_fp32 = torch.zeros(shape, dtype=torch.bool, device=device)
-        q_last_polarity, q_last_polarity_scale = F.quantize_blockwise(last_polarity_fp32, blocksize=4096)
-        state.setdefault('last_polarity_q', q_last_polarity)
-        state.setdefault('last_polarity_q_scale', q_last_polarity_scale)
+        # Boolean polarity tracking (no quantization needed for boolean)
+        state.setdefault('last_polarity', torch.zeros(shape, dtype=torch.bool, device=device))
 
-        # Momentum and variance initialization
-        exp_avg_fp32 = torch.zeros_like(p)
-        q_exp_avg, q_exp_avg_scale = F.quantize_blockwise(exp_avg_fp32, blocksize=4096)
+        # Momentum initialization with quantization
+        exp_avg_fp32 = torch.zeros_like(p, dtype=torch.float32)
+        q_exp_avg, q_exp_avg_scale = self._quantize_tensor(exp_avg_fp32)
         state.setdefault("exp_avg_q", q_exp_avg)
         state.setdefault("exp_avg_q_scale", q_exp_avg_scale)
 
-        if group["came"]:
-            exp_avg_sq_fp32 = torch.zeros_like(p)
-            q_exp_avg_sq, q_exp_avg_sq_scale = F.quantize_blockwise(exp_avg_sq_fp32, blocksize=4096)
+        # Variance initialization with quantization (for CAME)
+        if group and group.get('came', True):
+            exp_avg_sq_fp32 = torch.zeros_like(p, dtype=torch.float32)
+            q_exp_avg_sq, q_exp_avg_sq_scale = self._quantize_tensor(exp_avg_sq_fp32)
             state.setdefault("exp_avg_sq_q", q_exp_avg_sq)
             state.setdefault("exp_avg_sq_q_scale", q_exp_avg_sq_scale)
 
-        exp_avg_res_fp32 = torch.zeros_like(p)
-        q_exp_avg_res, q_exp_avg_res_scale = F.quantize_blockwise(exp_avg_res_fp32, blocksize=4096)
+        # AdaBelief residual initialization with quantization
+        exp_avg_res_fp32 = torch.zeros_like(p, dtype=torch.float32)
+        q_exp_avg_res, q_exp_avg_res_scale = self._quantize_tensor(exp_avg_res_fp32)
         state.setdefault("exp_avg_res_q", q_exp_avg_res)
         state.setdefault("exp_avg_res_q_scale", q_exp_avg_res_scale)
 
-        s_fp32 = torch.zeros_like(p)
-        q_s, q_s_scale = F.quantize_blockwise(s_fp32, blocksize=4096)
+        # Torque-aware momentum state initialization with quantization
+        s_fp32 = torch.zeros_like(p, dtype=torch.float32)
+        q_s, q_s_scale = self._quantize_tensor(s_fp32)
         state.setdefault("s_q", q_s)
         state.setdefault("s_q_scale", q_s_scale)
 
-        # Full finetune initialization
-        if group is not None and group['full_finetune'] is False:
-            """
-            ==== ALLoRA ====
-            ALLoRA: Adaptive Learning Rate Mitigates LoRA Fatal Flaws
-            https://arxiv.org/abs/2410.09692
-            """
+        # Full finetune initialization (ALLoRA)
+        if group is not None and group.get('full_finetune', False) is False:
             if len(p.shape) == 2:
                 row_norm = p.norm(dim=1, keepdim=True)
-                row_scaling = 1.0 / torch.sqrt(row_norm + 1.0 / (group['eta']**2))
-                q_row_scaling, q_row_scaling_scale = F.quantize_blockwise(row_scaling, blocksize=4096)
+                row_scaling = 1.0 / torch.sqrt(row_norm + 1.0 / (group.get('eta', 2.0)**2))
+                q_row_scaling, q_row_scaling_scale = self._quantize_tensor(row_scaling)
                 state.setdefault("row_scaling_q", q_row_scaling)
                 state.setdefault("row_scaling_q_scale", q_row_scaling_scale)
 
-    @staticmethod
-    def _update_torque_aware_momentum(state: Dict[str, Any], scaled_grad: torch.Tensor, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update momentum using Torque-Aware Momentum during early training.
-
-        Implementation from:
-        https://arxiv.org/abs/2412.18790
-        https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/tam.py
-
-        Args:
-            state: Optimizer state for the parameter
-            scaled_grad: Scaled gradient tensor
-            eps1: Epsilon parameter for numerical stability
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated momentum average
-        """
+    def _update_torque_aware_momentum(self, state: Dict[str, Any], scaled_grad: torch.Tensor, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update momentum using Torque-Aware Momentum during early training."""
         # Set fixed beta values for early training
         beta1, beta2, beta3 = 0.9, 0.999, 0.9999
         decay_rate = 0.9
 
-        # Get state tensors
-        s = F.dequantize_blockwise(state['s_q'], state['s_q_scale'], blocksize=4096)
-        exp_avg =F.dequantize_blockwise(state['exp_avg_q'], state['exp_avg_q_scale'], blocksize=4096)
+        # Dequantize state tensors
+        s = self._dequantize_tensor(state['s_q'], state['s_q_scale'])
+        exp_avg = self._dequantize_tensor(state['exp_avg_q'], state['exp_avg_q_scale'])
 
         # Calculate correlation between normalized momentum and gradient
         corr = normalize(exp_avg, p=2.0, dim=0).mul_(normalize(scaled_grad, p=2.0, dim=0))
@@ -561,54 +584,35 @@ class Automagic_CameAMP8bit(BaseOptimizer):
         # Update momentum
         exp_avg.mul_(beta1).add_(d)
 
-        # Calculate momentum average
-        exp_avg_bar = exp_avg
+        # Re-quantize updated states
+        state['s_q'], state['s_q_scale'] = self._quantize_tensor(s)
+        state['exp_avg_q'], state['exp_avg_q_scale'] = self._quantize_tensor(exp_avg)
 
-        return exp_avg_bar, exp_avg
+        return exp_avg, exp_avg
 
-    @staticmethod
-    def _update_torque_aware_momentum(state: Dict[str, Any], scaled_grad: torch.Tensor, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update momentum using consistency-based approach after early training.
-
-        Implementation from:
-        Towards Faster Training of Diffusion Models: An Inspiration of A Consistency Phenomenon
-        https://arxiv.org/abs/2404.07946
-
-        Args:
-            state: Optimizer state for the parameter
-            group: Parameter group containing optimization settings
-            scaled_grad: Scaled gradient tensor
-            beta1: Beta1 parameter for momentum
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated momentum average
-        """
+    def _update_consistency_momentum(self, state: Dict[str, Any], group: Dict[str, Any], scaled_grad: torch.Tensor, beta1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update momentum using consistency-based approach after early training."""
         # Calculate time-dependent beta1
-        beta1_t = max(beta1 * group['beta1_decay'] ** state["step"], 0.4)
+        beta1_orig, beta2, beta3 = group["betas"]
+        beta1_t = max(beta1_orig * group.get('beta1_decay', 0.9995) ** state["step"], 0.4)
 
-        # Get momentum state
-        exp_avg = F.dequantize_blockwise(state['exp_avg_q'], state['exp_avg_q_scale'], blocksize=4096)
+        # Dequantize momentum state
+        exp_avg = self._dequantize_tensor(state['exp_avg_q'], state['exp_avg_q_scale'])
 
         # Update momentum with time-dependent beta1
         exp_avg.mul_(beta1_t).add_(scaled_grad, alpha=1 - beta1_t)
 
         # Calculate momentum average
-        exp_avg_bar = exp_avg * beta1 + scaled_grad * (1 - beta1)
+        exp_avg_bar = exp_avg * beta1_orig + scaled_grad * (1 - beta1_orig)
+
+        # Re-quantize updated state
+        state['exp_avg_q'], state['exp_avg_q_scale'] = self._quantize_tensor(exp_avg)
 
         return exp_avg_bar, exp_avg
 
-    @staticmethod
-    def _update_post_warmup_lr_mask(state: Dict[str, Any], group: Dict[str, Any]) -> torch.Tensor:
-        """Update learning rate mask after warmup phase.
-
-        Args:
-            state: Optimizer state for the parameter
-            group: Parameter group containing optimization settings
-
-        Returns:
-            torch.Tensor: Updated learning rate mask
-        """
-        new_lr = F.dequantize_blockwise(state['lr_mask_q'], state['lr_mask_q_scale'], blocksize=4096)
+    def _update_post_warmup_lr_mask(self, state: Dict[str, Any], group: Dict[str, Any]) -> torch.Tensor:
+        """Update learning rate mask after warmup phase."""
+        new_lr = self._dequantize_tensor(state['lr_mask_q'], state['lr_mask_q_scale'])
 
         # Update maximum learning rate if needed
         if group["lr"] > state["lr_max"]:
@@ -618,29 +622,23 @@ class Automagic_CameAMP8bit(BaseOptimizer):
         if group["lr"] < state["lr_max"]:
             new_lr = new_lr * max((group["lr"] / state["lr_max"]), 0.1)
 
+        # Re-quantize updated learning rate mask
+        state['lr_mask_q'], state['lr_mask_q_scale'] = self._quantize_tensor(new_lr)
+
         return new_lr
 
     def _update_warmup_lr_mask(self, state: Dict[str, Any], group: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
-        """Update learning rate mask during warmup phase.
-
-        Args:
-            state: Optimizer state for the parameter
-            group: Parameter group containing optimization settings
-            grad: Gradient tensor
-
-        Returns:
-            torch.Tensor: Updated learning rate mask
-        """
-        # Update polarity tracking
-        last_polarity = F.dequantize_blockwise(state['last_polarity_q'], state['last_polarity_q_scale'], blocksize=4096)
+        """Update learning rate mask during warmup phase."""
+        # Update polarity tracking (boolean tensor - no quantization needed)
+        last_polarity = state['last_polarity']
         current_polarity = (grad > 0)
         sign_agree = torch.where(last_polarity == current_polarity, 1, -1)
-        q_last_polarity, q_last_polarity_scale = F.quantize_blockwise(current_polarity, blocksize=4096)
-        state['last_polarity_q'] = q_last_polarity
-        state['last_polarity_q_scale'] = q_last_polarity_scale
+        state['last_polarity'] = current_polarity
+
+        # Dequantize learning rate mask
+        lr_mask = self._dequantize_tensor(state['lr_mask_q'], state['lr_mask_q_scale'])
 
         # Calculate new learning rate
-        lr_mask = F.dequantize_blockwise(state['lr_mask_q'], state['lr_mask_q_scale'], blocksize=4096)
         new_lr = torch.where(
             sign_agree > 0,
             lr_mask + self.config.lr_bump,
@@ -650,35 +648,51 @@ class Automagic_CameAMP8bit(BaseOptimizer):
         # Clamp learning rate to valid range
         new_lr = torch.clamp(new_lr, min=self.config.min_lr, max=self.config.max_lr)
 
-        # Update quantized learning rate mask
-        q_lr_mask, q_lr_mask_scale = F.quantize_blockwise(new_lr, blocksize=4096)
-        state['lr_mask_q'] = q_lr_mask
-        state['lr_mask_q_scale'] = q_lr_mask_scale
+        # Re-quantize updated learning rate mask
+        state['lr_mask_q'], state['lr_mask_q_scale'] = self._quantize_tensor(new_lr)
         state['avg_lr'] = torch.mean(new_lr).item()
 
         return new_lr
 
+    def _update_momentum(self, state: Dict[str, Any], group: Dict[str, Any], scaled_grad: torch.Tensor, beta1: float, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update momentum based on training phase."""
+        if state["step"] < group.get("warmup_steps", 500) / 2:
+            return self._update_torque_aware_momentum(state, scaled_grad, eps1)
+        else:
+            return self._update_consistency_momentum(state, group, scaled_grad, beta1)
+
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
         """Perform a single optimization step with 8-bit quantization."""
-        loss = closure() if closure is not None else None
+        loss = None
+
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
+            # Collect gradients for adaptive gradient regularization
+            grads_this_group = []
+            for p in group["params"]:
+                if p.grad is not None:
+                    grads_this_group.append(p.grad.view(-1))
+            if len(grads_this_group) == 0:
+                continue
+
+            all_group_grads = torch.cat(grads_this_group)
+            abs_all_group_grads = torch.abs(all_group_grads)
+            sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
+
             for p in group["params"]:
                 if p.grad is None or not p.requires_grad:
                     continue
 
-                """
-                === grad 初始化 ===
-                ==== AGR自適應梯度正則 ====
-                Adaptive Gradient Regularization: A Faster and Generalizable Optimization Technique for Deep Neural Networks
-                https://arxiv.org/pdf/2407.16944
-                """
+                # Adaptive Gradient Regularization
                 abs_grad = torch.abs(p.grad)
                 alpha = abs_grad / sum_abs_all_group_grads
                 grad = p.grad * (1 - alpha)
 
-                # === state 初始化 ===
+                # Initialize state if needed
                 state = self.state[p]
                 if len(state) == 0:
                     self._init_state(p, group)
@@ -687,136 +701,131 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 state["step"] += 1
 
                 self._step = state["step"]
-                if state["step"] == group.get("warmup_steps", 0):
-                    if 's' in state:
-                        del state['s']
+
+                # Clean up warmup-specific states after warmup
+                if state["step"] == group.get("warmup_steps", 500):
+                    if 's_q' in state:
                         del state['s_q']
                         del state['s_q_scale']
                     if 'last_polarity' in state:
                         del state['last_polarity']
-                        del state['last_polarity_q']
-                        del state['last_polarity_q_scale']
 
                 beta1, beta2, beta3 = group["betas"]
                 eps1, eps2, eps3 = group["eps"]
-                exp_avg = F.dequantize_blockwise(state['exp_avg_q'], state['exp_avg_q_scale'], blocksize=4096)
-                exp_avg_res = F.dequantize_blockwise(state['exp_avg_res_q'], state['exp_avg_res_q_scale'], blocksize=4096)
 
-                if group["came"]:
-                    """
-                    CAME: Confidence-guided Adaptive Memory Efficient Optimization
-                    https://arxiv.org/pdf/2411.02853
-                    https://github.com/yangluo7/CAME
-                    """
-                    exp_avg_sq = F.dequantize_blockwise(state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'], blocksize=4096)
+                # Dequantize main state tensors
+                exp_avg = self._dequantize_tensor(state['exp_avg_q'], state['exp_avg_q_scale'])
+                exp_avg_res = self._dequantize_tensor(state['exp_avg_res_q'], state['exp_avg_res_q_scale'])
+
+                # CAME or AdaBelief gradient scaling
+                if group.get("came", True):
+                    # CAME: Confidence-guided Adaptive Memory Efficient Optimization
+                    exp_avg_sq = self._dequantize_tensor(state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'])
                     exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
                     scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
+                    scaled_grad.div_((self._rms(scaled_grad) / group.get("clip_threshold", 1.0)).clamp_(min=1.0))
 
-                    scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+                    # Re-quantize exp_avg_sq
+                    state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'] = self._quantize_tensor(exp_avg_sq)
                 else:
-                    # Adabelief
+                    # AdaBelief gradient clipping
                     clip = state['step'] ** 0.25
                     scaled_grad = grad.clamp(-clip, clip)
 
-                """
-                ==== Momentum Update ====
-                """
+                # Update momentum
                 exp_avg_bar, exp_avg = self._update_momentum(state, group, scaled_grad, beta1, eps1)
 
-                """
-                ==== AdaBelief ====
-                AdaBelief Optimizer: Adapting Stepsizes by the Belief in Observed Gradients
-
-                https://arxiv.org/abs/2010.07468
-                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/adabelief.py
-                """
+                # AdaBelief variance update
                 res = (scaled_grad - exp_avg_bar).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
                 update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
 
-                """
-                === Grams ===
-                Grams: Gradient Descent with Adaptive Momentum Scaling
-                https://arxiv.org/abs/2412.17107
-                https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
-                """
+                # Grams: Gradient Descent with Adaptive Momentum Scaling
                 grams_update = update_p.abs() * grad.sign()
-                alpha = 1.0 * group['beta1_decay'] ** state["step"]
+                alpha = 1.0 * group.get('beta1_decay', 0.9995) ** state["step"]
                 update_p = alpha * grams_update + (1 - alpha) * update_p
 
-                if state["step"] < group["warmup_steps"] / 2:
-                    """
-                    === 正交梯度 ===
-                    Grokking at the Edge of Numerical Stability
-
-                    https://arxiv.org/abs/2501.04697
-                    https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
-                    """
+                # Orthogonal gradient during early warmup
+                if state["step"] < group.get("warmup_steps", 500) / 2:
                     update_p = self.orthograd_(p, update_p)
 
-                """
-                ==== Automagic lrmask ====
-                https://github.com/ostris/ai-toolkit/blob/main/toolkit/optimizers/automagic.py
-                """
+                # Update learning rate mask
                 new_lr = self._update_learning_rate_mask(state, group, grad)
 
-                if "row_scaling" in state:
-                    row_scaling = F.dequantize_blockwise(state['row_scaling_q'], state['row_scaling_q_scale'], blocksize=4096)
+                # Apply row scaling if available (ALLoRA)
+                if "row_scaling_q" in state:
+                    row_scaling = self._dequantize_tensor(state['row_scaling_q'], state['row_scaling_q_scale'])
                     new_lr = new_lr * row_scaling
 
+                # Apply learning rate and update parameters
                 update_p = update_p.mul(new_lr)
-
                 p.add_(-update_p)
+
+                # Re-quantize exp_avg_res
+                state['exp_avg_res_q'], state['exp_avg_res_q_scale'] = self._quantize_tensor(exp_avg_res)
 
         if self.config.verbose:
             print([group["lr"] for group in self.param_groups])
+
+        torch.cuda.synchronize()
+
         return loss
+
+    def _update_learning_rate_mask(self, state: Dict[str, Any], group: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
+        """Update learning rate mask based on training phase."""
+        if state["step"] < group.get("warmup_steps", 500):
+            return self._update_warmup_lr_mask(state, group, grad)
+        else:
+            return self._update_post_warmup_lr_mask(state, group)
 
     def state_dict(self) -> Dict[str, Any]:
         """Get the 8-bit optimizer state dictionary."""
         orig_sd = super().state_dict()
         new_state = {}
-        for k, v in orig_sd['state'].items():
-            # Don't store unquantized tensors
-            save_state = {kk: vv for kk, vv in v.items()
-                         if kk not in ('lr_mask_q', 'lr_mask_q_scale', 'last_polarity_q', 'last_polarity_q_scale', 'exp_avg_q', 'exp_avg_q_scale', 'exp_avg_sq_q', 'exp_avg_sq_q_scale', 'exp_avg_res_q', 'exp_avg_res_q_scale', 'row_scaling_q', 'row_scaling_q_scale', 's_q', 's_q_scale')}
-            # Save quantized tensors
-            if 'lr_mask_q' in v and 'lr_mask_q_scale' in v:
-                save_state['lr_mask_q'] = v['lr_mask_q']
-                save_state['lr_mask_q_scale'] = v['lr_mask_q_scale']
-            if 'last_polarity_q' in v and 'last_polarity_q_scale' in v:
-                save_state['last_polarity_q'] = v['last_polarity_q']
-                save_state['last_polarity_q_scale'] = v['last_polarity_q_scale']
-            if 'exp_avg_q' in v and 'exp_avg_q_scale' in v:
-                save_state['exp_avg_q'] = v['exp_avg_q']
-                save_state['exp_avg_q_scale'] = v['exp_avg_q_scale']
-            if 'exp_avg_sq_q' in v and 'exp_avg_sq_q_scale' in v:
-                save_state['exp_avg_sq_q'] = v['exp_avg_sq_q']
-                save_state['exp_avg_sq_q_scale'] = v['exp_avg_sq_q_scale']
-            if 'exp_avg_res_q' in v and 'exp_avg_res_q_scale' in v:
-                save_state['exp_avg_res_q'] = v['exp_avg_res_q']
-                save_state['exp_avg_res_q_scale'] = v['exp_avg_res_q_scale']
-            if 'row_scaling_q' in v and 'row_scaling_q_scale' in v:
-                save_state['row_scaling_q'] = v['row_scaling_q']
-                save_state['row_scaling_q_scale'] = v['row_scaling_q_scale']
-            if 's_q' in v and 's_q_scale' in v:
-                save_state['s_q'] = v['s_q']
-                save_state['s_q_scale'] = v['s_q_scale']
 
+        # List of quantized state keys to preserve
+        quantized_keys = {
+            'lr_mask_q', 'lr_mask_q_scale',
+            'exp_avg_q', 'exp_avg_q_scale',
+            'exp_avg_sq_q', 'exp_avg_sq_q_scale',
+            'exp_avg_res_q', 'exp_avg_res_q_scale',
+            'row_scaling_q', 'row_scaling_q_scale',
+            's_q', 's_q_scale'
+        }
+
+        for k, v in orig_sd['state'].items():
+            # Save all non-quantized state and quantized tensors
+            save_state = {}
+            for kk, vv in v.items():
+                if kk in quantized_keys or kk not in ['lr_mask', 'exp_avg', 'exp_avg_sq', 'exp_avg_res', 'row_scaling', 's']:
+                    save_state[kk] = vv
             new_state[k] = save_state
+
         orig_sd['state'] = new_state
-        orig_sd['magic8_version'] = 1
+        orig_sd['magic8_version'] = 2  # Updated version number
         return orig_sd
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load the 8-bit optimizer state dictionary."""
-        if 'magic8_version' not in state_dict or state_dict['magic8_version'] != 1:
-            print('[WARNING] You loaded an unexpected state dict, some 8-bit parameters may not be synchronized!')
+        if 'magic8_version' not in state_dict or state_dict['magic8_version'] < 2:
+            print('[WARNING] You loaded an older state dict version, some 8-bit parameters may not be synchronized!')
+
+        # Create basic state dict without quantized tensors for parent class
         basic_sd = {'state': {}, 'param_groups': state_dict['param_groups']}
+        quantized_keys = {
+            'lr_mask_q', 'lr_mask_q_scale',
+            'exp_avg_q', 'exp_avg_q_scale',
+            'exp_avg_sq_q', 'exp_avg_sq_q_scale',
+            'exp_avg_res_q', 'exp_avg_res_q_scale',
+            'row_scaling_q', 'row_scaling_q_scale',
+            's_q', 's_q_scale'
+        }
+
         for k, v in state_dict['state'].items():
-            basic_sd['state'][k] = {kk: vv for kk, vv in v.items()
-                     if kk not in ('lr_mask_q', 'lr_mask_q_scale', 'last_polarity_q', 'last_polarity_q_scale', 'exp_avg_q', 'exp_avg_q_scale', 'exp_avg_sq_q', 'exp_avg_sq_q_scale', 'exp_avg_res_q', 'exp_avg_res_q_scale', 'row_scaling_q', 'row_scaling_q_scale', 's_q', 's_q_scale')}
+            basic_sd['state'][k] = {kk: vv for kk, vv in v.items() if kk not in quantized_keys}
+
         super().load_state_dict(basic_sd)
+
         # Restore quantized tensors
         param_map = [p for g in self.param_groups for p in g['params']]
         for idx, p in enumerate(param_map):
@@ -825,24 +834,11 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 continue
             src = state_dict['state'][idx_str]
             st = self.state[p]
-            if 'lr_mask_q' in src and 'lr_mask_q_scale' in src:
-                st['lr_mask_q'] = src['lr_mask_q']
-                st['lr_mask_q_scale'] = src['lr_mask_q_scale']
-            if 'last_polarity_q' in src and 'last_polarity_q_scale' in src:
-                st['last_polarity_q'] = src['last_polarity_q']
-                st['last_polarity_q_scale'] = src['last_polarity_q_scale']
-            if 'exp_avg_q' in src and 'exp_avg_q_scale' in src:
-                st['exp_avg_q'] = src['exp_avg_q']
-                st['exp_avg_q_scale'] = src['exp_avg_q_scale']
-            if 'exp_avg_sq_q' in src and 'exp_avg_sq_q_scale' in src:
-                st['exp_avg_sq_q'] = src['exp_avg_sq_q']
-                st['exp_avg_sq_q_scale'] = src['exp_avg_sq_q_scale']
-            if 'exp_avg_res_q' in src and 'exp_avg_res_q_scale' in src:
-                st['exp_avg_res_q'] = src['exp_avg_res_q']
-                st['exp_avg_res_q_scale'] = src['exp_avg_res_q_scale']
-            if 'row_scaling_q' in src and 'row_scaling_q_scale' in src:
-                st['row_scaling_q'] = src['row_scaling_q']
-                st['row_scaling_q_scale'] = src['row_scaling_q_scale']
-            if 's_q' in src and 's_q_scale' in src:
-                st['s_q'] = src['s_q']
-                st['s_q_scale'] = src['s_q_scale']
+
+            # Restore all quantized tensor pairs
+            for base_key in ['lr_mask', 'exp_avg', 'exp_avg_sq', 'exp_avg_res', 'row_scaling', 's']:
+                q_key = f'{base_key}_q'
+                scale_key = f'{base_key}_q_scale'
+                if q_key in src and scale_key in src:
+                    st[q_key] = src[q_key]
+                    st[scale_key] = src[scale_key]
