@@ -1,7 +1,8 @@
 import torch
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Deque
 from torch.nn.functional import normalize
 from dataclasses import dataclass
+from collections import deque
 import math
 
 @dataclass
@@ -325,7 +326,7 @@ class Automagic_CameAMP(BaseOptimizer):
             abs_all_group_grads = torch.abs(all_group_grads)
             sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
 
-            if self._step < self.config.warmup_steps / 2 and self.config.weight_decay > 0:
+            if self._step < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
                 mean_norm = abs_all_group_grads.mean()
                 std_norm = abs_all_group_grads.std(unbiased=False)
 
@@ -362,7 +363,7 @@ class Automagic_CameAMP(BaseOptimizer):
                 eps1, eps2, eps3 = group["eps"]
                 exp_avg , exp_avg_res = state['exp_avg'], state["exp_avg_res"]
 
-                if group["came"]:
+                if group.get("came", True):
                     """
                     CAME: Confidence-guided Adaptive Memory Efficient Optimization
                     https://arxiv.org/pdf/2411.02853
@@ -683,7 +684,7 @@ class Automagic_CameAMP8bit(BaseOptimizer):
             abs_all_group_grads = torch.abs(all_group_grads)
             sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
 
-            if self._step < self.config.warmup_steps / 2 and self.config.weight_decay > 0:
+            if self._step < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
                 mean_norm = abs_all_group_grads.mean()
                 std_norm = abs_all_group_grads.std(unbiased=False)
 
@@ -727,10 +728,13 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                     exp_avg_sq = self._dequantize_tensor(state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'])
                     exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
                     scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
-                    scaled_grad.div_((self._rms(scaled_grad) / group.get("clip_threshold", 1.0)).clamp_(min=1.0))
+                    scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
 
                     # Re-quantize exp_avg_sq
-                    state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'] = self._quantize_tensor(exp_avg_sq)
+                    quantized, scale_tensor = self._quantize_tensor(exp_avg_sq)
+                    state['exp_avg_sq_q'] = quantized
+                    state['exp_avg_sq_q_scale'] = scale_tensor
+                    state['exp_avg_sq'] = exp_avg_sq
                 else:
                     # AdaBelief gradient clipping
                     clip = state['step'] ** 0.25
@@ -771,9 +775,6 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 # Apply learning rate and update parameters
                 update_p = update_p.mul(new_lr)
                 p.add_(-update_p)
-
-                # Re-quantize exp_avg_res
-                state['exp_avg_res_q'], state['exp_avg_res_q_scale'] = self._quantize_tensor(exp_avg_res)
 
         if self.config.verbose:
             print([group["lr"] for group in self.param_groups])
@@ -853,3 +854,810 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 if q_key in src and scale_key in src:
                     st[q_key] = src[q_key]
                     st[scale_key] = src[scale_key]
+
+class ContextualOptimizationModule:
+    """
+    基於 C-Optim 的上下文感知優化模組
+    """
+
+    def __init__(self,
+                 context_window: int = 100,
+                 edge_threshold: float = 0.95,
+                 adaptation_rate: float = 0.1):
+        self.context_window = context_window
+        self.edge_threshold = edge_threshold
+        self.adaptation_rate = adaptation_rate
+
+        # 上下文歷史
+        self.gradient_history: Deque[torch.Tensor] = deque(maxlen=context_window)
+        self.loss_history: Deque[float] = deque(maxlen=context_window)
+        self.lr_history: Deque[float] = deque(maxlen=context_window)
+
+    def update_context(self, gradient: torch.Tensor, loss: float, lr: float):
+        """更新上下文信息"""
+        self.gradient_history.append(gradient.detach().clone())
+        self.loss_history.append(loss)
+        self.lr_history.append(lr)
+
+    def compute_gradient_consistency(self) -> float:
+        """計算梯度一致性指標"""
+        if len(self.gradient_history) < 2:
+            return 1.0
+
+        recent_grads = list(self.gradient_history)[-10:]  # 最近10步
+
+        # 計算梯度方向的一致性
+        consistencies = []
+        for i in range(1, len(recent_grads)):
+            prev_grad = recent_grads[i-1].flatten()
+            curr_grad = recent_grads[i].flatten()
+
+            # 餘弦相似度
+            cos_sim = torch.nn.functional.cosine_similarity(prev_grad.unsqueeze(0), curr_grad.unsqueeze(0))
+            consistencies.append(cos_sim.item())
+
+        return sum(consistencies) / len(consistencies) if consistencies else 1.0
+
+    def detect_edge_case(self) -> bool:
+        """檢測是否為邊緣情況"""
+        if len(self.loss_history) < 10:
+            return False
+
+        recent_losses = list(self.loss_history)[-10:]
+
+        # 檢測損失震盪
+        loss_variance = torch.var(torch.tensor(recent_losses))
+        loss_mean = torch.mean(torch.tensor(recent_losses))
+        cv = loss_variance.sqrt() / (loss_mean + 1e-8)  # 變異係數
+
+        # 檢測梯度一致性
+        grad_consistency = self.compute_gradient_consistency()
+
+        # 邊緣情況：高變異係數或低梯度一致性
+        is_edge = cv > 0.5 or grad_consistency < 0.3
+
+        return is_edge
+
+    def compute_contextual_lr_multiplier(self) -> float:
+        """計算上下文感知的學習率乘數"""
+        if len(self.loss_history) < 5:
+            return 1.0
+
+        # 分析損失趨勢
+        recent_losses = torch.tensor(list(self.loss_history)[-5:])
+        loss_trend = (recent_losses[-1] - recent_losses[0]) / len(recent_losses)
+
+        # 分析梯度一致性
+        grad_consistency = self.compute_gradient_consistency()
+
+        # 檢測邊緣情況
+        is_edge = self.detect_edge_case()
+
+        # 計算乘數
+        if is_edge:
+            # 邊緣情況：更保守的學習率
+            multiplier = 0.5 + 0.3 * grad_consistency
+        elif loss_trend > 0:
+            # 損失上升：降低學習率
+            multiplier = 0.8
+        elif grad_consistency > 0.8:
+            # 梯度一致且損失下降：可以稍微提高學習率
+            multiplier = 1.2
+        else:
+            multiplier = 1.0
+
+        return max(0.1, min(2.0, multiplier))
+
+class Automagic_CameAMP_COptim(BaseOptimizer):
+    """
+    整合 C-Optim 的 Automagic_CameAMP 優化器
+    """
+
+    def __init__(self, params, **kwargs):
+        config = OptimizerConfig(**kwargs)
+        super().__init__(params, config)
+
+        self._step = 0
+
+        # C-Optim 模組
+        self.c_optim = ContextualOptimizationModule(
+            context_window=kwargs.get('context_window', 100),
+            edge_threshold=kwargs.get('edge_threshold', 0.95),
+            adaptation_rate=kwargs.get('adaptation_rate', 0.1)
+        )
+
+        # 多尺度動量
+        self.momentum_scales = [1, 5, 20, 100]  # 不同時間尺度
+
+    def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
+        """初始化包含 C-Optim 的狀態"""
+        super()._init_state(p, group)
+
+        state = self.state[p]
+
+        # C-Optim 特定狀態
+        state.setdefault('c_optim_context', {})
+        state.setdefault('edge_case_count', 0)
+        state.setdefault('contextual_lr_multiplier', 1.0)
+
+        # 多尺度動量
+        for scale in self.momentum_scales:
+            state.setdefault(f'momentum_scale_{scale}', torch.zeros_like(p))
+            state.setdefault(f'momentum_count_{scale}', 0)
+
+    def _update_multiscale_momentum(self, state: Dict[str, Any], grad: torch.Tensor, beta: float = 0.9):
+        """更新多尺度動量"""
+        for scale in self.momentum_scales:
+            momentum_key = f'momentum_scale_{scale}'
+            count_key = f'momentum_count_{scale}'
+
+            # 每 scale 步更新一次該尺度的動量
+            if state['step'] % scale == 0:
+                state[momentum_key].mul_(beta).add_(grad, alpha=1-beta)
+                state[count_key] += 1
+
+    def _get_contextual_update(self, state: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
+        """獲取上下文感知的更新"""
+        # 獲取不同尺度的動量
+        momentum_contributions = []
+        total_weight = 0
+
+        for scale in self.momentum_scales:
+            momentum = state[f'momentum_scale_{scale}']
+            count = state[f'momentum_count_{scale}']
+
+            if count > 0:
+                # 權重與尺度成反比（短期動量權重更高）
+                weight = 1.0 / scale
+                momentum_contributions.append(momentum * weight)
+                total_weight += weight
+
+        if momentum_contributions and total_weight > 0:
+            # 加權平均不同尺度的動量
+            combined_momentum = sum(momentum_contributions) / total_weight
+        else:
+            combined_momentum = grad
+
+        return combined_momentum
+
+    @torch.no_grad()
+    def step(self, closure: Optional[callable] = None) -> Optional[float]:
+        """執行一步優化，整合 C-Optim 功能"""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # 更新全域上下文（如果有損失值）
+        if loss is not None:
+            avg_grad_norm = 0
+            param_count = 0
+
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        avg_grad_norm += p.grad.norm().item()
+                        param_count += 1
+
+            if param_count > 0:
+                avg_grad_norm /= param_count
+                self.c_optim.update_context(
+                    torch.tensor(avg_grad_norm),
+                    loss.item(),
+                    group.get("lr", self.config.lr)
+                )
+
+        for group in self.param_groups:
+            # 計算全域上下文乘數
+            global_lr_multiplier = self.c_optim.compute_contextual_lr_multiplier()
+            is_edge_case = self.c_optim.detect_edge_case()
+
+            # 收集梯度進行 AGR
+            grads_this_group = []
+            for p in group["params"]:
+                if p.grad is not None:
+                    grads_this_group.append(p.grad.view(-1))
+            if len(grads_this_group) == 0:
+                continue
+
+            all_group_grads = torch.cat(grads_this_group)
+            abs_all_group_grads = torch.abs(all_group_grads)
+            sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
+
+            if self._step < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
+                mean_norm = abs_all_group_grads.mean()
+                std_norm = abs_all_group_grads.std(unbiased=False)
+
+            for p in group["params"]:
+                if p.grad is None or not p.requires_grad:
+                    continue
+
+                # AGR 正則化
+                abs_grad = torch.abs(p.grad)
+                alpha = abs_grad / sum_abs_all_group_grads
+                grad = p.grad * (1 - alpha)
+
+                # 初始化狀態
+                state = self.state[p]
+                if len(state) == 0:
+                    self._init_state(p, group)
+                if 'step' not in state:
+                    state['step'] = 0
+                state["step"] += 1
+
+                self._step = state["step"]
+
+                # 更新多尺度動量
+                self._update_multiscale_momentum(state, grad)
+
+                # 邊緣情況處理
+                if is_edge_case:
+                    state['edge_case_count'] += 1
+                    # 邊緣情況下使用更保守的策略
+                    edge_factor = 0.5
+                else:
+                    edge_factor = 1.0
+
+                # 清理暖身狀態
+                if state["step"] == group.get("warmup_steps", 0):
+                    if 's' in state:
+                        del state['s']
+                    if 'last_polarity' in state:
+                        del state['last_polarity']
+
+                beta1, beta2, beta3 = group["betas"]
+                eps1, eps2, eps3 = group["eps"]
+                exp_avg, exp_avg_res = state['exp_avg'], state["exp_avg_res"]
+
+                # CAME 或 AdaBelief 梯度縮放
+                if group.get("came", True):
+                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
+                    scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
+                    scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+                else:
+                    clip = state['step'] ** 0.25
+                    scaled_grad = grad.clamp(-clip, clip)
+
+                # 動量更新（整合多尺度）
+                contextual_update = self._get_contextual_update(state, scaled_grad)
+                exp_avg_bar, exp_avg = self._update_momentum(state, group, contextual_update, beta1, eps1)
+
+                # AdaBelief 變異數更新
+                res = (scaled_grad - exp_avg_bar).pow(2) + eps2
+                exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
+                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+
+                # Grams 更新
+                grams_update = update_p.abs() * grad.sign()
+                alpha = 1.0 * group.get('beta1_decay', 0.9995) ** state["step"]
+                update_p = alpha * grams_update + (1 - alpha) * update_p
+
+                # 正交梯度（早期暖身）
+                if state["step"] < group.get("warmup_steps", 500) / 2:
+                    update_p = self.orthograd_(p, update_p)
+
+                # 學習率遮罩更新
+                new_lr = self._update_learning_rate_mask(state, group, grad)
+
+                # 應用上下文感知的學習率調整
+                new_lr = new_lr * global_lr_multiplier * edge_factor
+                state['contextual_lr_multiplier'] = global_lr_multiplier * edge_factor
+
+                # 行縮放（ALLoRA）
+                if "row_scaling" in state:
+                    new_lr = new_lr * state["row_scaling"]
+
+                # 自適應權重衰減
+                if state["step"] < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
+                    param_abs_grad = abs_grad.mean()
+                    norm_grad = (param_abs_grad - mean_norm) / std_norm
+                    ada_alpha = 4
+                    theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
+                    p.data.mul_(1 - new_lr * group["weight_decay"] * theta)
+
+                # 應用更新
+                update_p = update_p.mul(new_lr)
+                p.add_(-update_p)
+
+        if self.config.verbose:
+            print(f"Lr: {[group['lr'] for group in self.param_groups]}")
+            print(f"Contextual Lr Multiplier: {global_lr_multiplier:.4f}")
+            print(f"Edge Case: {is_edge_case}")
+
+        return loss
+    def state_dict(self) -> Dict[str, Any]:
+        """Get the optimizer state dictionary."""
+        state = super().state_dict()
+        state['magic_version'] = 1
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """Load the optimizer state dictionary."""
+        if 'magic_version' not in state_dict or state_dict['magic_version'] != 1:
+            print('[WARNING] You loaded an unexpected state dict, some dynamic mask parameters may not be properly synchronized!')
+        super().load_state_dict(state_dict)
+
+class Automagic_CameAMP_COptim8bit(BaseOptimizer):
+    """8-bit 版本的 Automagic_CameAMP_COptim 優化器，結合 C-Optim 和 bitsandbytes 量化技術"""
+
+    def __init__(self, params, **kwargs):
+        config = OptimizerConfig(**kwargs)
+        super().__init__(params, config)
+        self._step = 0
+
+        # 檢查 bitsandbytes 可用性
+        try:
+            import bitsandbytes.functional as F
+            self.F = F
+            # 測試量化功能
+            test_tensor = torch.randn(10, 10, dtype=torch.float32)
+            _, _ = F.quantize_blockwise(test_tensor, blocksize=256)
+        except Exception as e:
+            raise RuntimeError(f"bitsandbytes 8-bit 量化不可用: {e}")
+
+        # C-Optim 模組初始化
+        self.c_optim = ContextualOptimizationModule(
+            context_window=kwargs.get('context_window', 100),
+            edge_threshold=kwargs.get('edge_threshold', 0.95),
+            adaptation_rate=kwargs.get('adaptation_rate', 0.1)
+        )
+
+        # 多尺度動量配置
+        self.momentum_scales = kwargs.get('momentum_scales', [1, 5, 10, 25])
+
+        print(f"[INFO] Initialize Automagic_CameAMP_COptim8bit optimizer")
+        print(f"[INFO] C-Optim config: context window={self.c_optim.context_window}, edge threshold={self.c_optim.edge_threshold}")
+        print(f"[INFO] Multi-scale momentum: {self.momentum_scales}")
+
+    def _quantize_tensor(self, tensor: torch.Tensor, blocksize: int = 4096) -> Tuple[torch.Tensor, torch.Tensor]:
+        """量化張量為 8-bit"""
+        if tensor.numel() == 0 or tensor.dtype == torch.bool:
+            return tensor, None
+
+        try:
+            # 確保張量在正確的設備上且為 float32
+            if tensor.device.type == 'cuda' and tensor.dtype != torch.float32:
+                tensor = tensor.float()
+
+            quantized, scale = self.F.quantize_blockwise(tensor, blocksize=blocksize)
+            return quantized, scale
+        except Exception:
+            # 量化失敗時返回原始張量
+            return tensor, None
+
+    def _dequantize_tensor(self, quantized: torch.Tensor, scale: torch.Tensor, blocksize: int = 4096) -> torch.Tensor:
+        """反量化張量"""
+        if scale is None:
+            return quantized
+
+        try:
+            return self.F.dequantize_blockwise(quantized, scale, blocksize=blocksize)
+        except Exception:
+            return quantized
+
+    def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
+        """初始化參數狀態，包含量化支援"""
+        state = self.state[p]
+
+        # 基本狀態初始化
+        state.setdefault('step', 0)
+        state.setdefault('exp_avg', torch.zeros_like(p))
+        state.setdefault('exp_avg_res', torch.zeros_like(p))
+
+        # 量化狀態
+        state.setdefault('exp_avg_quantized', None)
+        state.setdefault('exp_avg_scale', None)
+        state.setdefault('exp_avg_res_quantized', None)
+        state.setdefault('exp_avg_res_scale', None)
+
+        # CAME 相關狀態
+        if group and group.get("came", True):
+            state.setdefault('exp_avg_sq', torch.zeros_like(p))
+            state.setdefault('exp_avg_sq_quantized', None)
+            state.setdefault('exp_avg_sq_scale', None)
+
+        # 學習率遮罩
+        state.setdefault('lr_mask', torch.ones_like(p))
+        state.setdefault('lr_mask_quantized', None)
+        state.setdefault('lr_mask_scale', None)
+
+        # 極性追蹤（布林值，不需量化）
+        state.setdefault('polarity', torch.zeros(p.shape, dtype=torch.bool, device=p.device))
+        state.setdefault('last_polarity', torch.zeros(p.shape, dtype=torch.bool, device=p.device))
+
+        # ALLoRA 行縮放
+        if p.dim() >= 2:
+            state.setdefault('row_scaling', torch.ones(p.shape[0], device=p.device))
+
+        # C-Optim 特定狀態
+        state.setdefault('c_optim_context', {})
+        state.setdefault('edge_case_count', 0)
+        state.setdefault('contextual_lr_multiplier', 1.0)
+
+        # 多尺度動量（量化支援）
+        for scale in self.momentum_scales:
+            momentum_key = f'momentum_scale_{scale}'
+            state.setdefault(momentum_key, torch.zeros_like(p))
+            state.setdefault(f'{momentum_key}_quantized', None)
+            state.setdefault(f'{momentum_key}_scale', None)
+            state.setdefault(f'momentum_count_{scale}', 0)
+
+    def _update_multiscale_momentum(self, state: Dict[str, Any], grad: torch.Tensor, beta: float = 0.9):
+        """更新多尺度動量（8-bit 版本）"""
+        for scale in self.momentum_scales:
+            momentum_key = f'momentum_scale_{scale}'
+            count_key = f'momentum_count_{scale}'
+
+            # 每 scale 步更新一次該尺度的動量
+            if state['step'] % scale == 0:
+                # 反量化動量
+                if state[f'{momentum_key}_quantized'] is not None:
+                    momentum = self._dequantize_tensor(
+                        state[f'{momentum_key}_quantized'],
+                        state[f'{momentum_key}_scale']
+                    )
+                else:
+                    momentum = state[momentum_key]
+
+                # 更新動量
+                momentum.mul_(beta).add_(grad, alpha=1-beta)
+
+                # 重新量化並儲存
+                quantized, scale_tensor = self._quantize_tensor(momentum)
+                state[f'{momentum_key}_quantized'] = quantized
+                state[f'{momentum_key}_scale'] = scale_tensor
+                state[momentum_key] = momentum  # 保留一份用於計算
+
+                state[count_key] += 1
+
+    def _get_contextual_update(self, state: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
+        """獲取上下文感知的更新（8-bit 版本）"""
+        momentum_contributions = []
+        total_weight = 0
+
+        for scale in self.momentum_scales:
+            momentum_key = f'momentum_scale_{scale}'
+            count = state[f'momentum_count_{scale}']
+
+            if count > 0:
+                # 反量化動量
+                if state[f'{momentum_key}_quantized'] is not None:
+                    momentum = self._dequantize_tensor(
+                        state[f'{momentum_key}_quantized'],
+                        state[f'{momentum_key}_scale']
+                    )
+                else:
+                    momentum = state[momentum_key]
+
+                # 權重與尺度成反比
+                weight = 1.0 / scale
+                momentum_contributions.append(momentum * weight)
+                total_weight += weight
+
+        if momentum_contributions and total_weight > 0:
+            combined_momentum = sum(momentum_contributions) / total_weight
+        else:
+            combined_momentum = grad
+
+        return combined_momentum
+
+    def _update_torque_aware_momentum(self, state: Dict[str, Any], scaled_grad: torch.Tensor, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """更新扭矩感知動量（8-bit 版本）"""
+        # 反量化 exp_avg
+        if state['exp_avg_quantized'] is not None:
+            exp_avg = self._dequantize_tensor(state['exp_avg_quantized'], state['exp_avg_scale'])
+        else:
+            exp_avg = state['exp_avg']
+
+        # 計算扭矩
+        torque = torch.cross(exp_avg.view(-1), scaled_grad.view(-1), dim=0)
+        torque_magnitude = torch.norm(torque) + eps1
+
+        # 扭矩感知更新
+        torque_factor = 1.0 / (1.0 + torque_magnitude)
+        exp_avg_bar = exp_avg * torque_factor
+
+        # 重新量化並儲存
+        quantized, scale_tensor = self._quantize_tensor(exp_avg)
+        state['exp_avg_quantized'] = quantized
+        state['exp_avg_scale'] = scale_tensor
+        state['exp_avg'] = exp_avg
+
+        return exp_avg_bar, exp_avg
+
+    def _update_consistency_momentum(self, state: Dict[str, Any], group: Dict[str, Any], scaled_grad: torch.Tensor, beta1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """更新一致性動量（8-bit 版本）"""
+        # 反量化 exp_avg
+        if state['exp_avg_quantized'] is not None:
+            exp_avg = self._dequantize_tensor(state['exp_avg_quantized'], state['exp_avg_scale'])
+        else:
+            exp_avg = state['exp_avg']
+
+        # 計算梯度一致性
+        if state['step'] > 1:
+            grad_consistency = torch.cosine_similarity(
+                exp_avg.view(-1),
+                scaled_grad.view(-1),
+                dim=0
+            ).item()
+        else:
+            grad_consistency = 1.0
+
+        # 自適應 beta1
+        adaptive_beta1 = beta1 * (0.5 + 0.5 * abs(grad_consistency))
+
+        # 更新動量
+        exp_avg.mul_(adaptive_beta1).add_(scaled_grad, alpha=1 - adaptive_beta1)
+        exp_avg_bar = exp_avg.clone()
+
+        # 重新量化並儲存
+        quantized, scale_tensor = self._quantize_tensor(exp_avg)
+        state['exp_avg_quantized'] = quantized
+        state['exp_avg_scale'] = scale_tensor
+        state['exp_avg'] = exp_avg
+
+        return exp_avg_bar, exp_avg
+
+    def _update_post_warmup_lr_mask(self, state: Dict[str, Any], group: Dict[str, Any]) -> torch.Tensor:
+        """更新暖身後學習率遮罩（8-bit 版本）"""
+        # 反量化 lr_mask
+        if state['lr_mask_quantized'] is not None:
+            lr_mask = self._dequantize_tensor(state['lr_mask_quantized'], state['lr_mask_scale'])
+        else:
+            lr_mask = state['lr_mask']
+
+        # 極性變化檢測
+        current_polarity = state['polarity']
+        last_polarity = state['last_polarity']
+        polarity_change = (current_polarity != last_polarity).float()
+
+        # 更新學習率遮罩
+        lr_mask = lr_mask * (1 - 0.1 * polarity_change) + 0.1 * polarity_change
+        lr_mask = torch.clamp(lr_mask, min=group.get("min_lr", 1e-7) / group["lr"], max=1.0)
+
+        # 更新極性歷史
+        state['last_polarity'] = current_polarity.clone()
+
+        # 重新量化並儲存
+        quantized, scale_tensor = self._quantize_tensor(lr_mask)
+        state['lr_mask_quantized'] = quantized
+        state['lr_mask_scale'] = scale_tensor
+        state['lr_mask'] = lr_mask
+
+        return lr_mask
+
+    def _update_warmup_lr_mask(self, state: Dict[str, Any], group: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
+        """更新暖身期學習率遮罩（8-bit 版本）"""
+        # 反量化 lr_mask
+        if state['lr_mask_quantized'] is not None:
+            lr_mask = self._dequantize_tensor(state['lr_mask_quantized'], state['lr_mask_scale'])
+        else:
+            lr_mask = state['lr_mask']
+
+        # 梯度方向變化
+        grad_sign = grad.sign()
+        state['polarity'] = (grad_sign > 0)
+
+        if 'last_grad_sign' in state:
+            sign_change = (grad_sign != state['last_grad_sign']).float()
+            lr_mask = lr_mask * (1 - 0.05 * sign_change)
+
+        state['last_grad_sign'] = grad_sign
+        lr_mask = torch.clamp(lr_mask, min=group.get("min_lr", 1e-7) / group["lr"], max=1.0)
+
+        # 重新量化並儲存
+        quantized, scale_tensor = self._quantize_tensor(lr_mask)
+        state['lr_mask_quantized'] = quantized
+        state['lr_mask_scale'] = scale_tensor
+        state['lr_mask'] = lr_mask
+
+        return lr_mask
+
+    def _update_momentum(self, state: Dict[str, Any], group: Dict[str, Any], scaled_grad: torch.Tensor, beta1: float, eps1: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """更新動量（8-bit 版本）"""
+        if state["step"] < group.get("warmup_steps", 500) / 2:
+            return self._update_torque_aware_momentum(state, scaled_grad, eps1)
+        else:
+            return self._update_consistency_momentum(state, group, scaled_grad, beta1)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[callable] = None) -> Optional[float]:
+        """執行一步優化，整合 C-Optim 功能和 8-bit 量化"""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # 更新全域上下文
+        if loss is not None:
+            avg_grad_norm = 0
+            param_count = 0
+
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        avg_grad_norm += p.grad.norm().item()
+                        param_count += 1
+
+            if param_count > 0:
+                avg_grad_norm /= param_count
+                self.c_optim.update_context(
+                    torch.tensor(avg_grad_norm),
+                    loss.item(),
+                    group.get("lr", self.config.lr)
+                )
+
+        for group in self.param_groups:
+            # 計算全域上下文乘數
+            global_lr_multiplier = self.c_optim.compute_contextual_lr_multiplier()
+            is_edge_case = self.c_optim.detect_edge_case()
+
+            # AGR 正則化
+            grads_this_group = []
+            for p in group["params"]:
+                if p.grad is not None:
+                    grads_this_group.append(p.grad.view(-1))
+            if len(grads_this_group) == 0:
+                continue
+
+            all_group_grads = torch.cat(grads_this_group)
+            abs_all_group_grads = torch.abs(all_group_grads)
+            sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
+
+            if self._step < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
+                mean_norm = abs_all_group_grads.mean()
+                std_norm = abs_all_group_grads.std(unbiased=False)
+
+            for p in group["params"]:
+                if p.grad is None or not p.requires_grad:
+                    continue
+
+                # AGR 正則化
+                abs_grad = torch.abs(p.grad)
+                alpha = abs_grad / sum_abs_all_group_grads
+                grad = p.grad * (1 - alpha)
+
+                # 初始化狀態
+                state = self.state[p]
+                if len(state) == 0:
+                    self._init_state(p, group)
+                if 'step' not in state:
+                    state['step'] = 0
+                state["step"] += 1
+
+                self._step = state["step"]
+
+                # 更新多尺度動量
+                self._update_multiscale_momentum(state, grad)
+
+                # 邊緣情況處理
+                if is_edge_case:
+                    state['edge_case_count'] += 1
+                    edge_factor = 0.5
+                else:
+                    edge_factor = 1.0
+
+                beta1, beta2, beta3 = group["betas"]
+                eps1, eps2, eps3 = group["eps"]
+
+                # 反量化狀態張量
+                if state['exp_avg_quantized'] is not None:
+                    exp_avg = self._dequantize_tensor(state['exp_avg_quantized'], state['exp_avg_scale'])
+                else:
+                    exp_avg = state['exp_avg']
+
+                if state['exp_avg_res_quantized'] is not None:
+                    exp_avg_res = self._dequantize_tensor(state['exp_avg_res_quantized'], state['exp_avg_res_scale'])
+                else:
+                    exp_avg_res = state['exp_avg_res']
+
+                # CAME 或 AdaBelief 梯度縮放
+                if group.get("came", True):
+                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
+                    scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
+                    scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+
+                    # 重新量化 exp_avg_sq
+                    quantized, scale_tensor = self._quantize_tensor(exp_avg_sq)
+                    state['exp_avg_sq_quantized'] = quantized
+                    state['exp_avg_sq_scale'] = scale_tensor
+                    state['exp_avg_sq'] = exp_avg_sq
+                else:
+                    clip = state['step'] ** 0.25
+                    scaled_grad = grad.clamp(-clip, clip)
+
+                # 動量更新（整合多尺度和量化）
+                contextual_update = self._get_contextual_update(state, scaled_grad)
+                exp_avg_bar, exp_avg = self._update_momentum(state, group, contextual_update, beta1, eps1)
+
+                # AdaBelief 變異數更新
+                res = (scaled_grad - exp_avg_bar).pow(2) + eps2
+                exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
+                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+
+                # 重新量化 exp_avg_res
+                quantized, scale_tensor = self._quantize_tensor(exp_avg_res)
+                state['exp_avg_res_quantized'] = quantized
+                state['exp_avg_res_scale'] = scale_tensor
+                state['exp_avg_res'] = exp_avg_res
+
+                # Grams 更新
+                grams_update = update_p.abs() * grad.sign()
+                alpha = 1.0 * group.get('beta1_decay', 0.9995) ** state["step"]
+                update_p = alpha * grams_update + (1 - alpha) * update_p
+
+                # 正交梯度（早期暖身）
+                if state["step"] < group.get("warmup_steps", 500) / 2:
+                    update_p = self.orthograd_(p, update_p)
+
+                # 學習率遮罩更新
+                new_lr = self._update_learning_rate_mask(state, group, grad)
+
+                # 應用上下文感知的學習率調整
+                new_lr = new_lr * global_lr_multiplier * edge_factor
+                state['contextual_lr_multiplier'] = global_lr_multiplier * edge_factor
+
+                # 行縮放（ALLoRA）
+                if "row_scaling" in state:
+                    new_lr = new_lr * state["row_scaling"]
+
+                # 自適應權重衰減
+                if state["step"] < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
+                    param_abs_grad = abs_grad.mean()
+                    norm_grad = (param_abs_grad - mean_norm) / std_norm
+                    ada_alpha = 4
+                    theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
+                    p.data.mul_(1 - new_lr * group["weight_decay"] * theta)
+
+                # 應用更新
+                update_p = update_p.mul(new_lr)
+                p.add_(-update_p)
+
+        if self.config.verbose:
+            print(f"Lr: {[group['lr'] for group in self.param_groups]}")
+            print(f"Contextual Lr Multiplier: {global_lr_multiplier:.4f}")
+            print(f"Edge Case: {is_edge_case}")
+
+        return loss
+
+    def _update_learning_rate_mask(self, state: Dict[str, Any], group: Dict[str, Any], grad: torch.Tensor) -> torch.Tensor:
+        """更新學習率遮罩（8-bit 版本）"""
+        if state["step"] < group.get("warmup_steps", 500):
+            return self._update_warmup_lr_mask(state, group, grad)
+        else:
+            return self._update_post_warmup_lr_mask(state, group)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """獲取優化器狀態字典（包含量化狀態）"""
+        state = super().state_dict()
+        state['magic_version'] = 2  # 8-bit C-Optim 版本
+        state['c_optim_state'] = {
+            'context_window': self.c_optim.context_window,
+            'edge_threshold': self.c_optim.edge_threshold,
+            'adaptation_rate': self.c_optim.adaptation_rate,
+            'gradient_history': self.c_optim.gradient_history,
+            'loss_history': self.c_optim.loss_history,
+            'lr_history': self.c_optim.lr_history
+        }
+        state['momentum_scales'] = self.momentum_scales
+        return state
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        """載入優化器狀態字典（包含量化狀態）"""
+        if 'magic_version' not in state_dict or state_dict['magic_version'] != 2:
+            print('[WARNING] Unexpected state dict, some dynamic mask parameters may not be properly synchronized!')
+
+        # 載入 C-Optim 狀態
+        if 'c_optim_state' in state_dict:
+            c_state = state_dict['c_optim_state']
+            self.c_optim.gradient_history = c_state.get('gradient_history', [])
+            self.c_optim.loss_history = c_state.get('loss_history', [])
+            self.c_optim.lr_history = c_state.get('lr_history', [])
+
+        # 載入動量尺度
+        if 'momentum_scales' in state_dict:
+            self.momentum_scales = state_dict['momentum_scales']
+
+        super().load_state_dict(state_dict)
