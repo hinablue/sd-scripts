@@ -6075,6 +6075,41 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
 
     return result
 
+def compute_adaptive_stability_factor(model_pred: torch.Tensor,
+                                    target: torch.Tensor,
+                                    current_step: int = 0,
+                                    total_steps: int = 1000,
+                                    loss_history: list = None) -> torch.Tensor:
+    """
+    綜合多種因素計算自適應穩定性因子
+    """
+    with torch.no_grad():
+        # 1. 基於誤差統計的因子
+        error_magnitude = torch.abs(model_pred - target)
+        error_std = torch.std(error_magnitude)
+        error_mean = torch.mean(error_magnitude)
+
+        # 誤差相對穩定性
+        error_stability = torch.exp(-error_std / (error_mean + 1e-8))
+
+        # 2. 基於訓練進度的因子
+        progress = current_step / max(total_steps, 1)
+        progress_factor = 0.5 + 0.5 * progress  # 從0.5增長到1.0
+
+        # 3. 基於數值範圍的因子
+        pred_range = torch.max(model_pred) - torch.min(model_pred)
+        target_range = torch.max(target) - torch.min(target)
+        range_factor = torch.sigmoid(torch.log(pred_range / (target_range + 1e-8)))
+
+        # 4. 綜合計算
+        base_stability = 1.0
+        stability_factor = base_stability * error_stability * progress_factor * range_factor
+
+        # 限制範圍並確保數值穩定
+        stability_factor = torch.clamp(stability_factor, 0.1, 2.0)
+
+        return stability_factor
+
 def stable_mse_loss(model_pred: torch.Tensor, target: torch.Tensor, reduction: str = 'none') -> torch.Tensor:
     """
     基於 https://arxiv.org/pdf/2501.04697 的數值穩定版 MSE Loss (StableMSE)。
@@ -6129,17 +6164,123 @@ def stable_mse_loss(model_pred: torch.Tensor, target: torch.Tensor, reduction: s
     )
 
     # 8. 應用 reduction 策略
-    if reduction == 'none':
-        return squared_error
-    elif reduction == 'mean':
+    if reduction == 'mean':
         return squared_error.mean()
     elif reduction == 'sum':
         return squared_error.sum()
     else:
-        raise ValueError(f"不支援的 reduction 方式: {reduction}")
+        return squared_error
+
+def stable_cross_entropy_loss(model_pred: torch.Tensor, target: torch.Tensor,
+                             reduction: str = 'none', eps: float = 1e-8) -> torch.Tensor:
+    """
+    基於 https://arxiv.org/pdf/2501.04697 的數值穩定版交叉熵損失函數。
+
+    Args:
+        model_pred: 模型預測值 (logits)，shape: [batch_size, num_classes] 或 [batch_size, ...]
+        target: 目標值，shape 與 model_pred 相同或 [batch_size] (class indices)
+        reduction: 'mean', 'sum', 或 'none'
+        eps: 數值穩定性的小常數
+
+    Returns:
+        loss: 與 mse_loss 相同結構的損失值
+    """
+    # 保存原始形狀
+    original_pred_shape = model_pred.shape
+    original_target_shape = target.shape
+
+    # 強制展平到2D
+    batch_size = model_pred.size(0)
+    num_classes = model_pred.size(1) if model_pred.dim() > 1 else 1
+
+    # 展平 model_pred 到 [N, C]
+    if model_pred.dim() > 2:
+        model_pred_2d = model_pred.view(batch_size, num_classes, -1)
+        model_pred_2d = model_pred_2d.permute(0, 2, 1).contiguous()
+        model_pred_2d = model_pred_2d.view(-1, num_classes)
+    else:
+        model_pred_2d = model_pred.view(-1, num_classes)
+
+    # 展平 target
+    if target.dim() > 1:
+        if target.shape == original_pred_shape:
+            # target 是 one-hot 格式
+            target_2d = target.view(batch_size, num_classes, -1)
+            target_2d = target_2d.permute(0, 2, 1).contiguous()
+            target_2d = target_2d.view(-1, num_classes)
+        else:
+            # target 是索引格式
+            target_2d = target.view(-1)
+    else:
+        target_2d = target
+
+    # 轉換為概率分佈
+    if target_2d.dim() == 1:
+        target_probs = torch.nn.functional.one_hot(target_2d.long(), num_classes=num_classes).float()
+    else:
+        target_probs = target_2d
+
+    # 確保 target_probs 為正值且歸一化
+    target_probs = torch.clamp(target_probs, min=0.0)
+    target_probs = target_probs / (target_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # StableMax 計算
+    max_vals = model_pred_2d.max(dim=-1, keepdim=True)[0].detach()
+    stable_logits = model_pred_2d - max_vals
+    exp_logits = torch.exp(stable_logits)
+    probs = exp_logits / (exp_logits.sum(dim=-1, keepdim=True) + 1e-8)
+    # 確保概率在有效範圍內
+    probs = torch.clamp(probs, min=1e-8, max=1.0 - 1e-8)
+    # 計算對數概率
+    log_probs = torch.log(probs + 1e-8)
+    # 計算交叉熵
+    cross_entropy = -torch.sum(target_probs * log_probs, dim=-1)
+    # 簡單地對所有元素求平均，避免維度問題
+    loss = cross_entropy.mean()
+
+    # 根據當前維度進行填充
+    batch_size = original_pred_shape[0]
+    if loss.dim() == 0:  # 標量
+        # 擴展為 [B, 1, 1, 1]
+        loss = loss.expand(batch_size, 1, 1, 1)
+
+    elif loss.dim() == 1:  # [N]
+        if loss.size(0) == batch_size:
+            # [B] -> [B, 1, 1, 1]
+            loss = loss.view(batch_size, 1, 1, 1)
+        else:
+            # [N] -> [B, 1, 1, N//B] 或類似的重塑
+            elements_per_batch = loss.size(0) // batch_size
+            if elements_per_batch * batch_size == loss.size(0):
+                loss = loss.view(batch_size, 1, 1, elements_per_batch)
+            else:
+                # 填充到最接近的大小
+                target_size = batch_size
+                if loss.size(0) > target_size:
+                    loss = loss[:target_size]
+                else:
+                    padding_size = target_size - loss.size(0)
+                    padding = loss[-1].expand(padding_size)
+                    loss = torch.cat([loss, padding])
+                loss = loss.view(batch_size, 1, 1, 1)
+
+    elif loss.dim() == 2:  # [B, N]
+        # [B, N] -> [B, 1, 1, N]
+        loss = loss.unsqueeze(1).unsqueeze(2)
+
+    elif loss.dim() == 3:  # [B, H, W] 或 [B, N, M]
+        # [B, H, W] -> [B, 1, H, W]
+        loss = loss.unsqueeze(1)
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
 
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, loss_type: str, reduction: str, huber_c: Optional[torch.Tensor] = None
+    model_pred: torch.Tensor, target: torch.Tensor, loss_type: str, reduction: str, huber_c: Optional[torch.Tensor] = None, current_step: int = 0, total_steps: int = 1000
 ):
     """
     NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
@@ -6172,13 +6313,14 @@ def conditional_loss(
         """
 
         # 計算標準 MSE
-        standard_mse = F.mse_loss(model_pred, target, reduction=reduction)
+        standard_mse = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
 
         # 計算穩定化 MSE
         stable_mse = stable_mse_loss(model_pred, target, reduction=reduction)
 
         # 自適應混合兩種損失
         # 當誤差較大時，更多使用穩定化版本
+        stability_factor = compute_adaptive_stability_factor(model_pred, target, current_step, total_steps)
         with torch.no_grad():
             error_magnitude = torch.abs(model_pred - target)
             error_std = torch.std(error_magnitude)
@@ -6193,6 +6335,19 @@ def conditional_loss(
             loss = loss.mean()
         elif reduction == 'sum':
             loss = loss.sum()
+    elif loss_type == "stable_max":
+        # 處理單一值的情況（如 scalar tensor）
+        if model_pred.dim() == 0:
+            model_pred = model_pred.unsqueeze(0)
+        if target.dim() == 0:
+            target = target.unsqueeze(0)
+
+        # 如果只有一個類別，退化為MSE
+        if model_pred.size(-1) == 1:
+            loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+        else:
+            # 應用 StableMax 交叉熵
+            loss = stable_cross_entropy_loss(model_pred, target, reduction=reduction)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     return loss

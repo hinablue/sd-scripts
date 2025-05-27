@@ -404,7 +404,7 @@ class Automagic_CameAMP(BaseOptimizer):
                 alpha = 1.0 * group['beta1_decay'] ** state["step"]
                 update_p = alpha * grams_update + (1 - alpha) * update_p
 
-                if state["step"] < group["warmup_steps"] / 2:
+                if state["step"] < group.get("warmup_steps", 500) / 2:
                     """
                     === 正交梯度 ===
                     Grokking at the Edge of Numerical Stability
@@ -427,7 +427,7 @@ class Automagic_CameAMP(BaseOptimizer):
                 Mirror, Mirror of the Flow: How Does Regularization Shape Implicit Bias?
                 https://arxiv.org/abs/2504.12883
                 """
-                if state["step"] < group["warmup_steps"] / 2 and group["weight_decay"] > 0:
+                if state["step"] < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
                     """
                     Adaptive Weight Decay for Deep Neural Networks
                     https://arxiv.org/abs/1907.08931
@@ -683,6 +683,10 @@ class Automagic_CameAMP8bit(BaseOptimizer):
             abs_all_group_grads = torch.abs(all_group_grads)
             sum_abs_all_group_grads = torch.sum(abs_all_group_grads)
 
+            if self._step < self.config.warmup_steps / 2 and self.config.weight_decay > 0:
+                mean_norm = abs_all_group_grads.mean()
+                std_norm = abs_all_group_grads.std(unbiased=False)
+
             for p in group["params"]:
                 if p.grad is None or not p.requires_grad:
                     continue
@@ -703,7 +707,7 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 self._step = state["step"]
 
                 # Clean up warmup-specific states after warmup
-                if state["step"] == group.get("warmup_steps", 500):
+                if state["step"] == group.get("warmup_steps", 0):
                     if 's_q' in state:
                         del state['s_q']
                         del state['s_q_scale']
@@ -756,6 +760,13 @@ class Automagic_CameAMP8bit(BaseOptimizer):
                 if "row_scaling_q" in state:
                     row_scaling = self._dequantize_tensor(state['row_scaling_q'], state['row_scaling_q_scale'])
                     new_lr = new_lr * row_scaling
+
+                if state["step"] < group.get("warmup_steps", 500)/ 2 and group["weight_decay"] > 0:
+                    param_abs_grad = abs_grad.mean()
+                    norm_grad = (param_abs_grad - mean_norm) / std_norm
+                    ada_alpha = 4
+                    theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
+                    p.data.mul_(1 - new_lr * group["weight_decay"] * theta)
 
                 # Apply learning rate and update parameters
                 update_p = update_p.mul(new_lr)
