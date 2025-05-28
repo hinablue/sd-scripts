@@ -232,6 +232,12 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
             all_group_grads = torch.cat(grads_this_group)
             sum_abs_all_group_grads = torch.sum(torch.abs(all_group_grads))
 
+            if any(self.state.get(p, {}).get("step", 0) < group.get("warmup_steps", 500) / 2
+                   for p in group["params"] if p.grad is not None) and group["weight_decay"] > 0:
+                abs_all_group_grads = torch.abs(all_group_grads)
+                mean_norm = abs_all_group_grads.mean()
+                std_norm = abs_all_group_grads.std(unbiased=False)
+
             for p in group["params"]:
                 if p.grad is None or not p.requires_grad:
                     continue
