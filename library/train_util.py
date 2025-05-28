@@ -31,6 +31,7 @@ from packaging.version import Version
 
 from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit, Automagic_CameAMP_COptim, Automagic_CameAMP_COptim8bit
 from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
+from library.automagic_cameamp_improved_8bit import Automagic_CameAMP_Improved_8Bit
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -4816,6 +4817,16 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = Automagic_CameAMP
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "Automagic_CameAMP_COptim".lower():
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+
+        logger.info(f"use Automagic_CameAMP_COptim optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_CameAMP_COptim
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type == "Automagic_CameAMP_Improved".lower():
         logger.info(f"use Automagic_CameAMP_Improved optimizer | {optimizer_kwargs}")
         optimizer_class = Automagic_CameAMP_Improved
@@ -4850,6 +4861,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         elif optimizer_type == "Automagic_CameAMP_COptim8bit".lower():
             logger.info(f"use 8-bit Automagic_CameAMP_COptim optimizer | {optimizer_kwargs}")
             optimizer_class = Automagic_CameAMP_COptim8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "Automagic_CameAMP_Improved8bit".lower():
+            logger.info(f"use Automagic_CameAMP_Improved_8Bit optimizer | {optimizer_kwargs}")
+            optimizer_class = Automagic_CameAMP_Improved_8Bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "SGDNesterov8bit".lower():

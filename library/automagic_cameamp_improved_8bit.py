@@ -59,6 +59,52 @@ class Improved8BitOptimizerConfig:
     fused_adam: bool = False  # 是否使用融合的 Adam 操作
     force_8bit: bool = False  # 強制所有狀態使用 8bit
 
+    # 新增：配置檔案選擇參數
+    profile: Optional[str] = None  # 可選值: 'memory_optimized', 'quality_optimized', 'balanced', None
+
+    def __post_init__(self):
+        """初始化後處理，根據 profile 載入預定義配置"""
+        if self.profile is not None:
+            self._apply_profile(self.profile)
+
+    def _apply_profile(self, profile_name: str):
+        """根據設定檔名稱應用預定義配置"""
+        if profile_name == 'memory_optimized':
+            # 記憶體優化配置 - 最大記憶體節省
+            self.force_8bit = True
+            self.min_8bit_size = 1024
+            self.edge_suppression = False
+            self.spatial_awareness = False
+            self.verbose = False
+            self.background_regularization = False
+            self.frequency_penalty = 0.0
+            self.lora_rank_penalty = False
+
+        elif profile_name == 'quality_optimized':
+            # 品質優化配置 - 最佳訓練效果
+            self.edge_suppression = True
+            self.edge_penalty = 0.15
+            self.background_regularization = True
+            self.spatial_awareness = True
+            self.lora_rank_penalty = True
+            self.frequency_penalty = 0.08
+            self.rank_penalty_strength = 0.02
+            self.verbose = True
+
+        elif profile_name == 'balanced':
+            # 平衡配置 - 記憶體與品質兼顧
+            self.min_8bit_size = 4096
+            self.edge_suppression = True
+            self.edge_penalty = 0.1
+            self.background_regularization = True
+            self.spatial_awareness = True
+            self.lora_rank_penalty = True
+            self.frequency_penalty = 0.05
+            self.verbose = True
+
+        else:
+            available_profiles = ['memory_optimized', 'quality_optimized', 'balanced']
+            raise ValueError(f"未知的設定檔案: {profile_name}. 可用的設定檔案: {available_profiles}")
 
 class BitsAndBytesOptimized(torch.optim.Optimizer):
     """使用 bitsandbytes 的改進版優化器基類."""
@@ -284,15 +330,41 @@ class Automagic_CameAMP_Improved_8Bit(BitsAndBytesOptimized):
     """
 
     def __init__(self, params, **kwargs):
-        config = Improved8BitOptimizerConfig(**kwargs)
+        # 如果提供了 profile 參數，先用它創建基礎配置
+        profile = kwargs.pop('profile', None)
+        if profile is not None:
+            # 從預定義配置開始
+            if profile == 'memory_optimized':
+                base_config = OptimizationProfiles.memory_optimized()
+            elif profile == 'quality_optimized':
+                base_config = OptimizationProfiles.quality_optimized()
+            elif profile == 'balanced':
+                base_config = OptimizationProfiles.balanced()
+            else:
+                available_profiles = ['memory_optimized', 'quality_optimized', 'balanced']
+                raise ValueError(f"未知的設定檔案: {profile}. 可用的設定檔案: {available_profiles}")
+
+            # 將基礎配置轉換為字典
+            base_dict = base_config.__dict__.copy()
+            # 用使用者提供的 kwargs 覆蓋基礎配置
+            base_dict.update(kwargs)
+            config = Improved8BitOptimizerConfig(**base_dict)
+        else:
+            # 直接使用 kwargs 創建配置
+            config = Improved8BitOptimizerConfig(**kwargs)
+
         super().__init__(params, config)
 
         if self.config.verbose:
             print(f"🚀 初始化 Automagic_CameAMP_Improved_8Bit 優化器")
+            if profile:
+                print(f"📋 使用設定檔案: {profile}")
             print(f"📊 8bit 量化: {'啟用' if BITSANDBYTES_AVAILABLE else '停用'}")
             print(f"🎯 邊緣抑制: {'啟用' if config.edge_suppression else '停用'}")
             print(f"🌅 背景正則化: {'啟用' if config.background_regularization else '停用'}")
             print(f"🧠 LoRA 優化: {'啟用' if config.lora_rank_penalty else '停用'}")
+            print(f"🔧 最小 8bit 張量大小: {config.min_8bit_size}")
+            print(f"💾 強制 8bit: {'是' if config.force_8bit else '否'}")
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
@@ -575,17 +647,38 @@ class Automagic_CameAMP_Improved_8Bit(BitsAndBytesOptimized):
 
 
 # 便利函數
-def create_improved_8bit_optimizer(model_parameters, **kwargs) -> Automagic_CameAMP_Improved_8Bit:
+def create_improved_8bit_optimizer(model_parameters, profile: Optional[str] = None, **kwargs) -> Automagic_CameAMP_Improved_8Bit:
     """
     便利函數：創建改進版 8bit 優化器.
 
     Args:
         model_parameters: 模型參數
-        **kwargs: 配置參數
+        profile: 預定義配置檔案名稱 ('memory_optimized', 'quality_optimized', 'balanced')
+        **kwargs: 其他配置參數，將覆蓋 profile 中的設定
 
     Returns:
         Automagic_CameAMP_Improved_8Bit 實例
+
+    Examples:
+        # 使用記憶體優化配置
+        optimizer = create_improved_8bit_optimizer(model.parameters(), profile='memory_optimized')
+
+        # 使用品質優化配置，但自定義學習率
+        optimizer = create_improved_8bit_optimizer(
+            model.parameters(),
+            profile='quality_optimized',
+            lr=2e-4
+        )
+
+        # 不使用預設配置，完全自定義
+        optimizer = create_improved_8bit_optimizer(
+            model.parameters(),
+            lr=1e-4,
+            edge_suppression=True
+        )
     """
+    if profile is not None:
+        kwargs['profile'] = profile
     return Automagic_CameAMP_Improved_8Bit(model_parameters, **kwargs)
 
 
