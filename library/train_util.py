@@ -30,6 +30,7 @@ from tqdm import tqdm
 from packaging.version import Version
 
 from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit, Automagic_CameAMP_COptim, Automagic_CameAMP_COptim8bit
+from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -4813,6 +4814,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
 
         logger.info(f"use Automagic_CameAMP optimizer | {optimizer_kwargs}")
         optimizer_class = Automagic_CameAMP
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_CameAMP_Improved".lower():
+        logger.info(f"use Automagic_CameAMP_Improved optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_CameAMP_Improved
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "Automagic_CameAMP_COptim".lower():
