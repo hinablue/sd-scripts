@@ -20,9 +20,7 @@ class ImprovedOptimizerConfig:
     beta1_decay: float = 0.9995
     weight_decay: float = 5e-4
     warmup_steps: int = 500
-    context_window: int = 30
     edge_threshold: float = 0.6
-    adaptation_rate: float = 0.25
     came: bool = True
     full_finetune: bool = False
     verbose: bool = False
@@ -54,9 +52,7 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
             beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
-            context_window=config.context_window,
             edge_threshold=config.edge_threshold,
-            adaptation_rate=config.adaptation_rate,
             came=config.came,
             full_finetune=config.full_finetune,
             edge_suppression=config.edge_suppression,

@@ -25,10 +25,8 @@ class Improved8BitOptimizerConfig:
     clip_threshold: float = 1.0
     betas: Tuple[float, float, float] = (0.8, 0.99, 0.999)
     eta: float = 2.0
-    beta1_decay: float = 0.9995
     weight_decay: float = 5e-4
     warmup_steps: int = 500
-    context_window: int = 30
     edge_threshold: float = 0.6
     adaptation_rate: float = 0.25
     came: bool = True
@@ -126,10 +124,8 @@ class BitsAndBytesOptimized(torch.optim.Optimizer):
             clip_threshold=config.clip_threshold,
             betas=config.betas,
             eta=eta_value,
-            beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
-            context_window=config.context_window,
             edge_threshold=config.edge_threshold,
             adaptation_rate=config.adaptation_rate,
             came=config.came,
