@@ -4,6 +4,7 @@ from torch.nn.functional import normalize
 from dataclasses import dataclass
 from collections import deque
 import math
+import random
 
 @dataclass
 class OptimizerConfig:
@@ -19,6 +20,9 @@ class OptimizerConfig:
     beta1_decay: float = 0.9995
     weight_decay: float = 5e-4
     warmup_steps: int = 500
+    context_window: int = 30,
+    edge_threshold: float = 0.6,
+    adaptation_rate: float = 0.25,
     came: bool = True
     full_finetune: bool = False
     verbose: bool = False
@@ -40,6 +44,9 @@ class BaseOptimizer(torch.optim.Optimizer):
             beta1_decay=config.beta1_decay,
             weight_decay=config.weight_decay,
             warmup_steps=config.warmup_steps,
+            context_window=config.context_window,
+            edge_threshold=config.edge_threshold,
+            adaptation_rate=config.adaptation_rate,
             came=config.came,
             full_finetune=config.full_finetune,
         )
@@ -372,7 +379,6 @@ class Automagic_CameAMP(BaseOptimizer):
                     exp_avg_sq = state["exp_avg_sq"]
                     exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
                     scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
-
                     scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
                 else:
                     # Adabelief
@@ -393,7 +399,7 @@ class Automagic_CameAMP(BaseOptimizer):
                 """
                 res = (scaled_grad - exp_avg_bar).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
-                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt() + eps2)
 
                 """
                 === Grams ===
@@ -861,8 +867,8 @@ class ContextualOptimizationModule:
     """
 
     def __init__(self,
-                 context_window: int = 100,
-                 edge_threshold: float = 0.95,
+                 context_window: int = 50,
+                 edge_threshold: float = 0.9,
                  adaptation_rate: float = 0.1):
         self.context_window = context_window
         self.edge_threshold = edge_threshold
@@ -873,11 +879,32 @@ class ContextualOptimizationModule:
         self.loss_history: Deque[float] = deque(maxlen=context_window)
         self.lr_history: Deque[float] = deque(maxlen=context_window)
 
+        # 新增：性能追蹤
+        self.performance_history: Deque[float] = deque(maxlen=50)
+        self.convergence_rate: float = 0.0
+        self.stable_steps: int = 0
+
     def update_context(self, gradient: torch.Tensor, loss: float, lr: float):
         """更新上下文信息"""
         self.gradient_history.append(gradient.detach().clone())
         self.loss_history.append(loss)
         self.lr_history.append(lr)
+
+        # 計算性能指標
+        if len(self.loss_history) >= 2:
+            loss_improvement = self.loss_history[-2] - self.loss_history[-1]
+            self.performance_history.append(loss_improvement)
+
+            # 更新收斂率
+            if len(self.performance_history) >= 10:
+                recent_improvements = list(self.performance_history)[-10:]
+                self.convergence_rate = sum(recent_improvements) / len(recent_improvements)
+
+                # 追蹤穩定步數
+                if abs(loss_improvement) < 1e-6:
+                    self.stable_steps += 1
+                else:
+                    self.stable_steps = 0
 
     def compute_gradient_consistency(self) -> float:
         """計算梯度一致性指標"""
@@ -898,55 +925,122 @@ class ContextualOptimizationModule:
 
         return sum(consistencies) / len(consistencies) if consistencies else 1.0
 
+    def compute_loss_stability(self) -> float:
+        """計算損失穩定性"""
+        if len(self.loss_history) < 10:
+            return 1.0
+
+        recent_losses = torch.tensor(list(self.loss_history)[-10:])
+        loss_std = torch.std(recent_losses)
+        loss_mean = torch.mean(recent_losses)
+
+        # 計算變異係數（越小越穩定）
+        cv = loss_std / (loss_mean + 1e-8)
+        # 轉換為穩定性分數（0-1，越大越穩定）
+        stability = torch.exp(-cv).item()
+        return min(1.0, max(0.0, stability))
+
     def detect_edge_case(self) -> bool:
-        """檢測是否為邊緣情況"""
+        """檢測是否為邊緣情況 - LoRA 優化版本"""
         if len(self.loss_history) < 10:
             return False
 
         recent_losses = list(self.loss_history)[-10:]
 
-        # 檢測損失震盪
+        # 檢測損失震盪（放寬標準）
         loss_variance = torch.var(torch.tensor(recent_losses))
         loss_mean = torch.mean(torch.tensor(recent_losses))
         cv = loss_variance.sqrt() / (loss_mean + 1e-8)  # 變異係數
 
-        # 檢測梯度一致性
+        # 檢測梯度一致性（降低要求）
         grad_consistency = self.compute_gradient_consistency()
 
-        # 邊緣情況：高變異係數或低梯度一致性
-        is_edge = cv > 0.5 or grad_consistency < 0.3
+        # 檢測是否陷入停滯（放寬條件）
+        loss_stagnation = self.stable_steps > 30  # 增加到 30 步
+
+        # LoRA 友好的邊緣情況判斷：更寬容的閾值
+        # 變異係數閾值從 0.3 提高到 0.5
+        # 梯度一致性閾值從 0.4 降低到 0.2
+        is_edge = cv > 0.5 or grad_consistency < 0.2 or loss_stagnation
 
         return is_edge
 
     def compute_contextual_lr_multiplier(self) -> float:
-        """計算上下文感知的學習率乘數"""
+        """計算上下文感知的學習率乘數 - LoRA 優化版本"""
         if len(self.loss_history) < 5:
-            return 1.0
+            return 1.2  # LoRA 初期需要較高學習率
 
-        # 分析損失趨勢
-        recent_losses = torch.tensor(list(self.loss_history)[-5:])
-        loss_trend = (recent_losses[-1] - recent_losses[0]) / len(recent_losses)
+        # 分析損失趨勢（使用更長的歷史）
+        recent_losses = torch.tensor(list(self.loss_history)[-10:])
 
-        # 分析梯度一致性
+        # 計算多種趨勢指標
+        short_trend = (recent_losses[-1] - recent_losses[-3]) / 2  # 短期趨勢
+        long_trend = (recent_losses[-1] - recent_losses[0]) / len(recent_losses)  # 長期趨勢
+
+        # 分析梯度一致性和損失穩定性
         grad_consistency = self.compute_gradient_consistency()
+        loss_stability = self.compute_loss_stability()
 
-        # 檢測邊緣情況
+        # 檢測邊緣情況（放寬條件）
         is_edge = self.detect_edge_case()
 
-        # 計算乘數
-        if is_edge:
-            # 邊緣情況：更保守的學習率
-            multiplier = 0.5 + 0.3 * grad_consistency
-        elif loss_trend > 0:
-            # 損失上升：降低學習率
-            multiplier = 0.8
-        elif grad_consistency > 0.8:
-            # 梯度一致且損失下降：可以稍微提高學習率
-            multiplier = 1.2
-        else:
-            multiplier = 1.0
+        # 計算收斂速度因子
+        convergence_factor = 1.0
+        if len(self.performance_history) >= 5:
+            avg_improvement = sum(list(self.performance_history)[-5:]) / 5
+            if avg_improvement > 0:
+                convergence_factor = min(2.0, 1.0 + avg_improvement * 150)  # 增強正向提升
+            elif avg_improvement < -1e-4:
+                convergence_factor = max(0.8, 1.0 + avg_improvement * 30)   # 減少負向懲罰
 
-        return max(0.1, min(2.0, multiplier))
+        # LoRA 優化的乘數計算邏輯
+        if is_edge:
+            # 邊緣情況：對 LoRA 更寬容，保持合理的學習率
+            if grad_consistency > 0.7:
+                multiplier = 1.0 + 0.5 * grad_consistency  # 1.0-1.35（提高基準）
+            else:
+                multiplier = 0.8 + 0.6 * grad_consistency  # 0.8-1.4（提高上限）
+
+        elif short_trend > 1e-5:  # 短期損失明顯上升
+            # LoRA 訓練中輕微的損失上升是正常的
+            multiplier = 0.9 + 0.3 * loss_stability  # 0.9-1.2（提高基準）
+
+        elif long_trend < -1e-6:  # 長期有改善趨勢
+            if grad_consistency > 0.8 and loss_stability > 0.7:
+                # 良好的一致性和穩定性 → 積極學習（LoRA 適合）
+                multiplier = 1.5 + 0.8 * grad_consistency  # 1.5-2.3
+            elif grad_consistency > 0.6:
+                # 中等一致性 → 適度提升
+                multiplier = 1.3 + 0.4 * grad_consistency  # 1.3-1.7
+            else:
+                # 低一致性但有改善 → 保守但不過度
+                multiplier = 1.1 + 0.3 * grad_consistency  # 1.1-1.4
+
+        elif abs(long_trend) < 1e-7:  # 停滯狀態
+            if self.stable_steps > 15:  # 放寬停滯檢測
+                # LoRA 訓練可能需要更強的突破力度
+                multiplier = 1.6 + 0.4 * random.uniform(0, 1)  # 1.6-2.0（帶隨機性）
+            else:
+                multiplier = 1.2  # 保持較高基準
+
+        else:
+            # 預設情況：LoRA 友好的基準值
+            base_multiplier = 1.1 + 0.3 * grad_consistency  # 1.1-1.4
+            stability_bonus = 0.2 * loss_stability  # 0-0.2（增加穩定性獎勵）
+            multiplier = base_multiplier + stability_bonus
+
+        # 應用收斂速度因子
+        multiplier *= convergence_factor
+
+        # LoRA 優化的動態邊界調整
+        if is_edge:
+            min_mult = 0.6  # 即使在邊緣情況也不過度降低
+            max_mult = 3.5  # 提高上限
+        else:
+            min_mult = 0.8  # 提高正常情況的最小值
+            max_mult = 4.0 if grad_consistency > 0.9 and loss_stability > 0.8 else 3.0
+
+        return max(min_mult, min(max_mult, multiplier))
 
 class Automagic_CameAMP_COptim(BaseOptimizer):
     """
@@ -961,8 +1055,8 @@ class Automagic_CameAMP_COptim(BaseOptimizer):
 
         # C-Optim 模組
         self.c_optim = ContextualOptimizationModule(
-            context_window=kwargs.get('context_window', 100),
-            edge_threshold=kwargs.get('edge_threshold', 0.95),
+            context_window=kwargs.get('context_window', 50),
+            edge_threshold=kwargs.get('edge_threshold', 0.9),
             adaptation_rate=kwargs.get('adaptation_rate', 0.1)
         )
 
@@ -1032,17 +1126,23 @@ class Automagic_CameAMP_COptim(BaseOptimizer):
         if loss is not None:
             avg_grad_norm = 0
             param_count = 0
+            total_grad_norm = 0
 
             for group in self.param_groups:
                 for p in group["params"]:
                     if p.grad is not None:
-                        avg_grad_norm += p.grad.norm().item()
+                        grad_norm = p.grad.norm().item()
+                        avg_grad_norm += grad_norm
+                        total_grad_norm += grad_norm ** 2
                         param_count += 1
 
             if param_count > 0:
                 avg_grad_norm /= param_count
+                rms_grad_norm = (total_grad_norm / param_count) ** 0.5
+
+                # 使用 RMS 梯度範數提供更穩定的上下文信息
                 self.c_optim.update_context(
-                    torch.tensor(avg_grad_norm),
+                    torch.tensor(rms_grad_norm),
                     loss.item(),
                     group.get("lr", self.config.lr)
                 )
@@ -1090,13 +1190,22 @@ class Automagic_CameAMP_COptim(BaseOptimizer):
                 # 更新多尺度動量
                 self._update_multiscale_momentum(state, grad)
 
-                # 邊緣情況處理
+                # 邊緣情況處理 - 改進版
                 if is_edge_case:
                     state['edge_case_count'] += 1
-                    # 邊緣情況下使用更保守的策略
-                    edge_factor = 0.5
+                    # 根據邊緣情況的嚴重程度動態調整
+                    grad_consistency = self.c_optim.compute_gradient_consistency()
+                    loss_stability = self.c_optim.compute_loss_stability()
+
+                    # 組合穩定性分數
+                    stability_score = (grad_consistency + loss_stability) / 2
+
+                    # 動態邊緣因子：穩定性越高，懲罰越小
+                    edge_factor = 0.4 + 0.4 * stability_score  # 0.4-0.8
                 else:
                     edge_factor = 1.0
+                    # 重置邊緣情況計數
+                    state['edge_case_count'] = max(0, state['edge_case_count'] - 1)
 
                 # 清理暖身狀態
                 if state["step"] == group.get("warmup_steps", 0):
@@ -1126,7 +1235,7 @@ class Automagic_CameAMP_COptim(BaseOptimizer):
                 # AdaBelief 變異數更新
                 res = (scaled_grad - exp_avg_bar).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
-                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt() + eps2)
 
                 # Grams 更新
                 grams_update = update_p.abs() * grad.sign()
@@ -1198,13 +1307,13 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
 
         # C-Optim 模組初始化
         self.c_optim = ContextualOptimizationModule(
-            context_window=kwargs.get('context_window', 100),
-            edge_threshold=kwargs.get('edge_threshold', 0.95),
+            context_window=kwargs.get('context_window', 50),
+            edge_threshold=kwargs.get('edge_threshold', 0.9),
             adaptation_rate=kwargs.get('adaptation_rate', 0.1)
         )
 
         # 多尺度動量配置
-        self.momentum_scales = kwargs.get('momentum_scales', [1, 5, 10, 25])
+        self.momentum_scales = kwargs.get('momentum_scales', [1, 5, 20, 100])
 
         print(f"[INFO] Initialize Automagic_CameAMP_COptim8bit optimizer")
         print(f"[INFO] C-Optim config: context window={self.c_optim.context_window}, edge threshold={self.c_optim.edge_threshold}")
@@ -1473,17 +1582,23 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
         if loss is not None:
             avg_grad_norm = 0
             param_count = 0
+            total_grad_norm = 0
 
             for group in self.param_groups:
                 for p in group["params"]:
                     if p.grad is not None:
-                        avg_grad_norm += p.grad.norm().item()
+                        grad_norm = p.grad.norm().item()
+                        avg_grad_norm += grad_norm
+                        total_grad_norm += grad_norm ** 2
                         param_count += 1
 
             if param_count > 0:
                 avg_grad_norm /= param_count
+                rms_grad_norm = (total_grad_norm / param_count) ** 0.5
+
+                # 使用 RMS 梯度範數提供更穩定的上下文信息
                 self.c_optim.update_context(
-                    torch.tensor(avg_grad_norm),
+                    torch.tensor(rms_grad_norm),
                     loss.item(),
                     group.get("lr", self.config.lr)
                 )
@@ -1531,12 +1646,22 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
                 # 更新多尺度動量
                 self._update_multiscale_momentum(state, grad)
 
-                # 邊緣情況處理
+                # 邊緣情況處理 - 改進版
                 if is_edge_case:
                     state['edge_case_count'] += 1
-                    edge_factor = 0.5
+                    # 根據邊緣情況的嚴重程度動態調整
+                    grad_consistency = self.c_optim.compute_gradient_consistency()
+                    loss_stability = self.c_optim.compute_loss_stability()
+
+                    # 組合穩定性分數
+                    stability_score = (grad_consistency + loss_stability) / 2
+
+                    # 動態邊緣因子：穩定性越高，懲罰越小
+                    edge_factor = 0.4 + 0.4 * stability_score  # 0.4-0.8
                 else:
                     edge_factor = 1.0
+                    # 重置邊緣情況計數
+                    state['edge_case_count'] = max(0, state['edge_case_count'] - 1)
 
                 beta1, beta2, beta3 = group["betas"]
                 eps1, eps2, eps3 = group["eps"]
@@ -1554,7 +1679,7 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
 
                 # CAME 或 AdaBelief 梯度縮放
                 if group.get("came", True):
-                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq = self._dequantize_tensor(state['exp_avg_sq_q'], state['exp_avg_sq_q_scale'])
                     exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
                     scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
                     scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
@@ -1575,7 +1700,7 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
                 # AdaBelief 變異數更新
                 res = (scaled_grad - exp_avg_bar).pow(2) + eps2
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
-                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
+                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt() + eps2)
 
                 # 重新量化 exp_avg_res
                 quantized, scale_tensor = self._quantize_tensor(exp_avg_res)
@@ -1592,16 +1717,17 @@ class Automagic_CameAMP_COptim8bit(BaseOptimizer):
                 if state["step"] < group.get("warmup_steps", 500) / 2:
                     update_p = self.orthograd_(p, update_p)
 
-                # 學習率遮罩更新
-                new_lr = self._update_learning_rate_mask(state, group, grad)
-
                 # 應用上下文感知的學習率調整
                 new_lr = new_lr * global_lr_multiplier * edge_factor
                 state['contextual_lr_multiplier'] = global_lr_multiplier * edge_factor
 
+                # 學習率遮罩更新
+                new_lr = self._update_learning_rate_mask(state, group, grad)
+
                 # 行縮放（ALLoRA）
                 if "row_scaling" in state:
-                    new_lr = new_lr * state["row_scaling"]
+                    row_scaling = self._dequantize_tensor(state['row_scaling_q'], state['row_scaling_q_scale'])
+                    new_lr = new_lr * row_scaling
 
                 # 自適應權重衰減
                 if state["step"] < group.get("warmup_steps", 500) / 2 and group["weight_decay"] > 0:
