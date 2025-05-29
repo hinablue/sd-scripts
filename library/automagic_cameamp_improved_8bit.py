@@ -230,6 +230,29 @@ class BitsAndBytesOptimized(torch.optim.Optimizer):
         penalty_grad = U @ torch.diag(S * rank_strength) @ Vh
         return penalty_grad
 
+    @staticmethod
+    def _orthograd(p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+        """
+        === 正交梯度 ===
+        Grokking at the Edge of Numerical Stability
+
+        https://arxiv.org/abs/2501.04697
+        https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
+        """
+        if p.norm(2) <= 1e-30:
+            return grad
+
+        G_shape = grad.shape
+        w = p.view(-1)
+        g = grad.view(-1)
+        g_norm = g.norm(2)
+
+        proj = torch.dot(w, g) / torch.dot(w, w).add(1e-30)
+        g_orth = g.sub_(w, alpha=proj)
+        g_orth_scaled = g_orth.mul_(g_norm / g_orth.norm(2).add(1e-30))
+
+        return g_orth_scaled.view(G_shape)
+
     def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """初始化 8bit 優化器狀態."""
         device = p.device
@@ -497,6 +520,9 @@ class Automagic_CameAMP_Improved_8Bit(BitsAndBytesOptimized):
                 self._set_8bit_state(state, 'exp_avg', exp_avg)
                 self._set_8bit_state(state, 'exp_avg_res', exp_avg_res)
 
+                if state["step"] < group.get("warmup_steps", 500) / 2:
+                    update_p = self._orthograd(p, update_p)
+
                 # 學習率遮罩更新
                 current_lr = self._update_learning_rate_mask(state, group, grad)
 
@@ -675,6 +701,8 @@ def create_improved_8bit_optimizer(model_parameters, profile: Optional[str] = No
     """
     if profile is not None:
         kwargs['profile'] = profile
+    else:
+        kwargs['profile'] = 'balanced'
     return Automagic_CameAMP_Improved_8Bit(model_parameters, **kwargs)
 
 

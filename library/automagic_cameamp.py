@@ -348,8 +348,8 @@ class Automagic_CameAMP(BaseOptimizer):
                 https://arxiv.org/pdf/2407.16944
                 """
                 abs_grad = torch.abs(p.grad)
-                alpha = abs_grad / sum_abs_all_group_grads
-                grad = p.grad * (1 - alpha)
+                agr = abs_grad / sum_abs_all_group_grads
+                grad = p.grad * (1 - agr)
 
                 # === state 初始化 ===
                 state = self.state[p]
@@ -377,9 +377,13 @@ class Automagic_CameAMP(BaseOptimizer):
                     https://github.com/yangluo7/CAME
                     """
                     exp_avg_sq = state["exp_avg_sq"]
-                    exp_avg_sq.mul_(beta2).add_(grad.pow(2) + eps1, alpha=1 - beta2)
+                    grad_p2 = grad.pow(2) + eps1
+                    if state['step'] == 1:
+                        exp_avg_sq.add_(grad_p2)
+                        continue
                     scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
                     scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+                    exp_avg_sq.mul_(beta2).add_(grad_p2, alpha=1 - beta2)
                 else:
                     # Adabelief
                     clip = state['step'] ** 0.25

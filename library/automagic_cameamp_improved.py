@@ -205,6 +205,28 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
                 if group.get('lora_rank_penalty', True):
                     state["rank_tracker"] = torch.zeros(min(p.shape), device=device)
 
+    @staticmethod
+    def _orthograd(p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+        """
+        === 正交梯度 ===
+        Grokking at the Edge of Numerical Stability
+
+        https://arxiv.org/abs/2501.04697
+        https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
+        """
+        if p.norm(2) <= 1e-30:
+            return grad
+
+        G_shape = grad.shape
+        w = p.view(-1)
+        g = grad.view(-1)
+        g_norm = g.norm(2)
+
+        proj = torch.dot(w, g) / torch.dot(w, w).add(1e-30)
+        g_orth = g.sub_(w, alpha=proj)
+        g_orth_scaled = g_orth.mul_(g_norm / g_orth.norm(2).add(1e-30))
+
+        return g_orth_scaled.view(G_shape)
 
 class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
     """改進版 Automagic_CameAMP 優化器，專門優化 LoRA 訓練並減少邊緣、背景過擬合."""
@@ -254,7 +276,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 state["step"] += 1
 
                 # 清理 warmup 後不需要的狀態
-                if state["step"] == group["warmup_steps"]:
+                if state["step"] == group.get("warmup_steps", 0):
                     for key in ['s', 'last_polarity']:
                         if key in state:
                             del state[key]
@@ -299,7 +321,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                     scaled_grad = grad
 
                 # === 改進 4：增強的動量處理 ===
-                if state["step"] < group["warmup_steps"] / 2:
+                if state["step"] < group.get("warmup_steps", 500) / 2:
                     # Torque-Aware Momentum with LoRA adaptation
                     decay_rate = 0.9
                     if 's' in state:
@@ -327,7 +349,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
 
                 # === 改進 5：增強的 Automagic 學習率遮罩 ===
-                if state["step"] < group["warmup_steps"]:
+                if state["step"] < group.get("warmup_steps", 500):
                     if 'last_polarity' in state:
                         last_polarity = state['last_polarity']
                         current_polarity = (grad > 0)
@@ -365,8 +387,11 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                     if group["lr"] < state["lr_max"]:
                         new_lr = new_lr * (group["lr"] / state["lr_max"])
 
+                if state["step"] < group.get("warmup_steps", 500) / 2:
+                    update_p = self._orthograd(p, update_p)
+
                 # === 改進 6：智能梯度方向控制 ===
-                if state["step"] < group["warmup_steps"] / 2:
+                if state["step"] < group.get("warmup_steps", 500) / 2:
                     # Grams with edge awareness
                     update_p.abs_().mul_(grad.sign())
 
