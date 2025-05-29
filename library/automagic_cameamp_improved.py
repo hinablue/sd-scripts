@@ -1,6 +1,5 @@
 import torch
 from typing import List, Dict, Any, Optional, Tuple, Deque
-from torch.nn.functional import normalize
 from dataclasses import dataclass
 from collections import deque
 import math
@@ -313,6 +312,90 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
 
             return g_orth_scaled.view(G_shape)
 
+    @staticmethod
+    def _compute_cosine_similarity_efficient(exp_avg: torch.Tensor, scaled_grad: torch.Tensor,
+                                            temp_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        高效計算餘弦相似度，避免兩次正規化操作.
+
+        使用公式: cos(θ) = (a · b) / (||a|| * ||b||)
+        相比兩次 normalize 操作，這種方法：
+        1. 減少記憶體分配（不創建正規化張量）
+        2. 減少計算量（只需一次內積和兩次範數計算）
+        3. 提升數值穩定性
+        """
+        with torch.no_grad():
+            # 計算內積 (向量化操作)
+            dot_product = torch.sum(exp_avg * scaled_grad, dim=0, keepdim=True)
+
+            # 計算兩個向量的範數
+            exp_avg_norm = torch.norm(exp_avg, p=2, dim=0, keepdim=True)
+            scaled_grad_norm = torch.norm(scaled_grad, p=2, dim=0, keepdim=True)
+
+            # 計算餘弦相似度，加入數值穩定性保護
+            denominator = exp_avg_norm * scaled_grad_norm
+            denominator = torch.clamp(denominator, min=1e-12)  # 避免除零
+
+            cosine_sim = dot_product / denominator
+
+            # 將相似度廣播到原始張量的形狀
+            if cosine_sim.shape != exp_avg.shape:
+                # 如果需要廣播，使用高效的方式
+                if temp_buffer is not None and temp_buffer.shape == exp_avg.shape:
+                    temp_buffer.fill_(1.0)
+                    temp_buffer.mul_(cosine_sim)
+                    return temp_buffer
+                else:
+                    return cosine_sim.expand_as(exp_avg)
+
+            return cosine_sim
+
+    @staticmethod
+    def _compute_correlation_fast(exp_avg: torch.Tensor, scaled_grad: torch.Tensor,
+                                temp_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        快速計算向量相關性，用於動量更新.
+
+        這個版本直接計算相關性而不是逐元素相乘正規化向量：
+        - 使用餘弦相似度作為相關性度量
+        - 避免創建中間正規化張量
+        - 利用向量化操作提升效率
+        """
+        # 如果張量形狀相同且較小，使用簡化計算
+        if exp_avg.shape == scaled_grad.shape and exp_avg.numel() < 10000:
+            return ImprovedBaseOptimizer._compute_cosine_similarity_efficient(
+                exp_avg, scaled_grad, temp_buffer)
+
+        # 對於大張量或不同形狀，使用分塊計算
+        with torch.no_grad():
+            if len(exp_avg.shape) > 1:
+                # 展平張量進行計算，然後重塑
+                exp_avg_flat = exp_avg.view(-1)
+                scaled_grad_flat = scaled_grad.view(-1)
+
+                # 計算全局餘弦相似度
+                dot_prod = torch.dot(exp_avg_flat, scaled_grad_flat)
+                norm_exp = torch.norm(exp_avg_flat)
+                norm_scaled = torch.norm(scaled_grad_flat)
+
+                # 避免除零並計算相似度
+                denominator = norm_exp * norm_scaled
+                if denominator < 1e-12:
+                    cosine_sim = torch.tensor(0.0, device=exp_avg.device, dtype=exp_avg.dtype)
+                else:
+                    cosine_sim = dot_prod / denominator
+
+                # 創建相關性張量
+                if temp_buffer is not None and temp_buffer.shape == exp_avg.shape:
+                    temp_buffer.fill_(cosine_sim.item())
+                    return temp_buffer
+                else:
+                    return torch.full_like(exp_avg, cosine_sim.item())
+            else:
+                # 1D 張量的簡單情況
+                return ImprovedBaseOptimizer._compute_cosine_similarity_efficient(
+                    exp_avg, scaled_grad, temp_buffer)
+
 class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
     """改進版 Automagic_CameAMP 優化器，專門優化 LoRA 訓練並減少邊緣、背景過擬合."""
 
@@ -450,10 +533,16 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                     if 's' in state:
                         s, exp_avg = state['s'], state['exp_avg']
 
-                        # 使用原地操作計算相關性
-                        exp_avg_norm = normalize(exp_avg, p=2.0, dim=0)
-                        scaled_grad_norm = normalize(scaled_grad, p=2.0, dim=0)
-                        corr = exp_avg_norm * scaled_grad_norm
+                        # 使用高效餘弦相似度計算替代兩次正規化
+                        corr_buffer_key = f"corr_{exp_avg.shape}"
+                        corr_buffer = temp_buffers.get(corr_buffer_key)
+                        if self.tensor_cache and corr_buffer is None:
+                            corr_buffer = self.tensor_cache.get_buffer(
+                                exp_avg.shape, exp_avg.dtype, exp_avg.device)
+                            temp_buffers[corr_buffer_key] = corr_buffer
+
+                        # 計算相關性（餘弦相似度）
+                        corr = self._compute_correlation_fast(exp_avg, scaled_grad, corr_buffer)
 
                         s.mul_(decay_rate).add_(corr, alpha=1.0 - decay_rate)
 
