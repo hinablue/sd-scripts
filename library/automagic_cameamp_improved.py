@@ -35,6 +35,52 @@ class ImprovedOptimizerConfig:
     lora_rank_penalty: bool = True
     rank_penalty_strength: float = 0.01
     low_rank_emphasis: float = 1.2
+    # 新增：記憶體優化參數
+    enable_cache: bool = True
+    max_cache_size: int = 100
+    use_approximate_svd: bool = True
+
+class TensorCache:
+    """張量緩存管理器，用於重用計算結果和緩衝區."""
+
+    def __init__(self, max_size: int = 100):
+        self.max_size = max_size
+        self.cache: Dict[str, torch.Tensor] = {}
+        self.buffer_pool: Dict[tuple, List[torch.Tensor]] = {}
+        self.access_count: Dict[str, int] = {}
+
+    def get_buffer(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """獲取指定形狀的緩衝區張量."""
+        key = (shape, dtype, device)
+        if key in self.buffer_pool and self.buffer_pool[key]:
+            return self.buffer_pool[key].pop()
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    def return_buffer(self, tensor: torch.Tensor) -> None:
+        """歸還緩衝區張量."""
+        key = (tuple(tensor.shape), tensor.dtype, tensor.device)
+        if key not in self.buffer_pool:
+            self.buffer_pool[key] = []
+        if len(self.buffer_pool[key]) < 5:  # 限制每種類型的緩衝區數量
+            tensor.zero_()  # 清零重用
+            self.buffer_pool[key].append(tensor)
+
+    def get_cached(self, key: str) -> Optional[torch.Tensor]:
+        """獲取快取的計算結果."""
+        if key in self.cache:
+            self.access_count[key] = self.access_count.get(key, 0) + 1
+            return self.cache[key]
+        return None
+
+    def set_cached(self, key: str, value: torch.Tensor) -> None:
+        """設定快取的計算結果."""
+        if len(self.cache) >= self.max_size:
+            # 移除最少使用的項目
+            least_used = min(self.access_count, key=self.access_count.get)
+            del self.cache[least_used]
+            del self.access_count[least_used]
+        self.cache[key] = value.detach()
+        self.access_count[key] = 1
 
 class ImprovedBaseOptimizer(torch.optim.Optimizer):
     """改進版基礎優化器，包含邊緣和背景過擬合控制."""
@@ -68,6 +114,20 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.base_lrs: List[float] = [config.lr for group in self.param_groups]
 
+        # 初始化記憶體優化組件
+        self.tensor_cache = TensorCache(config.max_cache_size) if config.enable_cache else None
+        self._precomputed_constants = self._precompute_constants()
+
+    def _precompute_constants(self) -> Dict[str, float]:
+        """預計算常用的常數值."""
+        return {
+            'sqrt_2_pi': math.sqrt(2.0 * math.pi),
+            'ln_2': math.log(2.0),
+            'inv_sqrt_2': 1.0 / math.sqrt(2.0),
+            'beta_decay_factor': self.config.beta1_decay,
+            'rank_decay': math.exp(-0.1),  # 用於 LoRA 排名懲罰
+        }
+
     @staticmethod
     def _rms(tensor: torch.Tensor) -> torch.Tensor:
         """計算張量的均方根值."""
@@ -76,91 +136,109 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
     @staticmethod
     def _ratio(new_p: torch.Tensor, p: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
         """計算選擇性投影衰減的比率."""
-        curr_norm, prev_norm = torch.norm(new_p - pre), torch.norm(p - pre)
-        ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
-        return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
+        with torch.no_grad():  # 純計算部分，不需要梯度
+            curr_norm, prev_norm = torch.norm(new_p - pre), torch.norm(p - pre)
+            ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
+            return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
 
-    @staticmethod
-    def _compute_edge_penalty(grad: torch.Tensor, threshold: float = 0.6) -> torch.Tensor:
+    def _compute_edge_penalty_optimized(self, grad: torch.Tensor, threshold: float = 0.6,
+                                      cache_key: Optional[str] = None) -> torch.Tensor:
         """
-        計算邊緣懲罰項，用於抑制邊緣過擬合.
-        使用拉普拉斯算子檢測邊緣，對高頻成分施加懲罰.
+        優化版邊緣懲罰計算，使用緩存和簡化算法.
         """
         if len(grad.shape) < 2:
             return torch.zeros_like(grad)
 
-        # 計算拉普拉斯算子（二階導數）
-        if len(grad.shape) == 2:
-            # 對於 2D 張量，計算 x 和 y 方向的二階導數
-            laplacian = torch.zeros_like(grad)
-            if grad.shape[0] > 2 and grad.shape[1] > 2:
-                # x 方向二階導數
-                laplacian[1:-1, :] += grad[2:, :] - 2 * grad[1:-1, :] + grad[:-2, :]
-                # y 方向二階導數
+        # 檢查緩存
+        if cache_key and self.tensor_cache:
+            cached = self.tensor_cache.get_cached(f"edge_{cache_key}")
+            if cached is not None and cached.shape == grad.shape:
+                return cached
+
+        with torch.no_grad():
+            # 獲取緩衝區而不是創建新張量
+            if self.tensor_cache:
+                laplacian = self.tensor_cache.get_buffer(grad.shape, grad.dtype, grad.device)
+            else:
+                laplacian = torch.zeros_like(grad)
+
+            # 簡化的邊緣檢測：只計算最重要的方向
+            if len(grad.shape) == 2 and grad.shape[0] > 2 and grad.shape[1] > 2:
+                # 使用原地操作
+                laplacian[1:-1, :] = grad[2:, :] - 2 * grad[1:-1, :] + grad[:-2, :]
                 laplacian[:, 1:-1] += grad[:, 2:] - 2 * grad[:, 1:-1] + grad[:, :-2]
-        else:
-            # 對於高維張量，計算沿最後兩個維度的拉普拉斯算子
-            *batch_dims, h, w = grad.shape
-            laplacian = torch.zeros_like(grad)
-            if h > 2 and w > 2:
-                laplacian[..., 1:-1, :] += grad[..., 2:, :] - 2 * grad[..., 1:-1, :] + grad[..., :-2, :]
-                laplacian[..., :, 1:-1] += grad[..., :, 2:] - 2 * grad[..., :, 1:-1] + grad[..., :, :-2]
 
-        # 計算邊緣強度
-        edge_strength = torch.abs(laplacian)
-        # 對超過閾值的邊緣施加懲罰
-        edge_mask = (edge_strength > threshold).float()
-        return edge_mask * edge_strength
+            # 計算邊緣強度（簡化版本）
+            edge_strength = torch.abs(laplacian)
+            edge_mask = (edge_strength > threshold).float()
+            result = edge_mask * edge_strength
 
-    @staticmethod
-    def _compute_frequency_penalty(grad: torch.Tensor) -> torch.Tensor:
+            # 緩存結果
+            if cache_key and self.tensor_cache:
+                self.tensor_cache.set_cached(f"edge_{cache_key}", result)
+
+            return result
+
+    def _compute_frequency_penalty_simplified(self, grad: torch.Tensor) -> torch.Tensor:
         """
-        計算頻率懲罰項，抑制高頻噪聲.
-        使用 FFT 分析頻率成分，對高頻成分施加懲罰.
+        簡化版頻率懲罰計算，使用近似方法.
         """
         if len(grad.shape) < 2:
             return torch.zeros_like(grad)
 
-        # 對 2D 張量執行 FFT
-        if len(grad.shape) == 2:
-            grad_fft = torch.fft.fft2(grad)
-            freq_magnitude = torch.abs(grad_fft)
+        with torch.no_grad():
+            # 使用簡化的高頻檢測：計算相鄰元素差異
+            if len(grad.shape) == 2:
+                h, w = grad.shape
+                if h > 1 and w > 1:
+                    # 計算水平和垂直差異
+                    h_diff = torch.abs(grad[:, 1:] - grad[:, :-1])
+                    v_diff = torch.abs(grad[1:, :] - grad[:-1, :])
 
-            # 創建高頻懲罰遮罩
-            h, w = grad.shape
-            center_h, center_w = h // 2, w // 2
-            y, x = torch.meshgrid(torch.arange(h, device=grad.device),
-                                torch.arange(w, device=grad.device), indexing='ij')
-            distance = torch.sqrt((y - center_h)**2 + (x - center_w)**2)
+                    # 創建結果張量
+                    if self.tensor_cache:
+                        result = self.tensor_cache.get_buffer(grad.shape, grad.dtype, grad.device)
+                    else:
+                        result = torch.zeros_like(grad)
 
-            # 高頻區域（距離中心較遠）
-            high_freq_mask = (distance > min(h, w) * 0.3).float()
-            penalty = freq_magnitude * high_freq_mask
+                    # 組合差異信息
+                    result[:, 1:] += h_diff
+                    result[1:, :] += v_diff
 
-            # 逆 FFT 回到空間域
-            penalty_spatial = torch.real(torch.fft.ifft2(penalty))
-            return penalty_spatial
+                    return result
 
-        return torch.zeros_like(grad)
+            return torch.zeros_like(grad)
 
-    @staticmethod
-    def _lora_rank_regularization(param: torch.Tensor, rank_strength: float = 0.01) -> torch.Tensor:
+    def _lora_rank_regularization_fast(self, param: torch.Tensor, rank_strength: float = 0.01,
+                                     use_approx: bool = True) -> torch.Tensor:
         """
-        LoRA 低秩正則化，鼓勵學習低秩結構.
-        通過 SVD 分解對高秩成分施加懲罰.
+        快速 LoRA 低秩正則化，使用近似 SVD.
         """
         if len(param.shape) != 2:
             return torch.zeros_like(param)
 
-        # 計算 SVD
-        U, S, Vh = torch.linalg.svd(param, full_matrices=False)
+        with torch.no_grad():
+            if use_approx and self.config.use_approximate_svd:
+                # 使用近似方法：只考慮最大的幾個奇異值
+                # 計算 A^T A 的特徵值（避免完整 SVD）
+                if param.shape[0] <= param.shape[1]:
+                    cov = torch.mm(param, param.t())
+                else:
+                    cov = torch.mm(param.t(), param)
 
-        # 對較大的奇異值施加懲罰（鼓勵低秩）
-        rank_penalty = torch.sum(S[S.argsort(descending=True)[10:]])  # 懲罰前 10 個之外的奇異值
+                # 只取前幾個特徵值
+                eigenvals, _ = torch.linalg.eigh(cov)
+                large_eigenvals = eigenvals[eigenvals.argsort(descending=True)[10:]]
+                rank_penalty_scalar = torch.sum(large_eigenvals) * rank_strength
 
-        # 重建懲罰梯度
-        penalty_grad = U @ torch.diag(S * rank_strength) @ Vh
-        return penalty_grad
+                # 創建梯度近似
+                return param * rank_penalty_scalar
+            else:
+                # 完整 SVD（如果需要）
+                U, S, Vh = torch.linalg.svd(param, full_matrices=False)
+                rank_penalty = torch.sum(S[S.argsort(descending=True)[10:]])
+                penalty_grad = U @ torch.diag(S * rank_strength) @ Vh
+                return penalty_grad
 
     def _init_state(self, p: torch.Tensor, group: Optional[Dict[str, Any]] = None) -> None:
         """初始化優化器狀態."""
@@ -206,27 +284,34 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
                     state["rank_tracker"] = torch.zeros(min(p.shape), device=device)
 
     @staticmethod
-    def _orthograd(p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
+    def _orthograd(p: torch.Tensor, grad: torch.Tensor,
+                  temp_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        === 正交梯度 ===
-        Grokking at the Edge of Numerical Stability
-
-        https://arxiv.org/abs/2501.04697
-        https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
+        === 正交梯度（記憶體優化版）===
+        使用提供的緩衝區減少記憶體分配
         """
         if p.norm(2) <= 1e-30:
             return grad
 
-        G_shape = grad.shape
-        w = p.view(-1)
-        g = grad.view(-1)
-        g_norm = g.norm(2)
+        with torch.no_grad():
+            G_shape = grad.shape
+            w = p.view(-1)
+            g = grad.view(-1)
+            g_norm = g.norm(2)
 
-        proj = torch.dot(w, g) / torch.dot(w, w).add(1e-30)
-        g_orth = g.sub_(w, alpha=proj)
-        g_orth_scaled = g_orth.mul_(g_norm / g_orth.norm(2).add(1e-30))
+            proj = torch.dot(w, g) / torch.dot(w, w).add(1e-30)
 
-        return g_orth_scaled.view(G_shape)
+            # 使用原地操作
+            if temp_buffer is not None and temp_buffer.shape == g.shape:
+                g_orth = temp_buffer
+                g_orth.copy_(g)
+                g_orth.sub_(w, alpha=proj)
+            else:
+                g_orth = g.sub(w, alpha=proj)
+
+            g_orth_scaled = g_orth.mul_(g_norm / g_orth.norm(2).add(1e-30))
+
+            return g_orth_scaled.view(G_shape)
 
 class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
     """改進版 Automagic_CameAMP 優化器，專門優化 LoRA 訓練並減少邊緣、背景過擬合."""
@@ -237,7 +322,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None) -> Optional[float]:
-        """執行單一優化步驟."""
+        """執行單一優化步驟（記憶體優化版）."""
         loss = closure() if closure is not None else None
 
         for group in self.param_groups:
@@ -254,11 +339,18 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
             all_group_grads = torch.cat(grads_this_group)
             sum_abs_all_group_grads = torch.sum(torch.abs(all_group_grads))
 
-            if any(self.state.get(p, {}).get("step", 0) < group.get("warmup_steps", 500) / 2
-                   for p in group["params"] if p.grad is not None) and group["weight_decay"] > 0:
+            # 預計算常用值
+            warmup_half = group.get("warmup_steps", 500) // 2
+            has_warmup_params = any(self.state.get(p, {}).get("step", 0) < warmup_half
+                                  for p in group["params"] if p.grad is not None)
+
+            if has_warmup_params and group["weight_decay"] > 0:
                 abs_all_group_grads = torch.abs(all_group_grads)
                 mean_norm = abs_all_group_grads.mean()
                 std_norm = abs_all_group_grads.std(unbiased=False)
+
+            # 為這個群組創建緩衝區
+            temp_buffers = {}
 
             for p in group["params"]:
                 if p.grad is None or not p.requires_grad:
@@ -283,28 +375,33 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                     if 'pre' in state and state.get("pre") is not None:
                         del state['pre']
 
-                # === 改進 1：增強的 AGR 自適應梯度正則化 ===
-                abs_grad = torch.abs(grad)
-                alpha = abs_grad / (sum_abs_all_group_grads + 1e-10)
+                # === 改進 1：增強的 AGR 自適應梯度正則化（使用原地操作）===
+                with torch.no_grad():
+                    abs_grad = torch.abs(grad)
+                    alpha = abs_grad / (sum_abs_all_group_grads + 1e-10)
 
-                # 新增：邊緣感知的梯度正則化
-                if group.get('edge_suppression', True):
-                    edge_penalty = self._compute_edge_penalty(grad, group.get('edge_threshold', 0.6))
-                    edge_factor = 1.0 + group.get('edge_penalty', 0.1) * edge_penalty
-                    alpha = alpha * edge_factor
+                    # 新增：邊緣感知的梯度正則化（使用緩存）
+                    if group.get('edge_suppression', True):
+                        cache_key = f"p_{id(p)}_{state['step']}"
+                        edge_penalty = self._compute_edge_penalty_optimized(
+                            grad, group.get('edge_threshold', 0.6), cache_key)
+                        edge_factor = 1.0 + group.get('edge_penalty', 0.1) * edge_penalty
+                        alpha.mul_(edge_factor)  # 原地操作
 
-                grad = grad * (1 - alpha)
+                    # 原地更新梯度
+                    grad.mul_(1 - alpha)
 
-                # === 改進 2：頻率感知的梯度調整 ===
-                if group.get('spatial_awareness', True) and len(grad.shape) >= 2:
-                    freq_penalty = self._compute_frequency_penalty(grad)
-                    freq_factor = group.get('frequency_penalty', 0.05)
-                    grad = grad - freq_factor * freq_penalty
+                    # === 改進 2：頻率感知的梯度調整（簡化版）===
+                    if group.get('spatial_awareness', True) and len(grad.shape) >= 2:
+                        freq_penalty = self._compute_frequency_penalty_simplified(grad)
+                        freq_factor = group.get('frequency_penalty', 0.05)
+                        grad.sub_(freq_penalty, alpha=freq_factor)  # 原地操作
 
-                # === 改進 3：LoRA 低秩正則化 ===
-                if group.get('lora_rank_penalty', True) and len(p.shape) == 2:
-                    rank_penalty = self._lora_rank_regularization(p, group.get('rank_penalty_strength', 0.01))
-                    grad = grad + rank_penalty
+                    # === 改進 3：LoRA 低秩正則化（快速版）===
+                    if group.get('lora_rank_penalty', True) and len(p.shape) == 2:
+                        rank_penalty = self._lora_rank_regularization_fast(
+                            p, group.get('rank_penalty_strength', 0.01))
+                        grad.add_(rank_penalty)  # 原地操作
 
                 # 原始 CAME 核心處理
                 beta1, beta2, beta3 = 0.9, 0.999, 0.9999
@@ -312,49 +409,117 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
 
                 # CAME 自適應記憶體高效優化
                 if group.get('came', True):
-                    update_p = grad.pow(2) + eps1
+                    # 獲取或創建緩衝區
+                    buffer_key = f"update_p_{grad.shape}"
+                    if self.tensor_cache and buffer_key not in temp_buffers:
+                        temp_buffers[buffer_key] = self.tensor_cache.get_buffer(
+                            grad.shape, grad.dtype, grad.device)
+
+                    update_p = temp_buffers.get(buffer_key, grad.pow(2))
+                    if buffer_key in temp_buffers:
+                        update_p.copy_(grad.pow(2))
+                    update_p.add_(eps1)  # 原地操作
+
                     exp_avg_sq = state["exp_avg_sq"]
                     exp_avg_sq.mul_(beta2).add_(update_p, alpha=1 - beta2)
-                    scaled_grad = grad.clone().mul_(exp_avg_sq.rsqrt())
-                    scaled_grad.div_((self._rms(scaled_grad) / group["clip_threshold"]).clamp_(min=1.0))
+
+                    # 獲取 scaled_grad 緩衝區
+                    scaled_grad_key = f"scaled_grad_{grad.shape}"
+                    if self.tensor_cache and scaled_grad_key not in temp_buffers:
+                        temp_buffers[scaled_grad_key] = self.tensor_cache.get_buffer(
+                            grad.shape, grad.dtype, grad.device)
+
+                    if scaled_grad_key in temp_buffers:
+                        scaled_grad = temp_buffers[scaled_grad_key]
+                        scaled_grad.copy_(grad)
+                        scaled_grad.mul_(exp_avg_sq.rsqrt())
+                    else:
+                        scaled_grad = grad * exp_avg_sq.rsqrt()
+
+                    # 原地梯度裁剪
+                    rms_val = self._rms(scaled_grad)
+                    clip_factor = group["clip_threshold"] / rms_val.clamp_(min=1.0)
+                    scaled_grad.mul_(clip_factor)
                 else:
                     scaled_grad = grad
 
-                # === 改進 4：增強的動量處理 ===
-                if state["step"] < group.get("warmup_steps", 500) / 2:
+                # === 改進 4：增強的動量處理（原地操作）===
+                if state["step"] < warmup_half:
                     # Torque-Aware Momentum with LoRA adaptation
-                    decay_rate = 0.9
+                    decay_rate = self._precomputed_constants['beta_decay_factor']
                     if 's' in state:
                         s, exp_avg = state['s'], state['exp_avg']
-                        corr = normalize(exp_avg, p=2.0, dim=0).mul_(normalize(scaled_grad, p=2.0, dim=0))
+
+                        # 使用原地操作計算相關性
+                        exp_avg_norm = normalize(exp_avg, p=2.0, dim=0)
+                        scaled_grad_norm = normalize(scaled_grad, p=2.0, dim=0)
+                        corr = exp_avg_norm * scaled_grad_norm
+
                         s.mul_(decay_rate).add_(corr, alpha=1.0 - decay_rate)
 
                         # LoRA 特定調整：強調低秩方向
                         if group.get('lora_rank_penalty', True) and len(p.shape) == 2:
                             low_rank_factor = group.get('low_rank_emphasis', 1.2)
-                            s = s * low_rank_factor
+                            s.mul_(low_rank_factor)
 
-                        d = ((1.0 + s) / 2.0).add_(eps1).mul_(scaled_grad)
+                        # 使用緩衝區計算 d
+                        d_key = f"d_{scaled_grad.shape}"
+                        if self.tensor_cache and d_key not in temp_buffers:
+                            temp_buffers[d_key] = self.tensor_cache.get_buffer(
+                                scaled_grad.shape, scaled_grad.dtype, scaled_grad.device)
+
+                        if d_key in temp_buffers:
+                            d = temp_buffers[d_key]
+                            d.copy_(s)
+                            d.add_(1.0).div_(2.0).add_(eps1).mul_(scaled_grad)
+                        else:
+                            d = ((1.0 + s) / 2.0).add_(eps1).mul_(scaled_grad)
+
                         exp_avg.mul_(beta1).add_(d)
                 else:
                     beta1, beta2, beta3 = group["betas"]
-                    beta1_t = max(beta1 * group['beta1_decay'] ** state["step"], 0.4)
+                    beta1_t = max(beta1 * (self._precomputed_constants['beta_decay_factor'] ** state["step"]), 0.4)
                     exp_avg = state['exp_avg']
                     exp_avg.mul_(beta1_t).add_(scaled_grad, alpha=1 - beta1_t)
 
                 # CAME 核心：信心引導的記憶體高效優化
                 exp_avg_res = state["exp_avg_res"]
-                res = (scaled_grad - exp_avg).pow(2) + eps2
-                exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
-                update_p = exp_avg.clone().mul_(exp_avg_res.rsqrt())
 
-                # === 改進 5：增強的 Automagic 學習率遮罩 ===
+                # 使用緩衝區計算 res
+                res_key = f"res_{scaled_grad.shape}"
+                if self.tensor_cache and res_key not in temp_buffers:
+                    temp_buffers[res_key] = self.tensor_cache.get_buffer(
+                        scaled_grad.shape, scaled_grad.dtype, scaled_grad.device)
+
+                if res_key in temp_buffers:
+                    res = temp_buffers[res_key]
+                    res.copy_(scaled_grad)
+                    res.sub_(exp_avg).pow_(2).add_(eps2)
+                else:
+                    res = (scaled_grad - exp_avg).pow(2) + eps2
+
+                exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
+
+                # 獲取 update_p 緩衝區
+                update_p_key = f"update_p_final_{exp_avg.shape}"
+                if self.tensor_cache and update_p_key not in temp_buffers:
+                    temp_buffers[update_p_key] = self.tensor_cache.get_buffer(
+                        exp_avg.shape, exp_avg.dtype, exp_avg.device)
+
+                if update_p_key in temp_buffers:
+                    update_p = temp_buffers[update_p_key]
+                    update_p.copy_(exp_avg)
+                    update_p.mul_(exp_avg_res.rsqrt())
+                else:
+                    update_p = exp_avg * exp_avg_res.rsqrt()
+
+                # === 改進 5：增強的 Automagic 學習率遮罩（原地操作）===
                 if state["step"] < group.get("warmup_steps", 500):
                     if 'last_polarity' in state:
                         last_polarity = state['last_polarity']
                         current_polarity = (grad > 0)
                         sign_agree = torch.where(last_polarity == current_polarity, 1.0, -1.0)
-                        state['last_polarity'] = current_polarity
+                        last_polarity.copy_(current_polarity)  # 原地更新
 
                         lr_mask = state['lr_mask']
 
@@ -367,90 +532,121 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                         else:
                             lr_bump = self.config.lr_bump
 
-                        new_lr = torch.where(
-                            sign_agree > 0,
-                            lr_mask + lr_bump,
-                            lr_mask - lr_bump
-                        )
+                        # 原地更新學習率遮罩
+                        lr_delta = torch.where(sign_agree > 0, lr_bump, -lr_bump)
+                        lr_mask.add_(lr_delta)
 
                         if group["lr"] > state["lr_max"]:
-                            new_lr = new_lr + (group["lr"] - state["lr_max"])
+                            lr_mask.add_(group["lr"] - state["lr_max"])
                             state["lr_max"] = group["lr"]
 
-                        new_lr = torch.clamp(new_lr, min=self.config.min_lr, max=self.config.max_lr)
-                        state['lr_mask'] = new_lr
-                        state['avg_lr'] = torch.mean(new_lr).item()
+                        lr_mask.clamp_(min=self.config.min_lr, max=self.config.max_lr)
+                        state['avg_lr'] = torch.mean(lr_mask).item()
                 else:
-                    new_lr = state['lr_mask']
+                    lr_mask = state['lr_mask']
                     if group["lr"] > state["lr_max"]:
                         state["lr_max"] = group["lr"]
                     if group["lr"] < state["lr_max"]:
-                        new_lr = new_lr * (group["lr"] / state["lr_max"])
+                        lr_mask.mul_(group["lr"] / state["lr_max"])
 
-                if state["step"] < group.get("warmup_steps", 500) / 2:
-                    update_p = self._orthograd(p, update_p)
+                # 正交梯度處理（使用緩衝區）
+                if state["step"] < warmup_half:
+                    ortho_buffer_key = f"ortho_{update_p.shape}"
+                    ortho_buffer = temp_buffers.get(ortho_buffer_key)
+                    if self.tensor_cache and ortho_buffer is None:
+                        ortho_buffer = self.tensor_cache.get_buffer(
+                            update_p.view(-1).shape, update_p.dtype, update_p.device)
+                        temp_buffers[ortho_buffer_key] = ortho_buffer
 
-                # === 改進 6：智能梯度方向控制 ===
-                if state["step"] < group.get("warmup_steps", 500) / 2:
-                    # Grams with edge awareness
+                    update_p = self._orthograd(p, update_p, ortho_buffer)
+
+                # === 改進 6：智能梯度方向控制（原地操作）===
+                if state["step"] < warmup_half:
+                    # Grams with edge awareness（原地操作）
                     update_p.abs_().mul_(grad.sign())
 
                     # 新增：邊緣抑制調整
                     if group.get('edge_suppression', True):
                         edge_history = state.get('edge_history', torch.zeros_like(update_p))
-                        current_edge = self._compute_edge_penalty(update_p)
+                        current_edge = self._compute_edge_penalty_optimized(update_p)
                         edge_history.mul_(0.9).add_(current_edge, alpha=0.1)
                         edge_suppression_factor = 1.0 - group.get('edge_penalty', 0.1) * edge_history
-                        update_p = update_p * edge_suppression_factor.clamp(0.1, 1.0)
+                        edge_suppression_factor.clamp_(0.1, 1.0)
+                        update_p.mul_(edge_suppression_factor)
                         state['edge_history'] = edge_history
                 else:
                     # Cautious optimization with spatial awareness
-                    mask = (update_p * grad > 0).to(grad.dtype)
-                    mask.div_(mask.mean().clamp_(min=1e-3))
+                    mask_key = f"mask_{update_p.shape}"
+                    if self.tensor_cache and mask_key not in temp_buffers:
+                        temp_buffers[mask_key] = self.tensor_cache.get_buffer(
+                            update_p.shape, update_p.dtype, update_p.device)
+
+                    if mask_key in temp_buffers:
+                        mask = temp_buffers[mask_key]
+                        mask.copy_(update_p * grad > 0)
+                        mask = mask.to(grad.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
+                    else:
+                        mask = (update_p * grad > 0).to(grad.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
 
                     # 新增：背景正則化
                     if group.get('background_regularization', True):
-                        # 檢測背景區域（梯度變化較小的區域）
                         grad_variance = torch.var(grad) if grad.numel() > 1 else torch.tensor(0.0)
-                        if grad_variance < 1e-6:  # 可能是背景區域
-                            background_factor = 0.5  # 減少背景區域的更新強度
-                            mask = mask * background_factor
+                        if grad_variance < 1e-6:
+                            mask.mul_(0.5)
 
-                    update_p = update_p * mask
+                    update_p.mul_(mask)
 
-                # 應用學習率遮罩
-                update_p = update_p * new_lr
+                # 應用學習率遮罩（原地操作）
+                update_p.mul_(lr_mask)
 
-                # === 改進 7：增強的選擇性投影衰減 ===
+                # === 改進 7：增強的選擇性投影衰減===
                 do_spd = False
                 if state["step"] < group.get("warmup_steps", 500):
-                    pre = state.get("pre", torch.zeros_like(p))
+                    if "pre" not in state:
+                        state["pre"] = p.clone()
+
+                    pre = state["pre"]
                     condition = -torch.sum(grad * (p - pre))
 
                     if condition < 0.0:
                         do_spd = True
-                        new_p = p - update_p
+                        # 使用緩衝區計算 new_p
+                        new_p_key = f"new_p_{p.shape}"
+                        if self.tensor_cache and new_p_key not in temp_buffers:
+                            temp_buffers[new_p_key] = self.tensor_cache.get_buffer(
+                                p.shape, p.dtype, p.device)
+
+                        if new_p_key in temp_buffers:
+                            new_p = temp_buffers[new_p_key]
+                            new_p.copy_(p)
+                            new_p.sub_(update_p)
+                        else:
+                            new_p = p - update_p
+
                         ratio = self._ratio(new_p, p, pre)
 
                         # 新增：LoRA 感知的權重衰減
                         if group.get('lora_rank_penalty', True) and len(p.shape) == 2:
-                            # 對低秩成分減少衰減，對高秩成分增加衰減
-                            U, S, Vh = torch.linalg.svd(new_p - pre, full_matrices=False)
-                            rank_weights = torch.exp(-torch.arange(len(S), device=S.device) * 0.1)
-                            weighted_decay = group["weight_decay"] * (1.0 + rank_weights.mean())
+                            # 簡化版本：使用預計算的衰減因子
+                            weighted_decay = group["weight_decay"] * (1.0 + self._precomputed_constants['rank_decay'])
                         else:
                             weighted_decay = group["weight_decay"]
 
-                        new_p = new_p - weighted_decay * ratio * (new_p - pre)
+                        # 原地更新
+                        decay_term = ratio * weighted_decay
+                        new_p.sub_(new_p - pre, alpha=decay_term)
                         p.copy_(new_p)
 
-                    state["pre"] = p.clone()
+                    # 更新 pre 狀態
+                    state["pre"].copy_(p)
 
                 # 最終參數更新
                 if not do_spd:
-                    p.add_(update_p, alpha=-1)
+                    p.sub_(update_p)
 
-                # === 改進 8：更新空間感知狀態 ===
+                # === 改進 8：更新空間感知狀態（原地操作）===
                 if group.get('spatial_awareness', True):
                     # 更新空間變異數追蹤
                     if len(grad.shape) >= 2:
@@ -458,6 +654,11 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                         spatial_var = state.get('spatial_variance', torch.ones_like(current_variance))
                         spatial_var.mul_(0.9).add_(current_variance, alpha=0.1)
                         state['spatial_variance'] = spatial_var
+
+            # 歸還緩衝區
+            if self.tensor_cache:
+                for buffer in temp_buffers.values():
+                    self.tensor_cache.return_buffer(buffer)
 
         if self.config.verbose:
             avg_lrs = [torch.mean(state['lr_mask']).item() if 'lr_mask' in state else group["lr"]
@@ -469,7 +670,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
     def state_dict(self) -> Dict[str, Any]:
         """獲取優化器狀態字典."""
         state = super().state_dict()
-        state['magic_version'] = 2  # 標記為改進版本
+        state['magic_version'] = 2  # 標記為記憶體優化版本
         return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -479,3 +680,26 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
         elif state_dict['magic_version'] != 2:
             print(f'[警告] 狀態字典版本不匹配：期望版本 2，實際版本 {state_dict["magic_version"]}')
         super().load_state_dict(state_dict)
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """獲取記憶體使用統計."""
+        if not self.tensor_cache:
+            return {"cache_disabled": True}
+
+        cache_size = len(self.tensor_cache.cache)
+        buffer_pools = {key: len(buffers) for key, buffers in self.tensor_cache.buffer_pool.items()}
+
+        return {
+            "cache_size": cache_size,
+            "max_cache_size": self.tensor_cache.max_size,
+            "buffer_pools": buffer_pools,
+            "total_buffers": sum(buffer_pools.values())
+        }
+
+    def clear_cache(self) -> None:
+        """清理緩存和緩衝區池."""
+        if self.tensor_cache:
+            self.tensor_cache.cache.clear()
+            self.tensor_cache.buffer_pool.clear()
+            self.tensor_cache.access_count.clear()
+            print("已清理所有緩存和緩衝區。")
