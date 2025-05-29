@@ -1,6 +1,6 @@
 
 # TAM 性能優化使用範例和基準測試
-"""
+
 Torque-Aware Momentum 性能優化指南
 
 ## 主要改進：
@@ -23,6 +23,7 @@ Torque-Aware Momentum 性能優化指南
 
 ## 使用範例：
 
+```
 # 高性能配置（推薦）
 config = OptimizerConfig(
     lr=1e-6,
@@ -48,9 +49,11 @@ config_large = OptimizerConfig(
     tam_use_inplace_ops=True,
     verbose=True
 )
+```
 
 ## 性能基準測試代碼：
 
+```
 import time
 import torch
 
@@ -97,6 +100,7 @@ def benchmark_tam_methods():
 
             avg_time = (end_time - start_time) / 100 * 1000  # 毫秒
             print(f"  {name}: {avg_time:.4f} ms")
+```
 
 ## 性能建議：
 
@@ -127,4 +131,3 @@ def benchmark_tam_methods():
 - 對於不規則形狀的張量，自動選擇可能不是最優
 - 在分散式訓練中，向量化方法可能有額外的通信開銷
 - 建議在實際工作負載上進行基準測試以確定最佳配置
-"""
