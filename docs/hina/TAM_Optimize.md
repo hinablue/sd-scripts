@@ -131,3 +131,49 @@ def benchmark_tam_methods():
 - 對於不規則形狀的張量，自動選擇可能不是最優
 - 在分散式訓練中，向量化方法可能有額外的通信開銷
 - 建議在實際工作負載上進行基準測試以確定最佳配置
+
+## 實作
+
+```
+def _compute_efficient_correlation(
+    self,
+    exp_avg: torch.Tensor,
+    scaled_grad: torch.Tensor
+) -> torch.Tensor:
+    """
+    高效計算相關性係數
+
+    使用餘弦相似度的直接計算方式，避免昂貴的正規化操作
+    corr = (exp_avg · scaled_grad) / (||exp_avg|| * ||scaled_grad||)
+    """
+    # 方法 1: 使用 torch.cosine_similarity (適用於較大張量)
+    if exp_avg.numel() > 1000:
+        # 展平張量以使用 cosine_similarity
+        exp_avg_flat = exp_avg.view(-1)
+        scaled_grad_flat = scaled_grad.view(-1)
+
+        # 計算餘弦相似度
+        cosine_sim = F.cosine_similarity(
+            exp_avg_flat.unsqueeze(0),
+            scaled_grad_flat.unsqueeze(0),
+            eps=self.eps_corr
+        )
+
+        # 廣播到原始形狀
+        return cosine_sim.expand_as(exp_avg)
+
+    # 方法 2: 手動計算（適用於較小張量）
+    else:
+        # 計算點積
+        dot_product = torch.sum(exp_avg * scaled_grad)
+
+        # 計算範數（使用快速平方根近似）
+        exp_avg_norm = torch.norm(exp_avg) + self.eps_norm
+        scaled_grad_norm = torch.norm(scaled_grad) + self.eps_norm
+
+        # 計算餘弦相似度
+        cosine_sim = dot_product / (exp_avg_norm * scaled_grad_norm)
+
+        # 廣播到原始形狀
+        return cosine_sim.expand_as(exp_avg)
+```
