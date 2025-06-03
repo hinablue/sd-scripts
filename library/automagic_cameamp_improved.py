@@ -644,7 +644,6 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                             state["lr_max"] = group["lr"]
 
                         lr_mask.clamp_(min=self.config.min_lr, max=self.config.max_lr)
-                        state['lr_mask'] = lr_mask
                         state['avg_lr'] = torch.mean(lr_mask).item()
                 else:
                     lr_mask = state['lr_mask']
