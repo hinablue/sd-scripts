@@ -39,6 +39,10 @@ class ImprovedOptimizerConfig:
     enable_cache: bool = True
     max_cache_size: int = 100
     use_approximate_svd: bool = True
+    # 新增：雙動量系統參數
+    enable_dual_momentum: bool = True
+    long_term_beta: float = 0.99  # beta3 for long-term momentum
+    alpha_mix_ratio: float = None  # auto-compute if None: (1-beta1)/(1-beta3)
 
 class TensorCache:
     """張量緩存管理器，用於重用計算結果和緩衝區."""
@@ -118,6 +122,12 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
         # 初始化記憶體優化組件
         self.tensor_cache = TensorCache(config.max_cache_size) if config.enable_cache else None
         self._precomputed_constants = self._precompute_constants()
+
+        # 新增：為每個參數群組設定雙動量參數
+        for group in self.param_groups:
+            group.setdefault('enable_dual_momentum', config.enable_dual_momentum)
+            group.setdefault('long_term_beta', config.long_term_beta)
+            group.setdefault('alpha_mix_ratio', config.alpha_mix_ratio)
 
     def _precompute_constants(self) -> Dict[str, float]:
         """預計算常用的常數值."""
@@ -284,6 +294,11 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
                 if group.get('lora_rank_penalty', True):
                     state["rank_tracker"] = torch.zeros(min(p.shape), device=device)
 
+        # 新增：雙動量系統狀態
+        if group and group.get('enable_dual_momentum', True):
+            state.setdefault("long_term_momentum", torch.zeros_like(p))  # 長期動量
+            state.setdefault("mixed_momentum_sq", torch.zeros_like(p))   # 混合動量的方差估計
+
     @staticmethod
     def _orthograd(p: torch.Tensor, grad: torch.Tensor,
                   temp_buffer: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -397,6 +412,105 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
                 # 1D 張量的簡單情況
                 return ImprovedBaseOptimizer._compute_cosine_similarity_efficient(
                     exp_avg, scaled_grad, temp_buffer)
+
+    def _compute_dual_momentum_update(
+        self,
+        grad: torch.Tensor,
+        state: Dict[str, Any],
+        group: Dict[str, Any],
+        temp_buffers: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        計算雙動量系統的更新值，結合 AdamS 的雙動量理念與 CAME 的信心度機制.
+
+        Args:
+            grad: 當前梯度
+            state: 優化器狀態
+            group: 參數群組設定
+            temp_buffers: 臨時緩衝區字典
+
+        Returns:
+            改進的動量更新值
+        """
+        if not group.get('enable_dual_momentum', True):
+            return grad  # 如果未啟用，返回原始梯度
+
+        beta1, beta2, beta3 = group["betas"]
+        long_term_beta = group.get('long_term_beta', 0.99)
+
+        # 計算 alpha 混合比例 (類似 AdamS)
+        alpha_mix = group.get('alpha_mix_ratio')
+        if alpha_mix is None:
+            alpha_mix = (1 - beta1) / (1 - long_term_beta)
+
+        # 獲取狀態變數
+        exp_avg = state["exp_avg"]           # 短期動量 (CAME 原有)
+        long_term_momentum = state["long_term_momentum"]  # 長期動量 (新增)
+        mixed_momentum_sq = state["mixed_momentum_sq"]    # 混合動量方差 (新增)
+
+        # === 步驟 1：更新長期動量 (類似 AdamS 的 exp_avg.mul_(beta3).add_(grad)) ===
+        long_term_momentum.mul_(long_term_beta).add_(grad)
+
+        # === 步驟 2：計算混合動量 (類似 AdamS 的 final_exp_avg) ===
+        # 使用緩衝區計算混合動量
+        mixed_momentum_key = f"mixed_momentum_{grad.shape}"
+        if self.tensor_cache and mixed_momentum_key not in temp_buffers:
+            temp_buffers[mixed_momentum_key] = self.tensor_cache.get_buffer(
+                grad.shape, grad.dtype, grad.device)
+
+        if mixed_momentum_key in temp_buffers:
+            mixed_momentum = temp_buffers[mixed_momentum_key]
+            # mixed_momentum = beta1 * long_term_momentum + alpha_mix * grad
+            mixed_momentum.copy_(long_term_momentum)
+            mixed_momentum.mul_(beta1).add_(grad, alpha=alpha_mix)
+        else:
+            mixed_momentum = beta1 * long_term_momentum + alpha_mix * grad
+
+        # === 步驟 3：更新混合動量的方差估計 (改進版) ===
+        # 計算縮放梯度項 (類似 AdamS 的 alpha_grad)
+        scaled_grad_key = f"scaled_grad_dual_{grad.shape}"
+        if self.tensor_cache and scaled_grad_key not in temp_buffers:
+            temp_buffers[scaled_grad_key] = self.tensor_cache.get_buffer(
+                grad.shape, grad.dtype, grad.device)
+
+        if scaled_grad_key in temp_buffers:
+            scaled_grad_term = temp_buffers[scaled_grad_key]
+            scaled_grad_term.copy_(grad)
+            scaled_grad_term.mul_(alpha_mix).pow_(2)
+        else:
+            scaled_grad_term = (alpha_mix * grad).pow(2)
+
+        # 更新混合動量方差: mixed_momentum_sq = beta2 * mixed_momentum_sq + (1-beta2) * [mixed_momentum² + scaled_grad_term]
+        mixed_momentum_var_key = f"mixed_momentum_var_{grad.shape}"
+        if self.tensor_cache and mixed_momentum_var_key not in temp_buffers:
+            temp_buffers[mixed_momentum_var_key] = self.tensor_cache.get_buffer(
+                grad.shape, grad.dtype, grad.device)
+
+        if mixed_momentum_var_key in temp_buffers:
+            momentum_var_term = temp_buffers[mixed_momentum_var_key]
+            momentum_var_term.copy_(mixed_momentum)
+            momentum_var_term.pow_(2).add_(scaled_grad_term)
+        else:
+            momentum_var_term = mixed_momentum.pow(2) + scaled_grad_term
+
+        mixed_momentum_sq.mul_(beta2).add_(momentum_var_term, alpha=1.0 - beta2)
+
+        # === 步驟 4：計算最終更新 (結合 CAME 的思想) ===
+        eps1 = group["eps"][0] if len(group["eps"]) > 0 else 1e-30
+
+        # 使用改進的方差估計進行正規化
+        if mixed_momentum_var_key in temp_buffers:
+            normalized_update = temp_buffers[mixed_momentum_var_key]
+            normalized_update.copy_(mixed_momentum)
+            normalized_update.div_(mixed_momentum_sq.sqrt().add_(eps1))
+        else:
+            normalized_update = mixed_momentum / (mixed_momentum_sq.sqrt() + eps1)
+
+        # === 步驟 5：與 CAME 的信心度機制結合 ===
+        # 保持與原有 exp_avg 的相容性，更新為混合動量
+        exp_avg.copy_(mixed_momentum)
+
+        return normalized_update
 
 class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
     """改進版 Automagic_CameAMP 優化器，專門優化 LoRA 訓練並減少邊緣、背景過擬合."""
@@ -528,6 +642,17 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 else:
                     scaled_grad = grad
 
+                # === 改進 4A：雙動量系統處理（新增）===
+                if group.get('enable_dual_momentum', True):
+                    # 應用雙動量系統，獲得改進的動量更新
+                    dual_momentum_update = self._compute_dual_momentum_update(
+                        scaled_grad, state, group, temp_buffers)
+
+                    # 將雙動量結果作為後續處理的輸入
+                    processed_grad = dual_momentum_update
+                else:
+                    processed_grad = scaled_grad
+
                 # === 改進 4：增強的動量處理（原地操作）===
                 if state["step"] < warmup_half:
                     # Torque-Aware Momentum with LoRA adaptation
@@ -544,7 +669,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                             temp_buffers[corr_buffer_key] = corr_buffer
 
                         # 計算相關性（餘弦相似度）
-                        corr = self._compute_correlation_fast(exp_avg, scaled_grad, corr_buffer)
+                        corr = self._compute_correlation_fast(exp_avg, processed_grad, corr_buffer)
 
                         s.mul_(decay_rate).add_(corr, alpha=1.0 - decay_rate)
 
@@ -554,17 +679,17 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                             s.mul_(low_rank_factor)
 
                         # 使用緩衝區計算 d
-                        d_key = f"d_{scaled_grad.shape}"
+                        d_key = f"d_{processed_grad.shape}"
                         if self.tensor_cache and d_key not in temp_buffers:
                             temp_buffers[d_key] = self.tensor_cache.get_buffer(
-                                scaled_grad.shape, scaled_grad.dtype, scaled_grad.device)
+                                processed_grad.shape, processed_grad.dtype, processed_grad.device)
 
                         if d_key in temp_buffers:
                             d = temp_buffers[d_key]
                             d.copy_(s)
-                            d.add_(1.0).div_(2.0).add_(eps1).mul_(scaled_grad)
+                            d.add_(1.0).div_(2.0).add_(eps1).mul_(processed_grad)
                         else:
-                            d = ((1.0 + s) / 2.0).add_(eps1).mul_(scaled_grad)
+                            d = ((1.0 + s) / 2.0).add_(eps1).mul_(processed_grad)
 
                         exp_avg.mul_(beta1).add_(d)
                 else:
@@ -572,23 +697,23 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                     beta1, beta2, beta3 = group["betas"]
                     beta1_t = max(beta1 * (self._precomputed_constants['beta_decay_factor'] ** state["step"]), 0.4)
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(beta1_t).add_(scaled_grad, alpha=1 - beta1_t)
+                    exp_avg.mul_(beta1_t).add_(processed_grad, alpha=1 - beta1_t)
 
                 # CAME 核心：信心引導的記憶體高效優化
                 exp_avg_res = state["exp_avg_res"]
 
                 # 使用緩衝區計算 res
-                res_key = f"res_{scaled_grad.shape}"
+                res_key = f"res_{processed_grad.shape}"
                 if self.tensor_cache and res_key not in temp_buffers:
                     temp_buffers[res_key] = self.tensor_cache.get_buffer(
-                        scaled_grad.shape, scaled_grad.dtype, scaled_grad.device)
+                        processed_grad.shape, processed_grad.dtype, processed_grad.device)
 
                 if res_key in temp_buffers:
                     res = temp_buffers[res_key]
-                    res.copy_(scaled_grad)
+                    res.copy_(processed_grad)
                     res.sub_(exp_avg).pow_(2).add_(eps2)
                 else:
-                    res = (scaled_grad - exp_avg).pow(2) + eps2
+                    res = (processed_grad - exp_avg).pow(2) + eps2
 
                 exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
 
@@ -609,7 +734,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 if state["step"] < group.get("warmup_steps", 500):
                     if 'last_polarity' in state:
                         last_polarity = state['last_polarity']
-                        current_polarity = (grad > 0)
+                        current_polarity = (processed_grad > 0)
                         sign_agree = torch.where(last_polarity == current_polarity, 1.0, -1.0)
                         last_polarity.copy_(current_polarity)  # 原地更新
 
@@ -666,7 +791,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 # === 改進 6：智能梯度方向控制（原地操作）===
                 if state["step"] < warmup_half:
                     # Grams with edge awareness（原地操作）
-                    update_p.abs_().mul_(grad.sign())
+                    update_p.abs_().mul_(processed_grad.sign())
 
                     # 新增：邊緣抑制調整
                     if group.get('edge_suppression', True):
@@ -686,16 +811,16 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
 
                     if mask_key in temp_buffers:
                         mask = temp_buffers[mask_key]
-                        mask.copy_(update_p * grad > 0)
-                        mask = mask.to(grad.dtype)
+                        mask.copy_(update_p * processed_grad > 0)
+                        mask = mask.to(processed_grad.dtype)
                         mask.div_(mask.mean().clamp_(min=1e-3))
                     else:
-                        mask = (update_p * grad > 0).to(grad.dtype)
+                        mask = (update_p * processed_grad > 0).to(processed_grad.dtype)
                         mask.div_(mask.mean().clamp_(min=1e-3))
 
                     # 新增：背景正則化
                     if group.get('background_regularization', True):
-                        grad_variance = torch.var(grad) if grad.numel() > 1 else torch.tensor(0.0)
+                        grad_variance = torch.var(processed_grad) if processed_grad.numel() > 1 else torch.tensor(0.0)
                         if grad_variance < 1e-6:
                             mask.mul_(0.5)
 
@@ -711,7 +836,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                         state["pre"] = p.clone()
 
                     pre = state["pre"]
-                    condition = -torch.sum(grad * (p - pre))
+                    condition = -torch.sum(p.grad * p)
 
                     if condition < 0.0:
                         do_spd = True
@@ -752,8 +877,8 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 # === 改進 8：更新空間感知狀態（原地操作）===
                 if group.get('spatial_awareness', True):
                     # 更新空間變異數追蹤
-                    if len(grad.shape) >= 2:
-                        current_variance = torch.var(grad, dim=-1, keepdim=True) if grad.shape[-1] > 1 else torch.ones_like(grad)
+                    if len(processed_grad.shape) >= 2:
+                        current_variance = torch.var(processed_grad, dim=-1, keepdim=True) if processed_grad.shape[-1] > 1 else torch.ones_like(processed_grad)
                         spatial_var = state.get('spatial_variance', torch.ones_like(current_variance))
                         spatial_var.mul_(0.9).add_(current_variance, alpha=0.1)
                         state['spatial_variance'] = spatial_var
