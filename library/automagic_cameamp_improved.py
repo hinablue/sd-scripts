@@ -18,6 +18,7 @@ class ImprovedOptimizerConfig:
     eta: float = 2.0
     beta1_decay: float = 0.9995
     weight_decay: float = 5e-4
+    d_coef: float = 2.0
     warmup_steps: int = 500
     edge_threshold: float = 0.6
     came: bool = True
@@ -100,6 +101,7 @@ class ImprovedBaseOptimizer(torch.optim.Optimizer):
             edge_threshold=config.edge_threshold,
             came=config.came,
             full_finetune=config.full_finetune,
+            d_coef=config.d_coef,
             edge_suppression=config.edge_suppression,
             edge_penalty=config.edge_penalty,
             background_regularization=config.background_regularization,
@@ -451,7 +453,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                 state["step"] += 1
 
                 # 清理 warmup 後不需要的狀態
-                if state["step"] == group.get("warmup_steps", 0):
+                if state["step"] == group.get("warmup_steps", 500):
                     for key in ['s', 'last_polarity']:
                         if key in state:
                             del state[key]
@@ -566,6 +568,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
 
                         exp_avg.mul_(beta1).add_(d)
                 else:
+                    # Cautious Optimizers: Improving Training with One Line of Code
                     beta1, beta2, beta3 = group["betas"]
                     beta1_t = max(beta1 * (self._precomputed_constants['beta_decay_factor'] ** state["step"]), 0.4)
                     exp_avg = state['exp_avg']
@@ -621,8 +624,19 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                         else:
                             lr_bump = self.config.lr_bump
 
+                        condition = -torch.sum(p.grad * p)
+                        if state["step"] < group.get("warmup_steps", 500) / 2:
+                            lr_bump_pos = lr_bump * group['d_coef'] if condition > 0.0 else lr_bump
+                            lr_bump_neg = lr_bump * group['d_coef'] if condition < 0.0 else lr_bump
+                        else:
+                            lr_bump_pos, lr_bump_neg = lr_bump, lr_bump
+
                         # 原地更新學習率遮罩
-                        lr_delta = torch.where(sign_agree > 0, lr_bump, -lr_bump)
+                        lr_delta = torch.where(
+                            sign_agree > 0,
+                            lr_bump_pos,
+                            -lr_bump_neg
+                        )
                         lr_mask.add_(lr_delta)
 
                         if group["lr"] > state["lr_max"]:
@@ -630,6 +644,7 @@ class Automagic_CameAMP_Improved(ImprovedBaseOptimizer):
                             state["lr_max"] = group["lr"]
 
                         lr_mask.clamp_(min=self.config.min_lr, max=self.config.max_lr)
+                        state['lr_mask'] = lr_mask
                         state['avg_lr'] = torch.mean(lr_mask).item()
                 else:
                     lr_mask = state['lr_mask']
