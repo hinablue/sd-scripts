@@ -155,7 +155,6 @@ class Automagic_AdamS(torch.optim.Optimizer):
 
         # 基本狀態
         state.setdefault("lr_max", 1e-6)
-        state.setdefault("decay_step", 0)
         state.setdefault("need_ortho", False)
         state.setdefault("step", 0)
         state.setdefault('avg_lr', float(self.lr))
@@ -299,7 +298,7 @@ class Automagic_AdamS(torch.optim.Optimizer):
                     sign_agree = torch.where(last_polarity == current_polarity, 1.0, -1.0)
                     state['last_polarity'] = current_polarity
 
-                    lr_mask = state['lr_mask']
+                    new_lr = state['lr_mask']
                     condition = -torch.sum(p.grad * p)
 
                     if state["step"] < group["warmup_steps"] / 2:
@@ -309,26 +308,20 @@ class Automagic_AdamS(torch.optim.Optimizer):
                         lr_bump_pos, lr_bump_neg = self.lr_bump, self.lr_bump
 
                     # in-place 更新學習率遮罩
-                    lr_mask.add_(torch.where(sign_agree > 0, lr_bump_pos, -lr_bump_neg))
+                    new_lr.add_(torch.where(sign_agree > 0, lr_bump_pos, -lr_bump_neg))
 
                     if group["lr"] >= state["lr_max"]:
                         state["lr_max"] = group["lr"]
 
-                    lr_mask.clamp_(min=self.min_lr, max=self.max_lr)
-                    state['avg_lr'] = torch.mean(lr_mask.float()).item()
-                    new_lr = lr_mask.float()
+                    new_lr.clamp_(min=self.min_lr, max=self.max_lr)
+                    state['avg_lr'] = torch.mean(new_lr.float()).item()
                 else:
                     # 清理不需要的狀態以節省記憶體
                     if 'last_polarity' in state:
                         del state['last_polarity']
-                        if 'lr_mask' in state:
-                            # 轉換為標量以節省記憶體
-                            state['lr_scalar'] = state['avg_lr']
-                            del state['lr_mask']
 
-                    new_lr = state.get('lr_scalar', state.get('avg_lr', self.lr))
+                    new_lr = state['lr_mask']
                     if group["lr"] >= state["lr_max"]:
-                        state["decay_step"] = 0
                         state["lr_max"] = group["lr"]
                     elif group["lr"] < state["lr_max"]:
                         new_lr = new_lr * max(group["lr"] / state["lr_max"], 0.1)
