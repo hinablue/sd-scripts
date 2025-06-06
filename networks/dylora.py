@@ -447,7 +447,7 @@ class DyLoRANetwork(torch.nn.Module):
 
             params = []
             for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+                param_data = {"params": param_groups[key].values(), "named": list(param_groups[key].keys())}
 
                 if len(param_data["params"]) == 0:
                     continue

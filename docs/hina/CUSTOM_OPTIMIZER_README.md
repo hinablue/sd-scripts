@@ -330,7 +330,7 @@ for group_idx, metadata in optimizer.param_groups_metadata.items():
 
 如有問題或建議，請：
 1. 查看此文檔的故障排除部分
-2. 運行測試腳本 `examples/custom_optimizer_usage.py`
+2. 運行測試腳本 `docs/hina/custom_optimizer_usage.py`
 3. 在項目 GitHub 頁面提交 issue
 
 歡迎貢獻改進和新功能！

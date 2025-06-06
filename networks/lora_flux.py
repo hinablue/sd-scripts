@@ -197,24 +197,24 @@ class LoRAModule(torch.nn.Module):
         # Choose a reasonable sample size
         n_rows = org_module_weight.shape[0]
         sample_size = min(1000, n_rows)  # Cap at 1000 samples or use all if smaller
-        
+
         # Sample random indices across all rows
         indices = torch.randperm(n_rows)[:sample_size]
-        
+
         # Convert to a supported data type first, then index
         # Use float32 for indexing operations
         weights_float32 = org_module_weight.to(dtype=torch.float32)
         sampled_weights = weights_float32[indices].to(device=self.device)
-        
+
         # Calculate sampled norms
         sampled_norms = torch.norm(sampled_weights, dim=1, keepdim=True)
-        
+
         # Store the mean norm as our estimate
         self.org_weight_norm_estimate = sampled_norms.mean()
-        
+
         # Optional: store standard deviation for confidence intervals
         self.org_weight_norm_std = sampled_norms.std()
-        
+
         # Free memory
         del sampled_weights, weights_float32
 
@@ -223,30 +223,30 @@ class LoRAModule(torch.nn.Module):
         # Calculate the true norm (this will be slow but it's just for validation)
         true_norms = []
         chunk_size = 1024  # Process in chunks to avoid OOM
-        
+
         for i in range(0, org_module_weight.shape[0], chunk_size):
             end_idx = min(i + chunk_size, org_module_weight.shape[0])
             chunk = org_module_weight[i:end_idx].to(device=self.device, dtype=self.dtype)
             chunk_norms = torch.norm(chunk, dim=1, keepdim=True)
             true_norms.append(chunk_norms.cpu())
             del chunk
-            
+
         true_norms = torch.cat(true_norms, dim=0)
         true_mean_norm = true_norms.mean().item()
-        
+
         # Compare with our estimate
         estimated_norm = self.org_weight_norm_estimate.item()
-        
+
         # Calculate error metrics
         absolute_error = abs(true_mean_norm - estimated_norm)
         relative_error = absolute_error / true_mean_norm * 100  # as percentage
-        
+
         if verbose:
             logger.info(f"True mean norm: {true_mean_norm:.6f}")
             logger.info(f"Estimated norm: {estimated_norm:.6f}")
             logger.info(f"Absolute error: {absolute_error:.6f}")
             logger.info(f"Relative error: {relative_error:.2f}%")
-            
+
         return {
             'true_mean_norm': true_mean_norm,
             'estimated_norm': estimated_norm,
@@ -261,7 +261,7 @@ class LoRAModule(torch.nn.Module):
         if self.ggpo_beta is None or self.ggpo_sigma is None:
             return
 
-        # only update norms when we are training 
+        # only update norms when we are training
         if self.training is False:
             return
 
@@ -269,7 +269,7 @@ class LoRAModule(torch.nn.Module):
         module_weights.mul(self.scale)
 
         self.weight_norms = torch.norm(module_weights, dim=1, keepdim=True)
-        self.combined_weight_norms = torch.sqrt((self.org_weight_norm_estimate**2) + 
+        self.combined_weight_norms = torch.sqrt((self.org_weight_norm_estimate**2) +
                                            torch.sum(module_weights**2, dim=1, keepdim=True))
 
     @torch.no_grad()
@@ -1175,7 +1175,7 @@ class LoRANetwork(torch.nn.Module):
             params = []
             descriptions = []
             for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+                param_data = {"params": param_groups[key].values(), "named": list(param_groups[key].keys())}
 
                 if len(param_data["params"]) == 0:
                     continue
