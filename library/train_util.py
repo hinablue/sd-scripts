@@ -4856,6 +4856,8 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
                 logger.info(f"Custom optimizer features: {opt_info['features']}")
                 if 'lora_stats' in opt_info:
                     logger.info(f"LoRA parameters detected: {opt_info['lora_stats']}")
+                if 'lokr_stats' in opt_info:
+                    logger.info(f"LoKr parameters detected: {opt_info['lokr_stats']}")
 
         elif optimizer_type == "SGDNesterov8bit".lower():
             logger.info(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")

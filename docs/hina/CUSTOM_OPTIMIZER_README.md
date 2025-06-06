@@ -57,6 +57,23 @@ Custom AdamW Optimizer 是一個基於 `bitsandbytes.optim.AdamW8bit` 的增強�
 - **原理**：對 LoRA 參數在訓練後期可能減少權重衰減
 - **參數**：`dynamic_weight_decay`
 
+### 4. LoKr 專屬優化
+
+#### Kronecker 積感知的學習率縮放
+- **目的**：針對 LoKr 的 Kronecker 積結構提供專門的學習率優化
+- **原理**：計算各個子矩陣乘積的範數，使用更溫和的縮放策略避免 Kronecker 積的範數放大效應
+- **特色**：自動檢測 LoKr 參數並建立配對關係
+
+#### LoKr 動態權重衰減
+- **目的**：為 LoKr 參數提供更保守的權重衰減策略
+- **原理**：使用比 LoRA 更溫和的衰減曲線和更高的最小權重衰減比例
+- **優化**：針對不同類型的 LoKr 參數（w1_a, w1_b, w2_a, w2_b）應用層次化學習率
+
+#### 智能參數檢測
+- **支援命名**：`lokr_w1_a`, `lokr_w1_b`, `lokr_w2_a`, `lokr_w2_b`, `lokr_w1`, `lokr_w2` 等多種模式
+- **自動分組**：建立 LoKr 參數的配對關係和組別結構
+- **統計監控**：提供詳細的 LoKr 參數統計信息
+
 ## 使用方法
 
 ### 基本使用
@@ -179,6 +196,24 @@ lora_config = {
 }
 ```
 
+#### LoKr 專用配置
+```python
+lokr_config = {
+    'use_spd': True,
+    'spd_lambda': 0.08,            # 略低於 LoRA
+    'use_cautious': True,
+    'use_adopt_stability': True,
+    'use_alora': True,             # 自動支援 LoKr
+    'alora_ratio': 18.0,          # LoKr 適用範圍：14.0-20.0
+    'dynamic_weight_decay': True,
+    'wd_transition_steps': 600,   # 較快過渡
+    'wd_decay_factor': 0.8,       # 溫和衰減
+    'wd_min_ratio': 0.18,         # 較高最小權重衰減
+    'use_tam': True,
+    'tam_beta': 0.995             # 略低於預設值
+}
+```
+
 ## 監控和調試
 
 ### 獲取優化器信息
@@ -189,14 +224,47 @@ print(f"優化器類型: {opt_info['optimizer_type']}")
 print(f"總參數數量: {opt_info['total_params']}")
 print(f"啟用功能: {opt_info['features']}")
 print(f"LoRA 統計: {opt_info['lora_stats']}")
+
+# LoKr 專用統計（如果檢測到 LoKr 參數）
+if 'lokr_stats' in opt_info:
+    lokr_stats = opt_info['lokr_stats']
+    print(f"LoKr 統計: {lokr_stats}")
+    print(f"  LoKr 組別: {lokr_stats['lokr_groups']}")
+    print(f"  配對關係: {lokr_stats['lokr_pairs']}")
+    print(f"  W1 參數: {lokr_stats['lokr_w1_params']} + {lokr_stats['lokr_w1_a_params']}A + {lokr_stats['lokr_w1_b_params']}B")
+    print(f"  W2 參數: {lokr_stats['lokr_w2_params']} + {lokr_stats['lokr_w2_a_params']}A + {lokr_stats['lokr_w2_b_params']}B")
+
+    # 檢查 LoKr 支援狀態
+    if lokr_stats['lokr_groups'] > 0:
+        print("✅ LoKr 參數檢測成功，啟用專門優化策略")
+    else:
+        print("⚠️ 未檢測到 LoKr 參數")
 ```
 
 ### 日誌輸出
 
 優化器會自動記錄以下信息：
 - 啟用的功能列表
-- 檢測到的 LoRA 參數統計
+- 檢測到的 LoRA/LoKr 參數統計
 - 功能特定的警告和信息
+- LoKr 專用的參數檢測和配對信息
+
+## 相關文檔
+
+- [LoKr 支援詳細指南](./LOKR_SUPPORT_GUIDE.md) - LoKr 支援的完整實現細節和使用指南
+- [動態權重衰減理論](./DYNAMIC_WEIGHT_DECAY_THEORY.md) - 動態權重衰減的理論基礎
+- [LoRA 優化文檔](./README_LoRA_Optimization.md) - LoRA 專用優化的詳細說明
+
+## 更新日誌
+
+### v2.1.0 - LoKr 支援
+- ✅ 新增 LoKr (Low-rank Kronecker product adaptation) 完整支援
+- ✅ 智能 LoKr 參數檢測和分組
+- ✅ Kronecker 積感知的學習率縮放
+- ✅ LoKr 專屬的動態權重衰減策略
+- ✅ 詳細的 LoKr 統計和監控功能
+- ✅ 多種 LoKr 命名模式支援
+- ✅ 向後相容，不影響現有 LoRA 功能
 
 ## 性能考量
 

@@ -8,6 +8,7 @@
 
 - **[使用指南](./CUSTOM_OPTIMIZER_USAGE_GUIDE.md)** - 快速上手指南和完整使用說明
 - **[基本配置範例](./custom_optimizer_usage.py)** - 程式碼範例和整合方法
+- **[LoKr 支援指南](./LOKR_SUPPORT_GUIDE.md)** - LoKr 專屬功能的詳細說明和使用指南
 
 ### 📚 理論基礎
 
@@ -33,10 +34,11 @@
 - 相比標準 AdamW 減少 45% 記憶體使用
 - 支援大模型和長序列訓練
 
-### LoRA 專屬優化
-- **ALoRA 風格學習率**：根據低秩矩陣的行向量範數自適應調整
-- **動態權重衰減**：針對 LoRA 參數的智能權重衰減策略
-- **參數自動識別**：自動檢測和配對 LoRA A/B 矩陣
+### LoRA/LoKr 專屬優化
+- **ALoRA 風格學習率**：根據低秩矩陣的行向量範數自適應調整，支援 LoRA 和 LoKr
+- **智能參數檢測**：自動檢測和配對 LoRA A/B 矩陣以及 LoKr 多參數組合
+- **動態權重衰減**：針對不同低秩結構的專門權重衰減策略
+- **Kronecker 積感知**：專為 LoKr 的 Kronecker 積結構設計的優化算法
 
 ### 九大增強技術
 
@@ -51,9 +53,9 @@
 6. **AGR (Adaptive Gradient Regularization)** - 自適應梯度正則化
 7. **TAM (Torque-Aware Momentum)** - 扭矩感知動量
 
-#### LoRA 專屬技術
-8. **ALoRA** - 自適應 LoRA 學習率
-9. **Dynamic Weight Decay** - 動態權重衰減
+#### LoRA/LoKr 專屬技術
+8. **ALoRA** - 自適應低秩學習率（支援 LoRA 和 LoKr）
+9. **Dynamic Weight Decay** - 針對不同低秩結構的智能權重衰減
 
 ## 🔧 關鍵參數說明
 
@@ -197,6 +199,6 @@ monitoring_metrics = {
 
 ---
 
-**最後更新**：2024年12月
+**最後更新**：2025年6月
 **版本**：1.0.0
 **維護者**：Hina
