@@ -89,7 +89,6 @@
 ## 🎨 技術亮點
 
 ### LoKr (Low-rank Kronecker) 支援 ⭐
-- **多樣命名支援**：`lokr_w1`, `lokr_w2`, `lokr_w1_a`, `lokr_w1_b` 等
 - **自動配對檢測**：智能建立參數配對關係
 - **Kronecker 感知**：專門的學習率縮放和權重衰減策略
 - **統計監控**：詳細的 LoKr 參數統計

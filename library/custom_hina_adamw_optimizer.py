@@ -73,7 +73,7 @@ class HinaAdamWOptimizer(AdamW8bit):
         is_paged: bool = False,
         # Enhanced features configuration
         use_spd: bool = True,
-        spd_lambda: float = 0.1,
+        spd_lambda: float = 0.06,
         use_cautious: bool = True,
         use_orthogonal_grad: bool = False,
         use_adopt_stability: bool = True,
@@ -82,7 +82,7 @@ class HinaAdamWOptimizer(AdamW8bit):
         use_tam: bool = True,
         tam_beta: float = 0.999,
         use_alora: bool = True,
-        alora_ratio: float = 21.0,
+        alora_ratio: float = 16.0,
         dynamic_weight_decay: bool = True,
         # Dynamic weight decay configuration
         wd_transition_steps: int = 1000,  # 權重衰減過渡的步數閾值
