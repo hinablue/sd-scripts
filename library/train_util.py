@@ -32,6 +32,7 @@ from packaging.version import Version
 from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit
 from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
 from library.automagic_adams import Automagic_AdamS
+from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -4843,6 +4844,18 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             optimizer_class = bnb.optim.AdamW8bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+
+        elif optimizer_type == "HinaAdamWOptimizer8bit".lower():
+            logger.info(f"use Hina Custom AdamW optimizer with enhanced features | {optimizer_kwargs}")
+            optimizer_class = HinaAdamWOptimizer
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Custom optimizer features: {opt_info['features']}")
+                if 'lora_stats' in opt_info:
+                    logger.info(f"LoRA parameters detected: {opt_info['lora_stats']}")
 
         elif optimizer_type == "SGDNesterov8bit".lower():
             logger.info(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")
