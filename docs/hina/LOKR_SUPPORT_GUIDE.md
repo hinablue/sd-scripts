@@ -21,8 +21,8 @@
 
 | 特性 | LoRA | LoKr |
 |------|------|------|
-| **分解方式** | 簡單矩陣分解：`W = W₀ + BA` | Kronecker 積分解：`W = W₀ + (B₁ ⊗ B₂)(A₁ ⊗ A₂)` |
-| **參數結構** | 2個矩陣 (A, B) | 4-6個矩陣 (w1_a, w1_b, w2_a, w2_b, etc.) |
+| **分解方式** | 簡單矩陣分解：`W = W₀ + BA` | Kronecker 積分解：`W = W₀ + W₁W₂ᵀ` |
+| **參數結構** | 2個矩陣 (A, B) | 2個矩陣 (w1, w2) |
 | **計算複雜度** | O(r×d) | O(r₁×r₂×d₁×d₂) |
 | **表達能力** | 低秩限制較強 | 更靈活的低秩表示 |
 | **優化需求** | 簡單配對優化 | 需要組別感知的優化 |
@@ -32,13 +32,13 @@
 ### 1. 問題分析階段
 
 **問題識別**：
-- LoKr 使用完全不同的參數命名和結構
-- 現有的參數配對邏輯無法處理 LoKr 的多參數組合
+- LoKr 使用不同的參數命名和結構
+- 現有的參數配對邏輯無法處理 LoKr 的參數組合
 - 需要針對 Kronecker 積結構設計專門的優化策略
 
 **技術挑戰**：
 - 多樣化的 LoKr 參數命名模式
-- 複雜的參數依賴關係（4-6個參數組成一個邏輯單元）
+- 簡化的 w1-w2 配對關係（與 LoRA 的 A-B 配對不同）
 - Kronecker 積結構的特殊數學性質
 
 ### 2. 設計決策階段
@@ -47,7 +47,7 @@
 1. **向後相容性**：不破壞現有的 LoRA 支援
 2. **自動檢測**：智能識別各種 LoKr 命名模式
 3. **專門優化**：針對 Kronecker 積結構的特殊優化
-4. **靈活擴展**：支援未來可能的 LoKr 變體
+4. **靈活擴展**：支援未來可能的 LoKr 變體和 Norm 參數
 
 **架構設計**：
 ```
@@ -64,6 +64,7 @@
 3. 實現 LoKr 專屬優化算法
 4. 整合到主優化流程
 5. 添加監控和統計功能
+6. 新增 Norm 參數支援
 
 ## 核心功能實現
 
@@ -73,21 +74,19 @@
 
 ```python
 # 標準 LoKr 命名
-"layer.lokr_w1_a.weight"  # → lokr_w1_a
-"layer.lokr_w1_b.weight"  # → lokr_w1_b
-"layer.lokr_w2_a.weight"  # → lokr_w2_a
-"layer.lokr_w2_b.weight"  # → lokr_w2_b
-
-# 簡化 LoKr 命名
-"layer.lokr_w1.weight"    # → lokr_w1
-"layer.lokr_w2.weight"    # → lokr_w2
+"layer.lokr_w1.weight"  # → lokr_w1
+"layer.lokr_w2.weight"  # → lokr_w2
 
 # 點式命名
-"layer.lokr.w1_a.weight"  # → lokr_w1_a
-"layer.lokr.w2.weight"    # → lokr_w2
+"layer.lokr.w1.weight"  # → lokr_w1
+"layer.lokr.w2.weight"  # → lokr_w2
 
-# 通用檢測
-"custom.lokr.param"       # → lokr_generic
+# 通用 LoKr 檢測
+"custom.lokr.param"     # → lokr_generic
+
+# Norm 參數命名
+"layer.w_norm.weight"   # → w_norm
+"layer.b_norm.weight"   # → b_norm
 ```
 
 #### 參數分類邏輯
@@ -98,21 +97,30 @@ def _classify_parameter(self, param_name):
     分類邏輯：
     1. 首先檢查 LoKr 模式（防止與 LoRA 混淆）
     2. 然後檢查 LoRA 模式
-    3. 最後歸類為普通參數
+    3. 接著檢查 Norm 模式
+    4. 最後歸類為普通參數
     """
     param_name_lower = param_name.lower()
 
-    # LoKr 檢測優先級：細粒度 → 粗粒度
-    if 'lokr_w1_a' in param_name_lower:
-        return 'lokr_w1_a'
-    elif 'lokr_w1_b' in param_name_lower:
-        return 'lokr_w1_b'
-    # ... 其他 LoKr 模式
+    # LoKr 檢測優先級
+    if '.lokr_w1' in param_name_lower or 'lokr_w1' in param_name_lower:
+        return 'lokr_w1'
+    elif '.lokr_w2' in param_name_lower or 'lokr_w2' in param_name_lower:
+        return 'lokr_w2'
+    elif 'lokr' in param_name_lower:
+        return 'lokr_generic'
 
     # LoRA 檢測
-    elif 'lora_down' in param_name_lower:
+    elif 'lora_down' in param_name_lower or 'lora_a' in param_name_lower:
         return 'lora_a'
-    # ... 其他 LoRA 模式
+    elif 'lora_up' in param_name_lower or 'lora_b' in param_name_lower:
+        return 'lora_b'
+
+    # Norm 參數檢測
+    elif '.w_norm' in param_name_lower or 'w_norm' in param_name_lower:
+        return 'w_norm'
+    elif '.b_norm' in param_name_lower or 'b_norm' in param_name_lower:
+        return 'b_norm'
 
     return 'regular'
 ```
@@ -126,15 +134,15 @@ def extract_base_name(param_name):
     """
     從完整參數名稱中提取基礎層名稱
     例子：
-    "unet.down_blocks.0.attentions.0.lokr_w1_a.weight"
+    "unet.down_blocks.0.attentions.0.lokr_w1.weight"
     → "unet.down_blocks.0.attentions.0"
     """
-    suffixes = [
-        '.lokr_w1_a.weight', '.lokr_w1_b.weight',
-        '.lokr_w2_a.weight', '.lokr_w2_b.weight',
-        # ... 更多後綴
-    ]
-    # 移除匹配的後綴並返回基礎名稱
+    base_name = param_name
+    if '.lokr_w1' in base_name:
+        base_name = base_name.replace('.lokr_w1', '')
+    elif '.lokr_w2' in base_name:
+        base_name = base_name.replace('.lokr_w2', '')
+    return base_name.strip('.')
 ```
 
 #### 分組建立邏輯
@@ -142,23 +150,34 @@ def extract_base_name(param_name):
 ```python
 # 每個 LoKr 組別包含的參數結構
 lokr_group = {
-    'w1': None,      # 直接 w1 參數
-    'w2': None,      # 直接 w2 參數
-    'w1_a': None,    # w1 的 A 分解
-    'w1_b': None,    # w1 的 B 分解
-    'w2_a': None,    # w2 的 A 分解
-    'w2_b': None,    # w2 的 B 分解
+    'w1': None,      # w1 參數
+    'w2': None,      # w2 參數
 }
 
-# 配對關係
+# 配對關係（簡化的 w1-w2 配對）
 lokr_pairs = {
-    w1_a_param: w1_b_param,  # w1 的 A-B 配對
-    w2_a_param: w2_b_param,  # w2 的 A-B 配對
-    w1_param: w2_param,      # w1-w2 配對
+    w1_param: w2_param,  # w1-w2 配對
 }
 ```
 
-### 3. LoKr 專屬優化策略
+### 3. Norm 參數支援
+
+#### Norm 參數配對
+
+```python
+# Norm 參數分組
+norm_group = {
+    'w_norm': None,  # 權重歸一化參數
+    'b_norm': None,  # 偏差歸一化參數
+}
+
+# Norm 配對關係
+norm_pairs = {
+    w_norm_param: b_norm_param,  # w_norm-b_norm 配對
+}
+```
+
+### 4. LoKr 專屬優化策略
 
 #### Kronecker 積感知的學習率縮放
 
@@ -168,33 +187,26 @@ def _compute_lokr_lr_scale(self, lokr_group):
     針對 Kronecker 積結構的學習率縮放
 
     原理：
-    1. 計算各個子矩陣的乘積範數
-    2. 平均範數作為整體複雜度指標
-    3. 使用更溫和的縮放係數（0.5 vs LoRA 的 1.0）
+    1. 計算 w1 和 w2 的範數
+    2. 組合範數作為整體複雜度指標
+    3. 使用保守的縮放策略（比 LoRA 更溫和）
     """
-    total_norm = 0.0
-    param_count = 0
+    w1 = lokr_group.get('w1')
+    w2 = lokr_group.get('w2')
 
-    # 處理 w1_a, w1_b 配對
-    if w1_a is not None and w1_b is not None:
-        w1_product = torch.matmul(w1_b.data, w1_a.data)
-        total_norm += torch.norm(w1_product).item()
-        param_count += 1
+    if w1 is not None and w2 is not None:
+        # 計算 Kronecker 積的近似範數
+        w1_norm = torch.norm(w1.data).item()
+        w2_norm = torch.norm(w2.data).item()
 
-    # 處理 w2_a, w2_b 配對
-    if w2_a is not None and w2_b is not None:
-        w2_product = torch.matmul(w2_b.data, w2_a.data)
-        total_norm += torch.norm(w2_product).item()
-        param_count += 1
+        # LoKr 的總體影響近似為兩個矩陣範數的乘積
+        combined_norm = w1_norm * w2_norm
 
-    if param_count > 0:
-        avg_norm = total_norm / param_count
-        # LoKr 使用更溫和的縮放
-        lr_scale = 1.0 / (1.0 + avg_norm * 0.5)
+        # 學習率縮放策略：與組合範數成反比，比 LoRA 稍微保守
+        lr_scale = 1.0 / (1.0 + combined_norm * 0.3)
+        return lr_scale
     else:
-        lr_scale = 1.0
-
-    return lr_scale
+        return 1.0
 ```
 
 #### LoKr 動態權重衰減
@@ -209,14 +221,20 @@ def _get_lokr_dynamic_weight_decay(self, param, group_metadata, state):
     2. 更高的最小權重衰減（1.5倍）
     3. 更溫和的過渡過程
     """
+    if not self.dynamic_weight_decay:
+        return 1.0
+
+    param_type = group_metadata['param_types'].get(param, 'regular')
+
+    # LoKr 參數的動態權重衰減策略
     if param_type.startswith('lokr_'):
         if state['step'] > self.wd_transition_steps:
             progress = (state['step'] - self.wd_transition_steps) / self.wd_transition_steps
 
-            # LoKr 專用衰減公式
+            # LoKr 使用更溫和的衰減曲線
             decay_multiplier = max(
-                self.wd_min_ratio * 1.5,  # 保持更高最小值
-                (self.wd_decay_factor ** 0.7) ** min(progress, 1.5)  # 更溫和
+                self.wd_min_ratio * 1.5,  # LoKr 保持更高的最小權重衰減
+                (self.wd_decay_factor ** 0.7) ** min(progress, 1.5)  # 更溫和的衰減
             )
             return decay_multiplier
 
@@ -226,26 +244,25 @@ def _get_lokr_dynamic_weight_decay(self, param, group_metadata, state):
 #### 學習率比例調整
 
 ```python
-# LoKr 的層次化學習率策略
-if param_type in ['lokr_w1_b', 'lokr_w2_b', 'lokr_w2']:
-    # 對"上層"參數（輸出相關）應用較高學習率
-    current_step_size *= (self.alora_ratio * 0.8)  # 比 LoRA 保守
+# LoKr 的學習率策略
+if param_type == 'lokr_w2':
+    # 對 w2 參數（類似 LoRA B）應用較高學習率
+    current_step_size *= (self.alora_ratio * 0.6)  # 比 LoRA 更保守
 ```
 
-### 4. 監控和統計
+### 5. 監控和統計
 
-#### 詳細的 LoKr 統計
+#### 詳細的統計信息
 
 ```python
 info['lokr_stats'] = {
-    'lokr_w1_params': total_lokr_w1,         # 直接 w1 參數數量
-    'lokr_w2_params': total_lokr_w2,         # 直接 w2 參數數量
-    'lokr_w1_a_params': total_lokr_w1_a,     # w1_a 參數數量
-    'lokr_w1_b_params': total_lokr_w1_b,     # w1_b 參數數量
-    'lokr_w2_a_params': total_lokr_w2_a,     # w2_a 參數數量
-    'lokr_w2_b_params': total_lokr_w2_b,     # w2_b 參數數量
+    'lokr_w1_params': total_lokr_w1,         # w1 參數數量
+    'lokr_w2_params': total_lokr_w2,         # w2 參數數量
     'lokr_pairs': total_lokr_pairs,          # 配對關係數量
-    'lokr_groups': total_lokr_groups         # LoKr 組別數量
+    'lokr_groups': total_lokr_groups,        # LoKr 組別數量
+    'w_norm_params': total_w_norm,           # w_norm 參數數量
+    'b_norm_params': total_b_norm,           # b_norm 參數數量
+    'norm_pairs': total_norm_pairs           # Norm 配對關係數量
 }
 ```
 
@@ -328,8 +345,9 @@ lokr_stats = opt_info['lokr_stats']
 print(f"\n🔷 LoKr 參數分佈:")
 print(f"  LoKr 組別: {lokr_stats['lokr_groups']}")
 print(f"  配對關係: {lokr_stats['lokr_pairs']}")
-print(f"  W1 類型: {lokr_stats['lokr_w1_params']} + {lokr_stats['lokr_w1_a_params']}A + {lokr_stats['lokr_w1_b_params']}B")
-print(f"  W2 類型: {lokr_stats['lokr_w2_params']} + {lokr_stats['lokr_w2_a_params']}A + {lokr_stats['lokr_w2_b_params']}B")
+print(f"  W1 參數: {lokr_stats['lokr_w1_params']}")
+print(f"  W2 參數: {lokr_stats['lokr_w2_params']}")
+print(f"  Norm 參數: {lokr_stats['w_norm_params']} (w) + {lokr_stats['b_norm_params']} (b)")
 
 # 檢查是否成功檢測到 LoKr 參數
 if lokr_stats['lokr_groups'] > 0:
@@ -426,7 +444,7 @@ experimental_lokr_config = {
 
 **可能原因**：
 - 參數命名不符合支援的模式
-- 參數沒有設置 `param_name` 屬性
+- 參數沒有正確的命名屬性
 
 **解決方案**：
 ```python
@@ -434,13 +452,10 @@ experimental_lokr_config = {
 for name, param in model.named_parameters():
     if 'lokr' in name:
         print(f"檢測到 LoKr 參數: {name}")
-        param.param_name = name  # 確保設置參數名稱
 
-# 或者在模型初始化後設置
-for param in model.parameters():
-    if hasattr(param, 'param_name'):
-        param_type = optimizer._classify_parameter(param.param_name)
-        print(f"{param.param_name} -> {param_type}")
+# 檢查優化器的參數分類
+opt_info = optimizer.get_optimization_info()
+print(f"LoKr 統計: {opt_info['lokr_stats']}")
 ```
 
 #### 2. 學習率過高或過低
@@ -484,8 +499,7 @@ logging.basicConfig(level=logging.INFO)
 
 optimizer = HinaAdamWOptimizer(
     model.parameters(),
-    verbose=True,  # 啟用詳細輸出
-    # ... 其他參數
+    # ... 參數
 )
 ```
 
@@ -514,37 +528,32 @@ LoKr 的核心思想是使用 Kronecker 積來表示低秩結構：
 給定矩陣 W ∈ ℝᵐˣⁿ，LoKr 分解為：
 W = W₀ + ΔW
 
-其中 ΔW 可以表示為：
-ΔW = (B₁ ⊗ B₂)(A₁ ⊗ A₂)ᵀ
-
-或者簡化形式：
+其中 ΔW 表示為：
 ΔW = W₁W₂ᵀ，其中 W₁, W₂ 是低維矩陣
 ```
 
 ### 優化挑戰
 
-1. **參數耦合**：LoKr 的多個參數之間存在複雜的數學依賴關係
-2. **範數控制**：Kronecker 積會放大範數，需要特別的縮放策略
-3. **梯度分佈**：不同參數的梯度分佈差異很大
+1. **參數耦合**：LoKr 的 w1 和 w2 參數之間存在數學依賴關係
+2. **範數控制**：Kronecker 積會影響範數，需要特別的縮放策略
+3. **梯度分佈**：不同參數的梯度分佈差異
 
 ### 解決方案設計
 
 ```python
 # 1. 組別感知的範數計算
-def compute_lokr_norm(w1_a, w1_b, w2_a, w2_b):
-    # 分別計算各個子矩陣乘積的範數
-    norm1 = torch.norm(torch.matmul(w1_b, w1_a))
-    norm2 = torch.norm(torch.matmul(w2_b, w2_a))
-    return (norm1 + norm2) / 2  # 平均範數
+def compute_lokr_norm(w1, w2):
+    # 計算組合範數
+    w1_norm = torch.norm(w1.data).item()
+    w2_norm = torch.norm(w2.data).item()
+    return w1_norm * w2_norm  # Kronecker 積的近似範數
 
-# 2. 層次化學習率
-def apply_hierarchical_lr(param_type, base_lr, ratio):
-    if param_type in ['lokr_w1_b', 'lokr_w2_b']:
-        return base_lr * ratio * 0.8  # "輸出層"參數
-    elif param_type in ['lokr_w1_a', 'lokr_w2_a']:
-        return base_lr * 0.9  # "輸入層"參數
+# 2. 學習率縮放
+def apply_lokr_lr_scaling(param_type, base_lr, ratio):
+    if param_type == 'lokr_w2':
+        return base_lr * ratio * 0.6  # w2 參數的特殊處理
     else:
-        return base_lr  # 其他參數
+        return base_lr  # w1 參數保持基準學習率
 ```
 
 ## 未來擴展
@@ -552,14 +561,13 @@ def apply_hierarchical_lr(param_type, base_lr, ratio):
 ### 計劃中的功能
 
 1. **更多 LoKr 變體支援**：
-   - Hierarchical LoKr
-   - Sparse LoKr
-   - Adaptive rank LoKr
+   - 擴展命名模式識別
+   - 支援更複雜的 LoKr 結構
 
 2. **自動調優**：
    - 基於訓練進度的自動參數調整
    - 智能學習率調度
-   - 動態 rank 調整
+   - 動態配對檢測
 
 3. **性能分析工具**：
    - LoKr 專用的性能分析器
@@ -598,12 +606,13 @@ HinaAdamWOptimizer 的 LoKr 支援提供了一個完整、智能、高效的解�
 2. **智能優化**：自動檢測和專門優化 LoKr 參數
 3. **詳細監控**：全面的統計和調試信息
 4. **靈活配置**：豐富的配置選項適應不同場景
+5. **擴展支援**：新增 Norm 參數支援和未來擴展能力
 
 這個實現不僅解決了原始問題，還為未來的 LoKr 相關研究和應用提供了堅實的基礎。
 
 ---
 
-**文檔版本**: 1.0
+**文檔版本**: 1.1
 **最後更新**: 2025-01-27
 **作者**: Hina
 **相關文件**:
