@@ -755,7 +755,7 @@ class HinaAdamWOptimizer(AdamW8bit):
 
                 # LoKr/Lora 學習率調整
                 if self.use_alora:
-                    if  param_type.startswith('lokr_')
+                    if param_type.startswith('lokr_'):
                         # 為 LoKr 參數尋找對應的組別
                         for base_name, lokr_group in group_metadata.get('lokr_groups', {}).items():
                             # 使用 id() 比較避免張量比較導致的尺寸錯誤
