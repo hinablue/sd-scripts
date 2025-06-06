@@ -78,6 +78,10 @@ class HinaAdamWOptimizer(AdamW8bit):
         use_alora: bool = True,
         alora_ratio: float = 21.0,
         dynamic_weight_decay: bool = True,
+        # Dynamic weight decay configuration
+        wd_transition_steps: int = 1000,  # 權重衰減過渡的步數閾值
+        wd_decay_factor: float = 0.7,    # 權重衰減減少係數
+        wd_min_ratio: float = 0.1,       # 最小權重衰減比例
         **kwargs
     ):
         """
@@ -99,6 +103,9 @@ class HinaAdamWOptimizer(AdamW8bit):
             use_alora: 啟用 ALoRA 風格學習率
             alora_ratio: ALoRA 學習率比例（ηB/ηA）
             dynamic_weight_decay: 啟用動態權重衰減
+            wd_transition_steps: 權重衰減過渡的步數閾值
+            wd_decay_factor: 權重衰減減少係數
+            wd_min_ratio: 最小權重衰減比例
         """
         super().__init__(
             params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
@@ -120,6 +127,10 @@ class HinaAdamWOptimizer(AdamW8bit):
         self.use_alora = use_alora
         self.alora_ratio = alora_ratio
         self.dynamic_weight_decay = dynamic_weight_decay
+        # Dynamic weight decay configuration
+        self.wd_transition_steps = wd_transition_steps
+        self.wd_decay_factor = wd_decay_factor
+        self.wd_min_ratio = wd_min_ratio
 
         # Initialize parameter groups and metadata
         self._initialize_parameter_groups()
@@ -357,7 +368,7 @@ class HinaAdamWOptimizer(AdamW8bit):
                 if self.use_adopt_stability:
                     # 更新二階矩（移除當前梯度）
                     exp_avg_sq_prev.copy_(exp_avg_sq)
-                    exp_avg_sq.mul_(beta2).addcmulsq_(grad, grad, value=1 - beta2)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
                     # 使用前一步的二階矩進行動量更新
                     if state['step'] > 1:
@@ -369,7 +380,7 @@ class HinaAdamWOptimizer(AdamW8bit):
                 else:
                     # 標準 Adam 更新
                     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                    exp_avg_sq.mul_(beta2).addcmulsq_(grad, grad, value=1 - beta2)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                     denom = exp_avg_sq.sqrt().add_(group['eps'])
 
                 # 偏差修正
@@ -414,9 +425,16 @@ class HinaAdamWOptimizer(AdamW8bit):
                 if self.dynamic_weight_decay:
                     # 根據訓練進度調整權重衰減
                     if param in group_metadata.get('lora_a_params', []) + group_metadata.get('lora_b_params', []):
-                        # 對 LoRA 參數可能減少權重衰減
-                        if state['step'] > 100:  # 在訓練後期可能減少權重衰減
-                            current_weight_decay *= 0.5
+                        # 對 LoRA 參數進行漸進式權重衰減調整
+                        if state['step'] > self.wd_transition_steps:
+                            # 計算漸進式衰減係數
+                            progress = (state['step'] - self.wd_transition_steps) / self.wd_transition_steps
+                            # 使用指數衰減曲線，避免權重衰減降得過低
+                            decay_multiplier = max(
+                                self.wd_min_ratio,
+                                self.wd_decay_factor ** min(progress, 2.0)  # 限制進度最大為 2.0
+                            )
+                            current_weight_decay *= decay_multiplier
 
                 if current_weight_decay != 0:
                     param.data.add_(param.data, alpha=-group['lr'] * current_weight_decay)
