@@ -33,6 +33,7 @@ from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit
 from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
 from library.automagic_adams import Automagic_AdamS
 from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
+from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -4844,6 +4845,16 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             optimizer_class = bnb.optim.AdamW8bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "HinaAdaptiveAdamW8bit".lower():
+            logger.info(f"use Adaptive Hina AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = AdaptiveHinaAdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Features: {opt_info['features']}")
+                logger.info(f"Adaptation: {opt_info['adaptation_config']}")
 
         elif optimizer_type == "HinaAdamWOptimizer8bit".lower():
             logger.info(f"use Hina Custom AdamW optimizer with enhanced features | {optimizer_kwargs}")
