@@ -609,9 +609,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         state['exp_avg_sq_prev'] = torch.zeros_like(param.data)
                     state['exp_avg_sq'] = torch.zeros_like(param.data)
                 else:
-                    # 檢查狀態張量形狀是否匹配
+                    # 檢查狀態張量形狀是否相符
                     if state['exp_avg'].shape != param.data.shape:
-                        logger.warning(f"狀態張量形狀不匹配，重新初始化參數 {param.data.shape}")
+                        logger.warning(f"狀態張量形狀不相符，重新初始化參數 {param.data.shape}")
                         state['exp_avg'] = torch.zeros_like(param.data)
                         state['exp_avg_sq'] = torch.zeros_like(param.data)
                         if self.use_adopt_stability:
@@ -627,6 +627,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     grad = self._apply_agr_regularization(grad)
 
                 # 正交梯度投影
+                # TODO: 正交梯度投影是否還有需要？開啟與關閉的效果需要更多測試。
                 if self.use_orthogonal_grad:
                     grad = self._apply_orthogonal_gradient(grad, param)
 

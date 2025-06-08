@@ -6,7 +6,17 @@
 
 ### 🎯 核心優化器文檔
 
-#### HinaAdamWOptimizer (主推薦)
+> **⚠️ 重要提醒**：
+> - **權重衰減限制**：需要修改 kohya sd-scripts 與 LyCORIS 的 `kohya.py` 程式碼才能使用權重衰減功能
+> - **維護狀態**：此版本將不再更新，未來發展將以 **AdaptiveHinaAdamW** 版本為主
+
+#### AdaptiveHinaAdamW (最新自適應版本) 🆕
+- **自適應參數關係發現**：智能分析參數間的相互作用和依賴關係
+- **動態重要性評估**：基於貢獻度實時調整參數的學習策略
+- **智能學習率調整**：根據參數重要性和關係自動調整學習率
+- **無參數類型依賴**：不依賴特定的參數命名模式，適用於各種模型架構
+
+#### HinaAdamWOptimizer (LoRA/LoKr 專用版本) ⚠️
 - **[HinaAdamWOptimizer 核心文檔](./CUSTOM_OPTIMIZER_README.md)** - 主要優化器的完整說明
 - **[使用指南](./CUSTOM_OPTIMIZER_USAGE_GUIDE.md)** - 詳細的使用說明和配置指南
 - **[LoKr 支援指南](./LOKR_SUPPORT_GUIDE.md)** ⭐ - LoKr 專屬功能的詳細說明
@@ -54,10 +64,12 @@
 ## 🎯 推薦閱讀路線
 
 ### 🆕 新手入門路線
-1. **[HinaAdamWOptimizer 核心文檔](./CUSTOM_OPTIMIZER_README.md)** - 了解核心功能
-2. **[使用指南](./CUSTOM_OPTIMIZER_USAGE_GUIDE.md)** - 學習基本使用
-3. **[基本使用範例](./custom_optimizer_usage.py)** - 實際操作
+1. **[AdaptiveHinaAdamW 基本使用](#adaptivehinaadamw-自適應版本-)** - 推薦使用的新版本 🆕
+2. **[HinaAdamWOptimizer 核心文檔](./CUSTOM_OPTIMIZER_README.md)** - 了解舊版核心功能 ⚠️
+3. **[使用指南](./CUSTOM_OPTIMIZER_USAGE_GUIDE.md)** - 學習基本使用
 4. **[LoKr 支援指南](./LOKR_SUPPORT_GUIDE.md)** - 掌握 LoKr 功能
+
+> **💡 建議**：新用戶建議直接使用 **AdaptiveHinaAdamW** 版本，功能更強大且持續維護
 
 ### 🔬 深度研究路線
 1. **[動態權重衰減理論](./DYNAMIC_WEIGHT_DECAY_THEORY.md)** - 理論基礎
@@ -73,12 +85,25 @@
 
 ## 🚀 核心優化器特色
 
-### HinaAdamWOptimizer
+### HinaAdamWOptimizer ⚠️
 - **🎯 LoRA/LoKr 專屬優化**：智能參數檢測和專門優化策略
 - **🧠 九大增強技術**：SPD、Cautious、ADOPT、Grams、AGR、TAM 等
 - **💾 記憶體高效**：基於 bitsandbytes AdamW8bit
-- **📊 動態權重衰減**：根據訓練進度自適應調整
+- **📊 動態權重衰減**：根據訓練進度自適應調整 ⚠️ *需修改 kohya.py*
 - **🔍 智能監控**：詳細的統計和診斷功能
+
+> **⚠️ 注意事項**：
+> - 此版本專為 LoRA/LoKr 設計，需要特定的參數命名模式
+> - 權重衰減功能需要修改 kohya sd-scripts 與 LyCORIS 的程式碼
+> - **不再維護更新**，建議使用 AdaptiveHinaAdamW 版本
+
+### AdaptiveHinaAdamW (自適應版本) 🆕
+- **🤖 智能參數關係發現**：自動分析參數間的相互作用和依賴關係
+- **📈 動態重要性評估**：基於實際貢獻度評估參數重要性
+- **⚡ 自適應學習率調整**：根據參數重要性和關係動態調整學習率
+- **🎯 無類型依賴設計**：不依賴特定參數命名，適用於各種模型架構
+- **🔄 定期關係更新**：定期重新發現參數關係，適應訓練過程變化
+- **📊 全面監控分析**：提供參數關係、重要性分析等詳細統計
 
 ### Automagic CameAMP 系列
 - **🤖 自動化優化**：智能參數調整和邊緣檢測
@@ -118,6 +143,8 @@
 ## 🎯 快速開始
 
 ### 基本使用
+
+#### HinaAdamWOptimizer (LoRA/LoKr 專用) ⚠️
 ```python
 from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 
@@ -126,9 +153,29 @@ optimizer = HinaAdamWOptimizer(
     model.parameters(),
     lr=1e-3,
     use_alora=True,              # 啟用 LoRA/LoKr 優化
-    dynamic_weight_decay=True,    # 啟用動態權重衰減
+    dynamic_weight_decay=True,    # ⚠️ 需修改 kohya.py 才能使用
     use_spd=True,                # 啟用泛化增強
     use_cautious=True            # 啟用穩定性優化
+)
+```
+
+> **⚠️ 重要提醒**：此版本不再維護更新，建議使用 **AdaptiveHinaAdamW** 版本
+
+#### AdaptiveHinaAdamW (自適應版本) 🆕
+```python
+from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
+
+# 創建自適應優化器（適用於各種模型架構）
+optimizer = AdaptiveHinaAdamW(
+    model.parameters(),
+    lr=1e-3,
+    use_dynamic_adaptation=True,     # 啟用動態自適應功能
+    adaptation_strength=1.0,         # 自適應調整強度
+    relationship_discovery_interval=100,  # 參數關係發現間隔
+    importance_decay=0.95,           # 重要性分數衰減係數
+    compatibility_threshold=0.3,     # 參數相容性閾值
+    use_spd=True,                   # 啟用 SPD 正則化
+    use_cautious=True               # 啟用謹慎更新
 )
 ```
 
@@ -180,6 +227,33 @@ lokr_config = {
 }
 ```
 
+### AdaptiveHinaAdamW 專用配置 🆕
+```python
+# 通用模型微調配置
+adaptive_config = {
+    'lr': 1e-3,
+    'use_dynamic_adaptation': True,
+    'adaptation_strength': 1.2,
+    'relationship_discovery_interval': 150,
+    'importance_decay': 0.95,
+    'compatibility_threshold': 0.25,
+    'dynamic_weight_decay': True,
+    'wd_transition_steps': 800,
+    'wd_decay_factor': 0.75
+}
+
+# 大型模型配置（更保守的自適應策略）
+large_model_config = {
+    'lr': 5e-4,
+    'adaptation_strength': 0.8,
+    'relationship_discovery_interval': 200,
+    'importance_decay': 0.98,
+    'compatibility_threshold': 0.35,
+    'use_cautious': True,
+    'use_adopt_stability': True
+}
+```
+
 ## 📊 性能表現
 
 ### 記憶體使用對比
@@ -199,12 +273,23 @@ lokr_config = {
 ## 🛠️ 故障排除
 
 ### 常見問題
+
+#### HinaAdamWOptimizer 相關 ⚠️
 1. **LoKr 參數未檢測** → 檢查參數命名模式
-2. **記憶體不足** → 使用 8bit 版本或減少批次大小
-3. **訓練不穩定** → 調整權重衰減參數
-4. **收斂緩慢** → 檢查學習率和 ALoRA 比例
+2. **權重衰減無效** → 需要修改 kohya sd-scripts 與 LyCORIS 的 `kohya.py` 程式碼
+3. **記憶體不足** → 使用 8bit 版本或減少批次大小
+4. **訓練不穩定** → 調整權重衰減參數
+5. **收斂緩慢** → 檢查學習率和 ALoRA 比例
+
+#### AdaptiveHinaAdamW 相關 🆕
+1. **參數關係未發現** → 調整 `relationship_discovery_interval` 和 `compatibility_threshold`
+2. **自適應效果不明顯** → 增加 `adaptation_strength` 參數
+3. **訓練過程不穩定** → 啟用 `use_cautious` 和 `use_adopt_stability`
+4. **記憶體使用過高** → 調整 `relationship_discovery_interval` 增加間隔
 
 ### 調試工具
+
+#### HinaAdamWOptimizer 調試
 ```python
 # 獲取詳細統計
 info = optimizer.get_optimization_info()
@@ -213,6 +298,23 @@ print(f"LoKr 參數: {info['lokr_stats']}")
 # 診斷 LoRA 配對
 diagnosis = optimizer.diagnose_lora_pairing()
 print(f"配對狀況: {diagnosis}")
+```
+
+#### AdaptiveHinaAdamW 調試 🆕
+```python
+# 獲取優化器詳細信息
+info = optimizer.get_optimization_info()
+print(f"自適應功能狀態: {info['features']}")
+print(f"訓練統計: {info['training_stats']}")
+
+# 獲取參數關係摘要
+relationships = optimizer.get_relationship_summary()
+print(f"發現的參數關係: {relationships['total_relationships']}")
+
+# 獲取重要性分析報告
+importance = optimizer.get_importance_analysis()
+print(f"高重要性參數: {importance['high_importance_params']}")
+print(f"低重要性參數: {importance['low_importance_params']}")
 ```
 
 ## 🤝 貢獻與支援
@@ -233,6 +335,8 @@ print(f"配對狀況: {diagnosis}")
 - **擴展 LoKr 支援**：更多命名模式和結構
 - **自動調優**：基於損失趨勢的參數自動調整
 - **視覺化工具**：訓練過程的視覺化監控
+- **AdaptiveHinaAdamW 增強**：更精確的參數關係分析和自適應策略
+- **跨架構優化**：針對 Transformer、CNN、RNN 等不同架構的專門優化
 
 ### 長期目標
 - **模型感知優化**：針對不同模型架構的專門優化
@@ -253,7 +357,7 @@ print(f"配對狀況: {diagnosis}")
 
 ---
 
-**最後更新**：2025年6月7日
-**版本**：2.0.0
+**最後更新**：2025年6月8日
+**版本**：2.1.0
 **維護者**：Hina
-**文檔狀態**：✅ 已更新並包含最新功能
+**文檔狀態**：✅ 已更新並包含 AdaptiveHinaAdamW 最新功能
