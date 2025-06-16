@@ -21,6 +21,12 @@ def copy_stochastic_(target: torch.Tensor, source: torch.Tensor):
         target: dtype=bfloat16 的目標張量
         source: dtype=float32 的源張量
     """
+    # 確保輸入類型正確
+    if target.dtype != torch.bfloat16:
+        raise ValueError(f"目標張量必須是 bfloat16，但得到 {target.dtype}")
+    if source.dtype != torch.float32:
+        raise ValueError(f"源張量必須是 float32，但得到 {source.dtype}")
+
     # 創建一個隨機 16 位整數
     result = torch.randint_like(
         source,
@@ -35,8 +41,8 @@ def copy_stochastic_(target: torch.Tensor, source: torch.Tensor):
     # 屏蔽尾數的低 16 位
     result.bitwise_and_(-65536)  # -65536 = FFFF0000 作為有符號 int32
 
-    # 將高 16 位複製到目標張量
-    target.copy_(result.view(dtype=torch.float32))
+    # 將高 16 位複製到目標張量（正確轉換為 bfloat16）
+    target.copy_(result.view(dtype=torch.float32).to(dtype=torch.bfloat16))
 
     del result
 
@@ -50,24 +56,20 @@ def add_stochastic_(_input: torch.Tensor, other: torch.Tensor, alpha: float = 1.
         other: 其他張量
         alpha: other 的乘數
     """
-    _input_original = _input
-    if _input.device.type == "mps":
-        _input = _input.to(dtype=torch.float32)
+    # 確保輸入張量是 bfloat16
+    if _input.dtype != torch.bfloat16:
+        raise ValueError(f"輸入張量必須是 bfloat16，但得到 {_input.dtype}")
 
     if other.dtype == torch.float32:
         result = other.clone()
     else:
         result = other.to(dtype=torch.float32)
 
-    if _input.device.type == "mps":
-        result.add_(_input, alpha=torch.tensor(alpha, dtype=torch.float32))
-    else:
-        result.add_(_input, alpha=alpha)
+    # 將 bfloat16 輸入轉換為 float32 進行計算
+    _input_fp32 = _input.to(dtype=torch.float32)
+    result.add_(_input_fp32, alpha=alpha)
 
     copy_stochastic_(_input, result)
-
-    if _input.device.type == "mps":
-        _input_original.copy_(_input.view(dtype=torch.float32))
 
 
 def addcdiv_stochastic_(
@@ -82,10 +84,18 @@ def addcdiv_stochastic_(
         tensor2: 分母張量
         value: tensor1/tensor2 的乘數
     """
-    if _input.dtype == torch.float32:
-        result = _input.clone()
-    else:
-        result = _input.to(dtype=torch.float32)
+    # 確保輸入張量是 bfloat16
+    if _input.dtype != torch.bfloat16:
+        raise ValueError(f"輸入張量必須是 bfloat16，但得到 {_input.dtype}")
+
+    # 將輸入轉換為 float32 進行計算
+    result = _input.to(dtype=torch.float32)
+
+    # 確保 tensor1 和 tensor2 也是正確的精度
+    if tensor1.dtype != torch.float32:
+        tensor1 = tensor1.to(dtype=torch.float32)
+    if tensor2.dtype != torch.float32:
+        tensor2 = tensor2.to(dtype=torch.float32)
 
     result.addcdiv_(tensor1, tensor2, value=value)
     copy_stochastic_(_input, result)
@@ -654,19 +664,23 @@ class AdaptiveHinaAdamWBF16(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError('AdamWBF16_HinaAdaptive 不支援稀疏梯度')
 
+                # 確保梯度也是正確的精度
+                if grad.dtype != torch.bfloat16:
+                    grad = grad.to(dtype=torch.bfloat16)
+
                 state = self.state[param]
 
-                # 狀態初始化
+                # 狀態初始化 - 確保所有狀態張量都是 bfloat16
                 if len(state) == 0:
                     state["step"] = 0.0
                     state["exp_avg"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
+                        param, memory_format=torch.preserve_format, dtype=torch.bfloat16
                     )
                     state["exp_avg_sq"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
+                        param, memory_format=torch.preserve_format, dtype=torch.bfloat16
                     )
                     state["shift"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
+                        param, memory_format=torch.preserve_format, dtype=torch.bfloat16
                     )
                     state["accumulated_decay"] = float(
                         torch.rand([]) * self.decay_threshold
@@ -674,7 +688,7 @@ class AdaptiveHinaAdamWBF16(Optimizer):
 
                     if self.use_adopt_stability:
                         state["exp_avg_sq_prev"] = torch.zeros_like(
-                            param, memory_format=torch.preserve_format
+                            param, memory_format=torch.preserve_format, dtype=torch.bfloat16
                         )
 
                 state["step"] += 1
@@ -723,9 +737,14 @@ class AdaptiveHinaAdamWBF16(Optimizer):
                 if self.use_adopt_stability and "exp_avg_sq_prev" in state:
                     state["exp_avg_sq_prev"] = state["exp_avg_sq"].clone()
 
+                # 確保所有計算都在正確的精度下進行
                 state["exp_avg"].mul_(beta1)
                 add_stochastic_(state["exp_avg"], grad, alpha=1 - beta1)
-                state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+
+                # 對於二階矩，需要特別處理 bfloat16 的乘法
+                grad_squared = grad * grad.conj()
+                state["exp_avg_sq"].mul_(beta2)
+                add_stochastic_(state["exp_avg_sq"], grad_squared, alpha=1 - beta2)
 
                 # 計算分母校正
                 denom_correction = (1 - beta2 ** state["step"]) ** 0.5
@@ -763,15 +782,19 @@ class AdaptiveHinaAdamWBF16(Optimizer):
                 add_stochastic_(param, state["shift"])
                 add_stochastic_(state["shift"], buffer.sub_(param))
 
-                # 權重衰減
+                # 權重衰減 - 確保正確的 bfloat16 處理
                 if decay_this_iteration > 0:
-                    state["shift"].add_(param, alpha=-decay_this_iteration)
+                    # 創建權重衰減項並使用隨機舍入
+                    weight_decay_term = param * decay_this_iteration
+                    add_stochastic_(state["shift"], weight_decay_term, alpha=-1.0)
 
                 # SPD 正則化
                 if self.use_spd:
                     spd_penalty = self._apply_spd_regularization(param, group, state)
                     if isinstance(spd_penalty, torch.Tensor):
-                        state["shift"].add_(spd_penalty, alpha=-current_lr)
+                        # 確保 SPD 懲罰項也使用隨機舍入
+                        spd_scaled = spd_penalty * current_lr
+                        add_stochastic_(state["shift"], spd_scaled, alpha=-1.0)
 
                 if zero_grad:
                     grad.zero_()
@@ -936,3 +959,59 @@ class AdaptiveHinaAdamWBF16(Optimizer):
             for key, value in state.items():
                 if isinstance(value, torch.Tensor) and value.device != device:
                     state[key] = value.to(device)
+
+    def validate_bf16_compatibility(self) -> Dict[str, Any]:
+        """驗證優化器的 BF16 兼容性並返回診斷信息"""
+        issues = []
+        warnings = []
+
+        for group_idx, group in enumerate(self.param_groups):
+            for param_idx, param in enumerate(group['params']):
+                param_info = f"參數組 {group_idx}, 參數 {param_idx}"
+
+                # 檢查參數類型
+                if param.dtype != torch.bfloat16:
+                    issues.append(f"{param_info}: 參數不是 bfloat16 類型 ({param.dtype})")
+
+                # 檢查梯度類型（如果存在）
+                if param.grad is not None and param.grad.dtype != torch.bfloat16:
+                    warnings.append(f"{param_info}: 梯度不是 bfloat16 類型 ({param.grad.dtype})")
+
+                # 檢查狀態張量類型（如果已初始化）
+                if param in self.state:
+                    state = self.state[param]
+                    for state_name, state_tensor in state.items():
+                        if isinstance(state_tensor, torch.Tensor) and state_tensor.dtype != torch.bfloat16:
+                            issues.append(f"{param_info}: 狀態 '{state_name}' 不是 bfloat16 類型 ({state_tensor.dtype})")
+
+        return {
+            'is_compatible': len(issues) == 0,
+            'critical_issues': issues,
+            'warnings': warnings,
+            'total_params': sum(len(group['params']) for group in self.param_groups),
+            'bf16_features_enabled': {
+                'stochastic_rounding': True,
+                'compensated_summation': True,
+                'delayed_weight_decay': True
+            }
+        }
+
+    def convert_to_bf16(self) -> None:
+        """將優化器的所有參數和狀態轉換為 bfloat16"""
+        for group in self.param_groups:
+            for param in group['params']:
+                if param.dtype != torch.bfloat16:
+                    param.data = param.data.to(dtype=torch.bfloat16)
+                    logger.info(f"將參數從 {param.dtype} 轉換為 bfloat16")
+
+                if param.grad is not None and param.grad.dtype != torch.bfloat16:
+                    param.grad.data = param.grad.data.to(dtype=torch.bfloat16)
+
+                # 轉換狀態張量
+                if param in self.state:
+                    state = self.state[param]
+                    for state_name, state_tensor in state.items():
+                        if isinstance(state_tensor, torch.Tensor) and state_tensor.dtype != torch.bfloat16:
+                            state[state_name] = state_tensor.to(dtype=torch.bfloat16)
+
+        logger.info("已將所有優化器狀態轉換為 bfloat16")
