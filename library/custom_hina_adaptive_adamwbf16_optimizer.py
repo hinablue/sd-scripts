@@ -147,6 +147,9 @@ class AdaptiveHinaAdamWBF16(Optimizer):
         wd_transition_steps: int = 1000,
         wd_decay_factor: float = 0.7,
         wd_min_ratio: float = 0.1,
+        # BF16 自動轉換配置
+        auto_convert_to_bf16: bool = True,
+        strict_bf16_check: bool = False,
         **kwargs
     ):
         """
@@ -176,6 +179,8 @@ class AdaptiveHinaAdamWBF16(Optimizer):
             wd_transition_steps: 權重衰減過渡的步數閾值
             wd_decay_factor: 權重衰減減少係數
             wd_min_ratio: 最小權重衰減比例
+            auto_convert_to_bf16: 是否自動將參數轉換為 bfloat16
+            strict_bf16_check: 啟用嚴格 bfloat16 檢查（會導致程式崩潰）
         """
 
         if not 0.0 <= eps:
@@ -216,6 +221,10 @@ class AdaptiveHinaAdamWBF16(Optimizer):
         self.wd_decay_factor = wd_decay_factor
         self.wd_min_ratio = wd_min_ratio
 
+        # BF16 轉換配置
+        self.auto_convert_to_bf16 = auto_convert_to_bf16
+        self.strict_bf16_check = strict_bf16_check
+
         # 自適應優化器內部狀態
         self.parameter_relationships = {}  # 參數關係映射
         self.importance_scores = {}        # 參數重要性分數
@@ -231,6 +240,10 @@ class AdaptiveHinaAdamWBF16(Optimizer):
         # 存儲初始參數（用於 SPD）
         if self.use_spd:
             self._store_initial_parameters()
+
+        # 自動檢查並轉換參數為 bfloat16（如果啟用）
+        if self.auto_convert_to_bf16:
+            self._auto_convert_to_bf16()
 
         logger.info(f"HinaAdaptiveAdamWBF16 初始化完成，動態自適應: {use_dynamic_adaptation}")
 
@@ -658,7 +671,15 @@ class AdaptiveHinaAdamWBF16(Optimizer):
                     continue
 
                 # 確保參數為 bfloat16
-                assert param.dtype == torch.bfloat16, "只支援 bfloat16 精度"
+                if param.dtype != torch.bfloat16:
+                    if self.strict_bf16_check:
+                        raise ValueError(f"參數 dtype 為 {param.dtype}，但優化器要求 bfloat16")
+                    elif self.auto_convert_to_bf16:
+                        logger.warning(f"參數 dtype 為 {param.dtype}，自動轉換為 bfloat16")
+                        param.data = param.data.to(dtype=torch.bfloat16)
+                    else:
+                        logger.error(f"參數 dtype 為 {param.dtype}，但優化器要求 bfloat16。請啟用 auto_convert_to_bf16 或手動轉換")
+                        raise ValueError(f"參數類型不匹配：期望 bfloat16，實際 {param.dtype}")
 
                 grad = param.grad.data
                 if grad.is_sparse:
@@ -1015,3 +1036,26 @@ class AdaptiveHinaAdamWBF16(Optimizer):
                             state[state_name] = state_tensor.to(dtype=torch.bfloat16)
 
         logger.info("已將所有優化器狀態轉換為 bfloat16")
+
+    def _auto_convert_to_bf16(self):
+        """自動將所有參數轉換為 bfloat16 格式"""
+        converted_count = 0
+        total_count = 0
+
+        for group in self.param_groups:
+            for param in group['params']:
+                total_count += 1
+                if param.dtype != torch.bfloat16:
+                    original_dtype = param.dtype
+                    param.data = param.data.to(dtype=torch.bfloat16)
+                    converted_count += 1
+                    logger.info(f"參數已從 {original_dtype} 自動轉換為 bfloat16")
+
+                # 如果梯度已存在，也轉換梯度
+                if param.grad is not None and param.grad.dtype != torch.bfloat16:
+                    param.grad.data = param.grad.data.to(dtype=torch.bfloat16)
+
+        if converted_count > 0:
+            logger.warning(f"已自動轉換 {converted_count}/{total_count} 個參數為 bfloat16 格式")
+        else:
+            logger.info(f"所有 {total_count} 個參數均已是 bfloat16 格式")
