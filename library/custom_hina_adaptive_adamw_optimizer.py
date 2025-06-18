@@ -430,12 +430,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     paired_scale = interaction_scale * compatibility_scale
                     base_scale *= paired_scale
 
-                    # logger.debug(f"參數 {param.shape} 配對調整: "
-                    #            f"交互={interaction_scale:.3f}, "
-                    #            f"相容性={compatibility_scale:.3f}")
+                    logger.debug(f"參數 {param.shape} 配對調整: "
+                               f"交互={interaction_scale:.3f}, "
+                               f"相容性={compatibility_scale:.3f}")
 
             except Exception as e:
-                # logger.warning(f"計算配對效應時發生錯誤: {e}")
+                logger.warning(f"計算配對效應時發生錯誤: {e}")
 
         # 3. 應用重要性加權
         final_scale = base_scale * importance_factor
