@@ -444,6 +444,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         return final_scale
 
+    @torch.compile
     def _compute_interaction_matrix(self, param1, param2, interaction_type):
         """根據交互類型計算交互矩陣"""
         try:
@@ -484,6 +485,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
             self.importance_scores[param_id] = new_importance
 
+    @torch.compile
     def _apply_spd_regularization(self, param, group, state):
         """應用 Selective Projection Decay 正則化"""
         if param not in self.initial_params:
@@ -510,6 +512,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
         spd_penalty = self.spd_lambda * bias_ratio * param_diff
         return spd_penalty
 
+    @torch.compile
     def _apply_orthogonal_gradient(self, grad, param, temp_buffer=None):
         """
         應用正交梯度投影 - 記憶體優化版本
@@ -585,6 +588,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
             logger.warning(f"正交梯度投影失敗: {e}")
             return grad
 
+    @torch.compile
     def _apply_agr_regularization(self, grad):
         """應用 Adaptive Gradient Regularization"""
         grad_norm = torch.norm(grad)
@@ -596,6 +600,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         return grad
 
+    @torch.compile
     def _apply_cautious_update(self, update, grad):
         """應用謹慎更新策略"""
         # 計算更新與梯度的對齊程度
@@ -613,6 +618,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         return update
 
+    @torch.compile
     def _apply_tam_damping(self, momentum, grad, state):
         """應用 Torque-Aware Momentum 阻尼"""
         if 'momentum_alignment' not in state:

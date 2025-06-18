@@ -13,6 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # 引入隨機舍入功能
+@torch.compile
 def copy_stochastic_(target: torch.Tensor, source: torch.Tensor):
     """
     使用隨機舍入將源張量複製到目標張量
@@ -46,7 +47,7 @@ def copy_stochastic_(target: torch.Tensor, source: torch.Tensor):
 
     del result
 
-
+@torch.compile
 def add_stochastic_(_input: torch.Tensor, other: torch.Tensor, alpha: float = 1.0):
     """
     使用隨機舍入將 other 添加到 input
@@ -71,7 +72,7 @@ def add_stochastic_(_input: torch.Tensor, other: torch.Tensor, alpha: float = 1.
 
     copy_stochastic_(_input, result)
 
-
+@torch.compile
 def addcdiv_stochastic_(
     _input: torch.Tensor, tensor1: torch.Tensor, tensor2: torch.Tensor, value: float = 1.0
 ):
@@ -581,6 +582,7 @@ class AdaptiveHinaAdamWBF16(Optimizer):
         except Exception as e:
             return grad
 
+    @torch.compile
     def _apply_agr_regularization(self, grad):
         """應用自適應梯度正則化"""
         grad_norm = torch.norm(grad)
@@ -591,6 +593,7 @@ class AdaptiveHinaAdamWBF16(Optimizer):
 
         return grad
 
+    @torch.compile
     def _apply_cautious_update(self, update, grad):
         """應用謹慎更新策略"""
         update_flat = update.view(-1)
