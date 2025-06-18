@@ -95,10 +95,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
             block_wise=block_wise, is_paged=is_paged, **kwargs
         )
 
-        # TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled.
-        # Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
-        torch.set_float32_matmul_precision('high')
-
         # 原有功能開關
         self.use_spd = use_spd
         self.spd_lambda = spd_lambda
@@ -127,17 +123,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
         self.parameter_relationships = {}  # 參數關係映射
         self.importance_scores = {}        # 參數重要性分數
         self.last_relationship_update = 0  # 上次關係更新的步數
-
-        # 編譯優化控制
-        self._compiled_functions = {}      # 編譯過的函數緩存
-        self._device_context = None       # 當前設備上下文
-        self._enable_smart_compile = True  # 智能編譯開關
-
-        # 智能設備檢查配置
-        self._enable_device_checks = True     # 設備檢查開關
-        self._auto_fix_device_mismatch = True # 自動修復設備不匹配
-        self._device_check_log_level = 'info' # 日誌級別：'debug', 'info', 'warning'
-        self._device_mismatch_count = 0       # 設備不匹配計數器
 
         # 初始化參數組的元數據
         self._initialize_adaptive_metadata()
@@ -325,11 +310,11 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         'partner_id': param2_id,
                         'compatibility': compatibility,
                         'joint_importance': joint_importance,
-                        'interaction_type': self._determine_interaction_type(param1, param2)
+                        'interaction_type': AdaptiveHinaAdamW._determine_interaction_type(param1, param2)
                     }
 
-                    logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
-                               f"相容性: {compatibility:.3f}")
+                    # logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
+                    #            f"相容性: {compatibility:.3f}")
 
         return new_relationships
 
@@ -385,10 +370,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
             return total_compatibility
 
         except Exception as e:
-            logger.warning(f"計算參數相容性時發生錯誤: {e}")
+            # logger.warning(f"計算參數相容性時發生錯誤: {e}")
             return 0.0
 
-    def _determine_interaction_type(self, param1, param2):
+    @staticmethod
+    @torch.jit.script
+    def _determine_interaction_type(param1: torch.Tensor, param2: torch.Tensor) -> str:
         """確定兩個參數的最佳交互類型"""
         shape1, shape2 = param1.shape, param2.shape
 
@@ -428,7 +415,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
             try:
                 # 根據交互類型計算交互矩陣
-                interaction_matrix = self._compute_interaction_matrix(
+                interaction_matrix = AdaptiveHinaAdamW._compute_interaction_matrix(
                     param, partner, interaction_type
                 )
 
@@ -443,12 +430,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     paired_scale = interaction_scale * compatibility_scale
                     base_scale *= paired_scale
 
-                    logger.debug(f"參數 {param.shape} 配對調整: "
-                               f"交互={interaction_scale:.3f}, "
-                               f"相容性={compatibility_scale:.3f}")
+                    # logger.debug(f"參數 {param.shape} 配對調整: "
+                    #            f"交互={interaction_scale:.3f}, "
+                    #            f"相容性={compatibility_scale:.3f}")
 
             except Exception as e:
-                logger.warning(f"計算配對效應時發生錯誤: {e}")
+                # logger.warning(f"計算配對效應時發生錯誤: {e}")
 
         # 3. 應用重要性加權
         final_scale = base_scale * importance_factor
@@ -458,34 +445,22 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         return final_scale
 
-    def _compute_interaction_matrix(self, param1, param2, interaction_type):
+    @staticmethod
+    @torch.jit.script
+    def _compute_interaction_matrix(param1: torch.Tensor, param2: torch.Tensor, interaction_type: str) -> torch.Tensor:
         """根據交互類型計算交互矩陣"""
-        try:
-            # 使用智能設備檢查
-            param1, param2, was_fixed = self._smart_device_check(
-                param1, param2, f"交互矩陣計算({interaction_type})"
-            )
-
-            if param1 is None or param2 is None:
-                return None
-
-            if interaction_type == 'matmul_12':
-                return torch.matmul(param1, param2)
-            elif interaction_type == 'matmul_21':
-                return torch.matmul(param2, param1)
-            elif interaction_type == 'matmul_12t':
-                return torch.matmul(param1, param2.T)
-            elif interaction_type == 'matmul_1t2':
-                return torch.matmul(param1.T, param2)
-            else:  # norm_based
-                # 使用參數範數的組合作為交互強度
-                norm1 = torch.norm(param1)
-                norm2 = torch.norm(param2)
-                return torch.tensor(norm1 * norm2, device=param1.device, dtype=param1.dtype)
-
-        except Exception as e:
-            logger.warning(f"交互矩陣計算失敗 ({interaction_type}): {e}")
-            return None
+        if interaction_type == 'matmul_12':
+            return torch.matmul(param1, param2)
+        elif interaction_type == 'matmul_21':
+            return torch.matmul(param2, param1)
+        elif interaction_type == 'matmul_12t':
+            return torch.matmul(param1, param2.T)
+        elif interaction_type == 'matmul_1t2':
+            return torch.matmul(param1.T, param2)
+        else:  # norm_based
+            norm1 = torch.norm(param1)
+            norm2 = torch.norm(param2)
+            return torch.tensor(norm1 * norm2, device=param1.device)
 
     def _update_importance_scores(self, group_metadata):
         """更新所有參數的重要性分數"""
@@ -532,7 +507,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
         spd_penalty = self.spd_lambda * bias_ratio * param_diff
         return spd_penalty
 
-    def _apply_orthogonal_gradient(self, grad, param, temp_buffer=None):
+    @staticmethod
+    @torch.jit.script
+    def _apply_orthogonal_gradient(grad: torch.Tensor, param: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         """
         應用正交梯度投影 - 記憶體優化版本
 
@@ -545,76 +522,45 @@ class AdaptiveHinaAdamW(AdamW8bit):
         Args:
             grad: 梯度張量
             param: 參數張量
-            temp_buffer: 可選的臨時緩衝區，用於減少記憶體分配
+            eps: 數值穩定性常數
 
         Returns:
             正交化後的梯度張量
         """
-        # 使用智能設備檢查
-        grad, param_data, was_fixed = self._smart_device_check(
-            grad, param.data, "正交梯度投影"
-        )
-        if grad is None or param_data is None:
-            return grad
-
         # 提前退出條件：參數範數太小時跳過正交化
         param_norm = torch.norm(param.data, p=2)
         if param_norm <= 1e-30:
-            logger.debug("參數範數太小，跳過正交梯度投影")
             return grad
 
-        try:
-            with torch.no_grad():
-                original_shape = grad.shape
-
-                # 展平張量進行向量運算（減少形狀轉換開銷）
-                param_flat = param_data.view(-1)
-                grad_flat = grad.view(-1)
-
-                # 檢查維度一致性
-                if param_flat.shape != grad_flat.shape:
-                    logger.warning(f"參數和梯度形狀不匹配: {param_flat.shape} vs {grad_flat.shape}")
-                    return grad
-
-                # 保存原始梯度範數（用於後續標準化）
-                grad_norm = torch.norm(grad_flat, p=2)
-                if grad_norm <= 1e-30:
-                    logger.debug("梯度範數太小，跳過正交投影")
-                    return grad
-
-                # 計算投影係數: proj_coeff = (g·p) / ||p||²
-                # 使用 add(1e-30) 避免除零
-                dot_product = torch.dot(param_flat, grad_flat)
-                param_norm_sq = torch.dot(param_flat, param_flat).add(1e-30)
-                proj_coeff = dot_product / param_norm_sq
-
-                # 計算正交化梯度: g_orth = g - proj_coeff * p
-                # 優先使用提供的緩衝區避免記憶體分配
-                if temp_buffer is not None and temp_buffer.shape == grad_flat.shape:
-                    # 使用緩衝區和原地操作
-                    orthogonal_grad_flat = temp_buffer
-                    orthogonal_grad_flat.copy_(grad_flat)
-                    orthogonal_grad_flat.sub_(param_flat, alpha=proj_coeff)
-                else:
-                    # 回退到標準操作
-                    orthogonal_grad_flat = grad_flat - proj_coeff * param_flat
-
-                # 計算正交化後的範數
-                orth_norm = torch.norm(orthogonal_grad_flat, p=2).add(1e-30)
-
-                # 標準化以保持原始梯度範數（重要的數值穩定性考慮）
-                # 這確保正交化不會改變梯度的大小，只改變方向
-                scale_factor = grad_norm / orth_norm
-                orthogonal_grad_flat.mul_(scale_factor)
-
-                # 恢復原始形狀
-                return orthogonal_grad_flat.view(original_shape)
-
-        except Exception as e:
-            logger.warning(f"正交梯度投影失敗: {e}")
+        param_norm = torch.norm(param.data, p=2)
+        if param_norm <= eps:
             return grad
 
-    def _apply_agr_regularization(self, grad):
+        param_flat = param.data.view(-1)
+        grad_flat = grad.view(-1)
+
+        if param_flat.shape != grad_flat.shape:
+            return grad
+
+        grad_norm = torch.norm(grad_flat, p=2)
+        if grad_norm <= eps:
+            return grad
+
+        dot_product = torch.dot(param_flat, grad_flat)
+        param_norm_sq = torch.dot(param_flat, param_flat) + eps
+        proj_coeff = dot_product / param_norm_sq
+
+        orthogonal_grad_flat = grad_flat - proj_coeff * param_flat
+        orth_norm = torch.norm(orthogonal_grad_flat, p=2) + eps
+
+        scale_factor = grad_norm / orth_norm
+        orthogonal_grad_flat = orthogonal_grad_flat * scale_factor
+
+        return orthogonal_grad_flat.view_as(grad)
+
+    @staticmethod
+    @torch.jit.script
+    def _apply_agr_regularization(grad: torch.Tensor) -> torch.Tensor:
         """應用 Adaptive Gradient Regularization"""
         grad_norm = torch.norm(grad)
 
@@ -625,15 +571,10 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         return grad
 
-    def _apply_cautious_update(self, update, grad):
+    @staticmethod
+    @torch.jit.script
+    def _apply_cautious_update(update: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
         """應用謹慎更新策略"""
-        # 使用智能設備檢查
-        update, grad, was_fixed = self._smart_device_check(
-            update, grad, "謹慎更新"
-        )
-        if update is None or grad is None:
-            return update
-
         # 計算更新與梯度的對齊程度
         update_flat = update.view(-1)
         grad_flat = grad.view(-1)
@@ -654,13 +595,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
         if 'momentum_alignment' not in state:
             state['momentum_alignment'] = 0.0
 
-        # 使用智能設備檢查
-        momentum, grad, was_fixed = self._smart_device_check(
-            momentum, grad, "TAM阻尼"
-        )
-        if momentum is None or grad is None:
-            return 1.0
-
         # 計算梯度與動量的對齊程度
         try:
             if torch.norm(momentum) > 0 and torch.norm(grad) > 0:
@@ -676,7 +610,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
             else:
                 alignment = 0.0
         except Exception as e:
-            logger.warning(f"TAM: 計算對齊度時發生錯誤: {e}")
+            # logger.warning(f"TAM: 計算對齊度時發生錯誤: {e}")
             alignment = 0.0
 
         # 平滑對齊估計
@@ -691,11 +625,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
     def update_device(self, device):
         """當模型被移動到新裝置時，更新優化器內部狀態"""
-        logger.info(f"更新優化器設備至: {device}")
-
-        # 清理編譯緩存，因為設備變更會導致重新編譯
-        self.clear_compilation_cache()
-
         if hasattr(self, 'initial_params'):
             for param, initial_param in self.initial_params.items():
                 if initial_param.device != device:
@@ -706,11 +635,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
             for key, value in state.items():
                 if isinstance(value, torch.Tensor) and value.device != device:
                     state[key] = value.to(device)
-
-        # 清理緩衝區池，因為設備變更後無法重用
-        self.clear_buffer_pool()
-
-        logger.info(f"優化器設備更新完成: {device}")
 
     def step(self, closure=None):
         """執行優化步驟 - 自適應版本的核心邏輯"""
@@ -730,7 +654,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
             if (self.global_step - self.last_relationship_update >=
                 self.relationship_discovery_interval):
 
-                logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
+                # logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
 
                 # 更新重要性分數
                 self._update_importance_scores(group_metadata)
@@ -765,7 +689,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 else:
                     # 檢查狀態張量形狀是否相符
                     if state['exp_avg'].shape != param.data.shape:
-                        logger.warning(f"狀態張量形狀不相符，重新初始化參數 {param.data.shape}")
+                        # logger.warning(f"狀態張量形狀不相符，重新初始化參數 {param.data.shape}")
                         state['exp_avg'] = torch.zeros_like(param.data)
                         state['exp_avg_sq'] = torch.zeros_like(param.data)
                         if self.use_adopt_stability:
@@ -778,13 +702,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
                 # AGR 正則化
                 if self.use_agr:
-                    agr_func = self._get_or_compile_function(
-                        '_apply_agr_regularization',
-                        self._apply_agr_regularization,
-                        grad.device,
-                        grad.dtype
-                    )
-                    grad = agr_func(grad)
+                    grad = AdaptiveHinaAdamW._apply_agr_regularization(grad)
 
                 # 正交梯度投影 - 記憶體優化版本
                 if self.use_orthogonal_grad:
@@ -796,7 +714,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                             grad_flat_shape, grad.dtype, grad.device
                         )
 
-                    grad = self._apply_orthogonal_gradient(grad, param, temp_buffers[buffer_key])
+                    grad = AdaptiveHinaAdamW._apply_orthogonal_gradient(grad, param)
 
                 # 偏差校正的學習率
                 bias_correction1 = 1 - beta1 ** state['step']
@@ -826,13 +744,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
                 # 謹慎更新
                 if self.use_cautious:
-                    cautious_func = self._get_or_compile_function(
-                        '_apply_cautious_update',
-                        self._apply_cautious_update,
-                        update.device,
-                        update.dtype
-                    )
-                    update = cautious_func(update, grad)
+                    update = AdaptiveHinaAdamW._apply_cautious_update(update, grad)
 
                 # 核心功能：動態自適應學習率調整
                 current_step_size = step_size
@@ -840,8 +752,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     lr_scale = self._compute_adaptive_lr_scale(param, group_metadata, state)
                     current_step_size *= lr_scale
 
-                    if lr_scale != 1.0:
-                        logger.debug(f"參數 {param.shape} 學習率調整: {lr_scale:.4f}")
+                    # if lr_scale != 1.0:
+                    #     logger.debug(f"參數 {param.shape} 學習率調整: {lr_scale:.4f}")
 
                 # 應用更新
                 param.data.add_(update, alpha=-current_step_size)
@@ -916,9 +828,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 'max_buffers_per_shape': self._max_buffers_per_shape
             }
 
-        # 添加智能設備檢查統計信息
-        info['smart_device_checks'] = self.get_device_stats()
-
         return info
 
     def get_relationship_summary(self) -> Dict[str, Any]:
@@ -989,24 +898,6 @@ class AdaptiveHinaAdamW(AdamW8bit):
             self._buffer_pool.clear()
             logger.info("已清理緩衝區池")
 
-    def clear_compilation_cache(self):
-        """清理編譯緩存，用於設備切換時或記憶體回收"""
-        if hasattr(self, '_compiled_functions'):
-            self._compiled_functions.clear()
-            self._device_context = None
-            logger.info("已清理編譯緩存")
-
-    def disable_smart_compile(self):
-        """禁用智能編譯，回到純解釋執行模式"""
-        self._enable_smart_compile = False
-        self.clear_compilation_cache()
-        logger.info("已禁用智能編譯系統")
-
-    def enable_smart_compile(self):
-        """啟用智能編譯系統"""
-        self._enable_smart_compile = True
-        logger.info("已啟用智能編譯系統")
-
     def get_buffer_pool_stats(self) -> Dict[str, Any]:
         """獲取緩衝區池的詳細統計信息"""
         if not hasattr(self, '_buffer_pool'):
@@ -1039,125 +930,3 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 stats['estimated_memory_mb'] += total_size_mb
 
         return stats
-
-    def _get_or_compile_function(self, func_name: str, base_func, device: torch.device, dtype: torch.dtype):
-        """
-        智能編譯系統：只有在設備和類型穩定時才編譯函數
-
-        Args:
-            func_name: 函數名稱
-            base_func: 基礎函數
-            device: 當前設備
-            dtype: 當前數據類型
-
-        Returns:
-            編譯後的函數或原始函數
-        """
-        if not self._enable_smart_compile:
-            return base_func
-
-        # 創建設備和類型的唯一鍵
-        context_key = f"{func_name}_{device.type}_{dtype}"
-
-        # 如果上下文發生變化，清理舊的編譯緩存
-        if self._device_context != device.type:
-            self._compiled_functions.clear()
-            self._device_context = device.type
-            logger.debug(f"設備上下文變更為 {device.type}，清理編譯緩存")
-
-        # 如果已經編譯過相同上下文的函數，直接返回
-        if context_key in self._compiled_functions:
-            return self._compiled_functions[context_key]
-
-        try:
-            # 只編譯穩定的函數（避免動態形狀變化的函數）
-            if func_name in ['_apply_agr_regularization', '_apply_cautious_update']:
-                compiled_func = torch.compile(base_func, mode='default')
-                self._compiled_functions[context_key] = compiled_func
-                logger.debug(f"成功編譯函數 {func_name} 於 {context_key}")
-                return compiled_func
-            else:
-                # 對於容易引起設備不匹配的函數，不進行編譯
-                logger.debug(f"跳過編譯函數 {func_name}（易造成設備不匹配）")
-                return base_func
-
-        except Exception as e:
-            logger.warning(f"編譯函數 {func_name} 失敗: {e}")
-            return base_func
-
-    def _smart_device_check(self, tensor1: torch.Tensor, tensor2: torch.Tensor,
-                           operation_name: str = "operation") -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        """
-        智能設備檢查，支持自動修復和靈活日誌級別
-
-        Args:
-            tensor1: 第一個張量
-            tensor2: 第二個張量
-            operation_name: 操作名稱（用於日誌）
-
-        Returns:
-            (修復後的tensor1, 修復後的tensor2, 是否發生了修復)
-        """
-        if not self._enable_device_checks:
-            return tensor1, tensor2, False
-
-        if tensor1.device == tensor2.device:
-            return tensor1, tensor2, False
-
-        # 發現設備不匹配
-        self._device_mismatch_count += 1
-
-        # 根據配置的日誌級別輸出信息
-        message = f"{operation_name}: 設備不匹配 {tensor1.device} vs {tensor2.device}"
-        if self._device_check_log_level == 'warning':
-            logger.warning(message)
-        elif self._device_check_log_level == 'info':
-            logger.info(message)
-        else:  # debug
-            logger.debug(message)
-
-        # 自動修復（如果啟用）
-        if self._auto_fix_device_mismatch:
-            # 選擇目標設備（通常選擇 CUDA 而非 CPU）
-            target_device = tensor1.device
-            if tensor2.device.type == 'cuda' and tensor1.device.type == 'cpu':
-                target_device = tensor2.device
-
-            # 移動張量到同一設備
-            if tensor1.device != target_device:
-                tensor1 = tensor1.to(target_device)
-            if tensor2.device != target_device:
-                tensor2 = tensor2.to(target_device)
-
-            logger.debug(f"自動修復：將張量移動到 {target_device}")
-            return tensor1, tensor2, True
-
-        return tensor1, tensor2, False
-
-    def configure_device_checks(self,
-                               enable: bool = True,
-                               auto_fix: bool = True,
-                               log_level: str = 'debug'):
-        """
-        配置設備檢查行為
-
-        Args:
-            enable: 是否啟用設備檢查
-            auto_fix: 是否自動修復設備不匹配
-            log_level: 日誌級別 ('debug', 'info', 'warning')
-        """
-        self._enable_device_checks = enable
-        self._auto_fix_device_mismatch = auto_fix
-        self._device_check_log_level = log_level
-
-        logger.info(f"設備檢查配置更新: 啟用={enable}, 自動修復={auto_fix}, 日誌級別={log_level}")
-
-    def get_device_stats(self) -> Dict[str, Any]:
-        """獲取設備相關統計信息"""
-        return {
-            'device_mismatch_count': self._device_mismatch_count,
-            'current_device_context': self._device_context,
-            'device_checks_enabled': self._enable_device_checks,
-            'auto_fix_enabled': self._auto_fix_device_mismatch,
-            'log_level': self._device_check_log_level
-        }
