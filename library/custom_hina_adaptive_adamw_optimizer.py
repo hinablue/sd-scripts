@@ -669,6 +669,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 if isinstance(value, torch.Tensor) and value.device != device:
                     state[key] = value.to(device)
 
+    @torch.no_grad()
     def step(self, closure=None):
         """執行優化步驟 - 自適應版本的核心邏輯"""
         loss = None

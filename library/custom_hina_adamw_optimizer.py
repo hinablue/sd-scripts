@@ -647,6 +647,7 @@ class HinaAdamWOptimizer(AdamW8bit):
         damping_factor = (1 + state['momentum_alignment']) / 2
         return damping_factor
 
+    @torch.no_grad()
     def step(self, closure=None):
         """執行優化步驟"""
         loss = None
