@@ -509,7 +509,29 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
     @staticmethod
     @torch.jit.script
-    def _apply_orthogonal_gradient(grad: torch.Tensor, param: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    def _orthogonal_gradient_core(grad_flat: torch.Tensor, param_flat: torch.Tensor, eps: float) -> torch.Tensor:
+        """正交梯度投影的核心計算 - JIT 優化版本"""
+        grad_norm = torch.norm(grad_flat, p=2)
+        if grad_norm <= eps:
+            return grad_flat
+
+        # 計算投影係數: proj_coeff = (g·p) / ||p||²
+        dot_product = torch.dot(param_flat, grad_flat)
+        param_norm_sq = torch.dot(param_flat, param_flat) + eps
+        proj_coeff = dot_product / param_norm_sq
+
+        # 計算正交化梯度: g_orth = g - proj_coeff * p
+        orthogonal_grad_flat = grad_flat - proj_coeff * param_flat
+
+        # 計算正交化後的範數
+        orth_norm = torch.norm(orthogonal_grad_flat, p=2) + eps
+
+        # 標準化以保持原始梯度範數
+        scale_factor = grad_norm / orth_norm
+        return orthogonal_grad_flat * scale_factor
+
+    @staticmethod
+    def _apply_orthogonal_gradient(grad: torch.Tensor, param: torch.Tensor, eps: float = 1e-30, temp_buffer: torch.Tensor = None) -> torch.Tensor:
         """
         應用正交梯度投影 - 記憶體優化版本
 
@@ -523,15 +545,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
             grad: 梯度張量
             param: 參數張量
             eps: 數值穩定性常數
+            temp_buffer: 可選的臨時緩衝區，用於減少記憶體分配
 
         Returns:
             正交化後的梯度張量
         """
         # 提前退出條件：參數範數太小時跳過正交化
-        param_norm = torch.norm(param.data, p=2)
-        if param_norm <= 1e-30:
-            return grad
-
         param_norm = torch.norm(param.data, p=2)
         if param_norm <= eps:
             return grad
@@ -546,16 +565,30 @@ class AdaptiveHinaAdamW(AdamW8bit):
         if grad_norm <= eps:
             return grad
 
-        dot_product = torch.dot(param_flat, grad_flat)
-        param_norm_sq = torch.dot(param_flat, param_flat) + eps
-        proj_coeff = dot_product / param_norm_sq
+        # 優先使用提供的緩衝區進行記憶體優化計算
+        if temp_buffer is not None and temp_buffer.shape == grad_flat.shape:
+            # 使用緩衝區進行手動最佳化
+            # 計算投影係數: proj_coeff = (g·p) / ||p||²
+            dot_product = torch.dot(param_flat, grad_flat)
+            param_norm_sq = torch.dot(param_flat, param_flat) + eps
+            proj_coeff = dot_product / param_norm_sq
 
-        orthogonal_grad_flat = grad_flat - proj_coeff * param_flat
-        orth_norm = torch.norm(orthogonal_grad_flat, p=2) + eps
+            # 使用緩衝區和原地操作
+            orthogonal_grad_flat = temp_buffer
+            orthogonal_grad_flat.copy_(grad_flat)
+            orthogonal_grad_flat.sub_(param_flat, alpha=proj_coeff)
 
-        scale_factor = grad_norm / orth_norm
-        orthogonal_grad_flat = orthogonal_grad_flat * scale_factor
+            # 計算正交化後的範數並標準化
+            orth_norm = torch.norm(orthogonal_grad_flat, p=2) + eps
+            scale_factor = grad_norm / orth_norm
+            orthogonal_grad_flat.mul_(scale_factor)
+        else:
+            # 回退到 JIT 優化的標準操作
+            orthogonal_grad_flat = AdaptiveHinaAdamW._orthogonal_gradient_core(
+                grad_flat, param_flat, eps
+            )
 
+        # 恢復原始形狀
         return orthogonal_grad_flat.view_as(grad)
 
     @staticmethod
@@ -714,7 +747,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                             grad_flat_shape, grad.dtype, grad.device
                         )
 
-                    grad = AdaptiveHinaAdamW._apply_orthogonal_gradient(grad, param)
+                    grad = AdaptiveHinaAdamW._apply_orthogonal_gradient(grad, param, 1e-30, temp_buffers[buffer_key])
 
                 # 偏差校正的學習率
                 bias_correction1 = 1 - beta1 ** state['step']
