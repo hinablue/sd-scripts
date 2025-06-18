@@ -86,7 +86,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         max_lr: float = 1e-2,
         lr_bump: float = 1e-5,
         eta: float = 2,
-        beta1: float = 0.95,
+        beta1: float = 0.9,
         d_coef: float = 2,
         weight_decay: float = 5e-4,
         warmup_steps: int = 500,
@@ -141,7 +141,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 pre_init = p.clone()
                 state.setdefault("pre", pre_init)
 
-    def sinkgd_preprocess(self, grad, num_iter=3):
+    def sinkgd_preprocess(self, grad, num_iter=5):
         m, n = grad.shape
         sqrt_n = n ** 0.5
         sqrt_m = m ** 0.5
@@ -187,22 +187,43 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 grad = p.grad.data
                 beta1 = group['beta1']
                 exp_avg = state['exp_avg']
+
                 if state['step'] == 1:
+                    # === ADOPT ===
+                    #ADOPT: Modified Adam Can Converge with Any β_2 with the Optimal Rate
+                    #https://arxiv.org/abs/2411.02853
+                    #https://github.com/iShohei220/adopt
                     exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    state['last_polarity'] = grad > 0
                     continue
 
-                update = exp_avg.abs() * grad.sign()
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-
                 if grad.ndim == 2:
-                    # === 正交梯度 ===
+                    # === Grams ===
+                    #Grams: Gradient Descent with Adaptive Momentum Scaling
+                    #https://arxiv.org/abs/2412.17107
+                    #https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
+                    update = exp_avg.abs() * (grad + exp_avg).sign()
+
+                    # === Orthograd ===
                     #Grokking at the Edge of Numerical Stability
 
                     #https://arxiv.org/abs/2501.04697
                     #https://github.com/LoganBooker/prodigy-plus-schedule-free/tree/dev
                     if group["orthograd"] and state["step"] > group["warmup_steps"] / 2:
-                        grad = orthograd_(p.data, update)
+                        update = orthograd_(p.data, update)
+
+                    # === SinkGD ===
+                    #Gradient Multi-Normalization for Stateless and Scalable LLM Training
+                    #https://arxiv.org/abs/2502.06742
                     update = self.sinkgd_preprocess(update)
+                else:
+                    # === Grams ===
+                    #Grams: Gradient Descent with Adaptive Momentum Scaling
+                    #https://arxiv.org/abs/2412.17107
+                    #https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
+                    update = exp_avg.abs() * grad.sign()
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
                 condition = 0.0
                 if group['d_coef'] != 1 and (state["step"] < group["warmup_steps"] / 2):
@@ -220,10 +241,15 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     if group["lr"] < state["lr_max"]:
                         lr_decay = max((group["lr"] / state["lr_max"]), 0.1)
 
+                # ==== Automagic lrmask ====
+                # https://github.com/ostris/ai-toolkit/blob/main/toolkit/optimizers/automagic.py
                 if state["step"] < group["warmup_steps"]:
                     lr_bump = self.lr_bump
                     min_lr = max(self.min_lr, state['avg_lr_max'] / 10)
                     max_lr = self.max_lr
+                    #Prodigy: An Expeditiously Adaptive Parameter-Free Learner
+                    #https://arxiv.org/pdf/2306.06101
+                    #https://github.com/konstmish/prodigy
                     if state["step"] < group["warmup_steps"] / 2:
                         lr_bump_pos = self.lr_bump * group['d_coef'] if condition > 0.0 else self.lr_bump
                         lr_bump_neg = self.lr_bump * group['d_coef'] if condition < 0.0 else self.lr_bump
@@ -259,13 +285,22 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                         state['new_avg_lr'] = state['new_avg_lr'] - decay_rate
                         new_lr = state['new_avg_lr']
 
+                    #Neural Thermodynamic Laws for Large Language Model Training
+                    #https://arxiv.org/abs/2505.10559
                     new_lr = torch.clamp(new_lr, min=state['avg_lr_max'] / 10, max=state['avg_lr_max'] * lr_decay)
 
-                allora =  state["row_scaling"] if "row_scaling" in state else 1
-                new_lr = new_lr * allora
+                # ==== VRAdam ====
+                #A Physics-Inspired Optimizer: Velocity Regularized Adam
+                #https://arxiv.org/abs/2505.13196
+                vr = 1 / (1+ min(3 * (exp_avg ** 2).sum(),10))
 
-                # Weight decay applied to y
+                allora =  state["row_scaling"] if "row_scaling" in state else 1
+                new_lr = new_lr * allora * vr
+
+                #Mirror, Mirror of the Flow: How Does Regularization Shape Implicit Bias?
+                #https://arxiv.org/abs/2504.12883
                 if group['weight_decay'] != 0 and state["step"] < group["warmup_steps"] / 2:
+                    # ==== Adadecay ====
                     #Adaptive Weight Decay for Deep Neural Networks
                     #https://arxiv.org/abs/1907.08931
                     param_abs_grad = torch.abs(p.grad).mean()
