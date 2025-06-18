@@ -136,7 +136,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
         # 智能設備檢查配置
         self._enable_device_checks = True     # 設備檢查開關
         self._auto_fix_device_mismatch = True # 自動修復設備不匹配
-        self._device_check_log_level = 'debug' # 日誌級別：'debug', 'info', 'warning'
+        self._device_check_log_level = 'info' # 日誌級別：'debug', 'info', 'warning'
         self._device_mismatch_count = 0       # 設備不匹配計數器
 
         # 初始化參數組的元數據
