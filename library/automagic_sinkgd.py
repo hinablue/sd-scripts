@@ -21,8 +21,8 @@ from torch.nn.functional import normalize
     效果：將重複的條件判斷減少 70%，提升執行效率
 4. 動態調整 normalize_iteration 次數 (中等優先級)
     智能迭代次數：
-        LoRA 場景：sinkgd_iters = 1 (原本 5 次)
-        完整微調：sinkgd_iters = 3 (原本 5 次)
+        LoRA 場景：sinkgd_iters = 3 (原本 5 次)
+        完整微調：sinkgd_iters = 5
 效果：LoRA 訓練時減少 80% 的正規化計算
 """
 
@@ -50,7 +50,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         self.lr_bump = lr_bump
         self.full_finetune = full_finetune
         # 預計算動態迭代次數 (優化建議 4)
-        self.sinkgd_iters = 1 if not full_finetune else 3
+        self.sinkgd_iters = 3 if not full_finetune else 5
         defaults = dict(
             lr=lr,
             avg_lr_max=lr,
