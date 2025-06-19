@@ -52,6 +52,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
         relationship_discovery_interval: int = 100,  # 每 N 步重新發現參數關係
         importance_decay: float = 0.95,  # 重要性分數的衰減係數
         compatibility_threshold: float = 0.3,  # 參數相容性閾值
+        # lr_mask 機制配置（策略 B：組合式整合）
+        use_lr_mask: bool = True,
+        lr_bump: float = 3e-6,  # lr_mask 調整幅度
+        min_lr: float = 1e-7,   # lr_mask 最小學習率
+        max_lr: float = 1e-3,   # lr_mask 最大學習率
+        warmup_steps: int = 500, # lr_mask warmup 步數
         # Dynamic weight decay configuration
         dynamic_weight_decay: bool = True,
         wd_transition_steps: int = 1000,
@@ -60,11 +66,16 @@ class AdaptiveHinaAdamW(AdamW8bit):
         **kwargs
     ):
         """
-        初始化自適應 HinaAdamW 優化器
+        初始化自適應 HinaAdamW 優化器 - 策略 B：組合式整合
+
+        整合策略：
+        1. lr_mask 作為基礎層：基於梯度極性進行即時學習率調整
+        2. 自適應機制作為高級層：基於參數重要性和關係進行長期調整
+        3. 最終學習率 = base_lr * lr_mask_scale * adaptive_scale
 
         Args:
             params: 模型參數
-            lr: 學習率
+            lr: 基礎學習率
             betas: Adam 的 beta 參數
             eps: 數值穩定性常數
             weight_decay: 權重衰減係數
@@ -82,6 +93,11 @@ class AdaptiveHinaAdamW(AdamW8bit):
             relationship_discovery_interval: 參數關係重新發現的間隔步數
             importance_decay: 重要性分數的時間衰減係數
             compatibility_threshold: 判斷參數相容性的閾值
+            use_lr_mask: 是否啟用 lr_mask 機制（策略 B 的基礎層）
+            lr_bump: lr_mask 的學習率調整幅度
+            min_lr: lr_mask 允許的最小學習率
+            max_lr: lr_mask 允許的最大學習率
+            warmup_steps: lr_mask 的 warmup 階段步數
             dynamic_weight_decay: 啟用動態權重衰減
             wd_transition_steps: 權重衰減過渡的步數閾值
             wd_decay_factor: 權重衰減減少係數
@@ -113,6 +129,13 @@ class AdaptiveHinaAdamW(AdamW8bit):
         self.importance_decay = importance_decay
         self.compatibility_threshold = compatibility_threshold
 
+        # lr_mask 機制配置（策略 B 基礎層）
+        self.use_lr_mask = use_lr_mask
+        self.lr_bump = lr_bump
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.warmup_steps = warmup_steps
+
         # 動態權重衰減配置
         self.dynamic_weight_decay = dynamic_weight_decay
         self.wd_transition_steps = wd_transition_steps
@@ -135,7 +158,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
         if self.use_spd:
             self._store_initial_parameters()
 
-        logger.info(f"AdaptiveHinaAdamWOptimizer 初始化完成，動態自適應: {use_dynamic_adaptation}")
+        logger.info(f"AdaptiveHinaAdamWOptimizer 初始化完成，動態自適應: {use_dynamic_adaptation}，lr_mask: {use_lr_mask}")
 
     def _get_buffer(self, shape, dtype, device):
         """
@@ -199,6 +222,23 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     'change_rate': 0.0,
                     'stability': 1.0
                 }
+
+                # === 策略 B：lr_mask 狀態初始化 ===
+                if self.use_lr_mask:
+                    # 確保參數在正確設備上
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+
+                    # 為每個參數初始化 lr_mask 相關狀態
+                    lr_mask_metadata = {
+                        'lr_mask': None,  # 將在第一次使用時初始化
+                        'last_polarity': None,  # 上次梯度極性
+                        'lr_max': self.defaults['lr'],  # 記錄最大學習率
+                        'avg_lr': self.defaults['lr'],   # 平均學習率
+                        'warmup_complete': False,  # warmup 是否完成
+                    }
+                    group_metadata['adaptation_history'][param_id].update(lr_mask_metadata)
+
+                    logger.debug(f"為參數 {param.shape} 初始化 lr_mask 狀態")
 
     def _store_initial_parameters(self):
         """存儲初始參數以供 SPD 使用"""
@@ -398,58 +438,91 @@ class AdaptiveHinaAdamW(AdamW8bit):
         else:
             return 'norm_based' # 基於範數的交互
 
-    def _compute_adaptive_lr_scale(self, param, group_metadata, state):
+    def _compute_adaptive_lr_scale(self, param, group_metadata, state, grad=None, global_step=None):
         """
-        基於動態關係和重要性的學習率調整
+        基於動態關係和重要性的學習率調整（策略 B：組合式整合）
 
-        這是自適應版本的核心創新：完全不依賴預定義的參數類型，
-        而是基於動態發現的關係和重要性進行學習率調整。
+        策略 B 實施：
+        1. 基礎層：lr_mask 基於梯度極性的即時調整
+        2. 高級層：基於參數重要性和關係的長期調整
+        3. 最終縮放 = lr_mask_scale * adaptive_scale
+
+        Args:
+            param: 參數張量
+            group_metadata: 參數組元數據
+            state: 優化器狀態
+            grad: 梯度張量（用於 lr_mask）
+            global_step: 全局步數（用於 lr_mask）
+
+        Returns:
+            float: 組合後的學習率縮放因子
         """
-        if not self.use_dynamic_adaptation:
-            return 1.0
 
-        param_id = id(param)
-        base_scale = 1.0
+        # === 第一層：lr_mask 基礎調整 ===
+        lr_mask_scale = 1.0
+        if self.use_lr_mask and grad is not None and global_step is not None:
+            lr_mask_scale = self._update_lr_mask(param, group_metadata, state, grad, global_step)
 
-        # 1. 基於重要性的調整
-        importance = self.importance_scores.get(param_id, 1.0)
-        importance_factor = min(3.0, max(0.1, importance * self.adaptation_strength))
+            # 如果 lr_mask_scale 是張量，取平均值作為標量
+            if isinstance(lr_mask_scale, torch.Tensor):
+                lr_mask_scale = lr_mask_scale.mean().item()
 
-        # 2. 基於參數關係的調整
-        if param_id in self.parameter_relationships:
-            rel_info = self.parameter_relationships[param_id]
-            partner = rel_info['partner']
-            interaction_type = rel_info['interaction_type']
+        # === 第二層：自適應高級調整 ===
+        adaptive_scale = 1.0
+        if self.use_dynamic_adaptation:
+            param_id = id(param)
 
-            try:
-                # 根據交互類型計算交互矩陣
-                interaction_matrix = AdaptiveHinaAdamW._compute_interaction_matrix(
-                    param, partner, interaction_type
-                )
+            # 1. 基於重要性的調整
+            importance = self.importance_scores.get(param_id, 1.0)
+            importance_factor = min(3.0, max(0.1, importance * self.adaptation_strength))
 
-                if interaction_matrix is not None:
-                    interaction_norm = torch.norm(interaction_matrix).item()
-                    compatibility_bonus = rel_info['compatibility']
+            # 2. 基於參數關係的調整
+            relationship_scale = 1.0
+            if param_id in self.parameter_relationships:
+                rel_info = self.parameter_relationships[param_id]
+                partner = rel_info['partner']
+                interaction_type = rel_info['interaction_type']
 
-                    # 動態調整公式（受 ALoRA 論文啟發）
-                    interaction_scale = 1.0 / (1.0 + interaction_norm * 0.1)
-                    compatibility_scale = 1.0 + compatibility_bonus * 0.2
+                try:
+                    # 根據交互類型計算交互矩陣
+                    interaction_matrix = AdaptiveHinaAdamW._compute_interaction_matrix(
+                        param, partner, interaction_type
+                    )
 
-                    paired_scale = interaction_scale * compatibility_scale
-                    base_scale *= paired_scale
+                    if interaction_matrix is not None:
+                        interaction_norm = torch.norm(interaction_matrix).item()
+                        compatibility_bonus = rel_info['compatibility']
 
-                    logger.debug(f"參數 {param.shape} 配對調整: "
-                               f"交互={interaction_scale:.3f}, "
-                               f"相容性={compatibility_scale:.3f}")
+                        # 動態調整公式（受 ALoRA 論文啟發）
+                        interaction_scale = 1.0 / (1.0 + interaction_norm * 0.1)
+                        compatibility_scale = 1.0 + compatibility_bonus * 0.2
 
-            except Exception as e:
-                logger.warning(f"計算配對效應時發生錯誤: {e}")
+                        relationship_scale = interaction_scale * compatibility_scale
 
-        # 3. 應用重要性加權
-        final_scale = base_scale * importance_factor
+                        logger.debug(f"參數 {param.shape} 關係調整: "
+                                   f"交互={interaction_scale:.3f}, "
+                                   f"相容性={compatibility_scale:.3f}")
 
-        # 4. 穩定性約束（避免極端值）
-        final_scale = max(0.01, min(5.0, final_scale))
+                except Exception as e:
+                    logger.warning(f"計算配對效應時發生錯誤: {e}")
+
+            # 3. 組合自適應調整
+            adaptive_scale = importance_factor * relationship_scale
+
+            # 4. 穩定性約束（避免極端值）
+            adaptive_scale = max(0.01, min(5.0, adaptive_scale))
+
+        # === 策略 B：組合最終縮放因子 ===
+        final_scale = lr_mask_scale * adaptive_scale
+
+        # 最終穩定性檢查
+        final_scale = max(0.001, min(10.0, final_scale))
+
+        # 詳細日誌記錄（僅在 debug 模式）
+        logger.debug(f"參數 {param.shape} 學習率縮放組合：")
+        logger.debug(f"  lr_mask_scale: {lr_mask_scale:.4f}")
+        logger.debug(f"  adaptive_scale: {adaptive_scale:.4f}")
+        logger.debug(f"  final_scale: {final_scale:.4f}")
 
         return final_scale
 
@@ -773,9 +846,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 bias_correction2 = 1 - beta2 ** state['step']
 
                 # 更新一階和二階動量估計
-                if self.use_adopt_stability:
-                    if 'exp_avg_sq_prev' in state:
-                        state['exp_avg_sq_prev'] = state['exp_avg_sq'].clone()
+                if self.use_adopt_stability and 'exp_avg_sq_prev' in state:
+                    state['exp_avg_sq_prev'] = state['exp_avg_sq'].clone()
 
                 state['exp_avg'].mul_(beta1).add_(grad, alpha=1 - beta1)
                 state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
@@ -802,12 +874,18 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
                 # 核心功能：動態自適應學習率調整
                 current_step_size = step_size
-                if self.use_dynamic_adaptation:
-                    lr_scale = self._compute_adaptive_lr_scale(param, group_metadata, state)
+                if self.use_dynamic_adaptation or self.use_lr_mask:
+                    # 策略 B：組合式學習率調整
+                    # 傳入梯度和全局步數以支援 lr_mask 機制
+                    lr_scale = self._compute_adaptive_lr_scale(
+                        param, group_metadata, state,
+                        grad=grad,  # 用於 lr_mask 的梯度極性判斷
+                        global_step=self.global_step  # 用於 warmup 判斷
+                    )
                     current_step_size *= lr_scale
 
                     if lr_scale != 1.0:
-                        logger.debug(f"參數 {param.shape} 學習率調整: {lr_scale:.4f}")
+                        logger.debug(f"參數 {param.shape} 組合學習率調整: {lr_scale:.4f}")
 
                 # 應用更新
                 param.data.add_(update, alpha=-current_step_size)
@@ -839,13 +917,17 @@ class AdaptiveHinaAdamW(AdamW8bit):
             for buffer in temp_buffers.values():
                 self._return_buffer(buffer)
 
+            # 清理記憶體
+            del grad, update, denom
+            temp_buffers.clear()
+
         return loss
 
     def get_optimization_info(self) -> Dict[str, Any]:
         """獲取優化器的詳細信息，用於監控和調試"""
         info = {
             'optimizer_type': 'AdaptiveHinaAdamWOptimizer',
-            'version': '自適應版本 - 無參數類型依賴',
+            'version': '策略 B：lr_mask + 自適應組合版本',
             'total_params': sum(len(group['params']) for group in self.param_groups),
             'features': {
                 'spd': self.use_spd,
@@ -856,6 +938,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 'agr': self.use_agr,
                 'tam': self.use_tam,
                 'dynamic_adaptation': self.use_dynamic_adaptation,
+                'lr_mask': self.use_lr_mask,  # 新增 lr_mask 狀態
                 'dynamic_weight_decay': self.dynamic_weight_decay
             },
             'adaptation_config': {
@@ -863,6 +946,13 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 'relationship_discovery_interval': self.relationship_discovery_interval,
                 'importance_decay': self.importance_decay,
                 'compatibility_threshold': self.compatibility_threshold
+            },
+            'lr_mask_config': {  # 新增 lr_mask 配置信息
+                'enabled': self.use_lr_mask,
+                'lr_bump': self.lr_bump,
+                'min_lr': self.min_lr,
+                'max_lr': self.max_lr,
+                'warmup_steps': self.warmup_steps
             }
         }
 
@@ -873,6 +963,11 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 'total_relationships': len(self.parameter_relationships),
                 'avg_importance_score': sum(self.importance_scores.values()) / max(1, len(self.importance_scores))
             }
+
+            # 添加 lr_mask 統計信息
+            if self.use_lr_mask:
+                lr_mask_stats = self._get_lr_mask_statistics()
+                info['training_stats']['lr_mask_stats'] = lr_mask_stats
 
         # 添加記憶體優化統計信息
         if hasattr(self, '_buffer_pool'):
@@ -985,3 +1080,255 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 stats['estimated_memory_mb'] += total_size_mb
 
         return stats
+
+    # === 策略 B：lr_mask 核心方法 ===
+    def _update_lr_mask(self, param, group_metadata, state, grad, global_step):
+        """
+        更新 lr_mask（策略 B 的基礎層）
+
+        Args:
+            param: 參數張量
+            group_metadata: 參數組元數據
+            state: 優化器狀態
+            grad: 梯度張量
+            global_step: 全局步數
+
+        Returns:
+            torch.Tensor: 更新後的 lr_mask 縮放因子
+        """
+        if not self.use_lr_mask:
+            return 1.0
+
+        param_id = id(param)
+        adaptation_info = group_metadata['adaptation_history'].get(param_id, {})
+
+        # 第一次初始化 lr_mask
+        if adaptation_info.get('lr_mask') is None:
+            device = param.device
+            shape = param.shape
+            adaptation_info['lr_mask'] = torch.ones(shape, device=device, dtype=torch.float32) * self.defaults['lr']
+            adaptation_info['last_polarity'] = torch.zeros(shape, dtype=torch.bool, device=device)
+
+            logger.debug(f"首次初始化參數 {param.shape} 的 lr_mask")
+
+        if global_step < self.warmup_steps:
+            return self._update_warmup_lr_mask(adaptation_info, grad, global_step)
+        else:
+            return self._update_post_warmup_lr_mask(adaptation_info, global_step)
+
+    def _update_warmup_lr_mask(self, adaptation_info, grad, global_step):
+        """
+        Warmup 階段的 lr_mask 更新（基於梯度極性）
+
+        Args:
+            adaptation_info: 參數的自適應信息
+            grad: 梯度張量
+            global_step: 全局步數
+
+        Returns:
+            torch.Tensor: lr_mask 縮放因子
+        """
+        # 追蹤梯度極性變化
+        last_polarity = adaptation_info['last_polarity']
+        current_polarity = (grad > 0)
+
+        # 判斷極性一致性
+        sign_agree = torch.where(last_polarity == current_polarity, 1.0, -1.0)
+        adaptation_info['last_polarity'] = current_polarity
+
+        # 獲取當前 lr_mask
+        lr_mask = adaptation_info['lr_mask']
+
+        # 基於極性一致性調整學習率
+        lr_adjustment = torch.where(
+            sign_agree > 0,
+            self.lr_bump,     # 極性一致：增加學習率
+            -self.lr_bump     # 極性變化：減少學習率
+        )
+
+        # 更新 lr_mask
+        new_lr_mask = lr_mask + lr_adjustment
+
+        # 處理學習率上限更新
+        current_base_lr = self.defaults['lr']
+        if current_base_lr > adaptation_info['lr_max']:
+            new_lr_mask = new_lr_mask + (current_base_lr - adaptation_info['lr_max'])
+            adaptation_info['lr_max'] = current_base_lr
+
+        # 限制學習率範圍
+        new_lr_mask = torch.clamp(new_lr_mask, min=self.min_lr, max=self.max_lr)
+
+        # 更新狀態
+        adaptation_info['lr_mask'] = new_lr_mask
+        adaptation_info['avg_lr'] = torch.mean(new_lr_mask).item()
+
+        # 返回相對於基礎學習率的縮放因子
+        base_lr = self.defaults['lr']
+        lr_scale = new_lr_mask / base_lr if base_lr > 0 else new_lr_mask
+
+        logger.debug(f"Warmup lr_mask 更新：avg_lr={adaptation_info['avg_lr']:.6f}, "
+                   f"scale_range=[{lr_scale.min().item():.3f}, {lr_scale.max().item():.3f}]")
+
+        return lr_scale
+
+    def _update_post_warmup_lr_mask(self, adaptation_info, global_step):
+        """
+        Post-warmup 階段的 lr_mask 更新（保持穩定，輕微衰減）
+
+        Args:
+            adaptation_info: 參數的自適應信息
+            global_step: 全局步數
+
+        Returns:
+            torch.Tensor: lr_mask 縮放因子
+        """
+        if not adaptation_info.get('warmup_complete', False):
+            # 清理 warmup 相關狀態
+            if 'last_polarity' in adaptation_info:
+                del adaptation_info['last_polarity']
+            adaptation_info['warmup_complete'] = True
+            logger.debug("lr_mask warmup 階段完成，進入穩定模式")
+
+        # 獲取當前 lr_mask
+        lr_mask = adaptation_info['lr_mask']
+
+        # Post-warmup 階段：輕微衰減以保持穩定
+        current_base_lr = self.defaults['lr']
+        lr_max = adaptation_info['lr_max']
+
+        if current_base_lr < lr_max:
+            # 如果當前基礎學習率降低，按比例調整 lr_mask
+            decay_factor = max(current_base_lr / lr_max, 0.1)
+            lr_mask = lr_mask * decay_factor
+            adaptation_info['lr_mask'] = lr_mask
+
+        # 返回相對於基礎學習率的縮放因子
+        base_lr = self.defaults['lr']
+        lr_scale = lr_mask / base_lr if base_lr > 0 else lr_mask
+
+        logger.debug(f"Post-warmup lr_mask：avg_lr={torch.mean(lr_mask).item():.6f}")
+
+        return lr_scale
+
+    def _get_lr_mask_statistics(self) -> Dict[str, Any]:
+        """獲取 lr_mask 的統計信息"""
+        if not self.use_lr_mask:
+            return {'message': 'lr_mask 未啟用'}
+
+        stats = {
+            'total_updates': 0,
+            'positive_updates': 0,
+            'negative_updates': 0,
+            'positive_to_negative_ratio': 0.0,
+            'negative_to_positive_ratio': 0.0,
+            'max_lr_scale': 0.0,
+            'min_lr_scale': 0.0,
+            'avg_lr_scale': 0.0
+        }
+
+        for group_metadata in self.param_groups_metadata.values():
+            for param_id, adaptation_info in group_metadata['adaptation_history'].items():
+                if 'lr_mask' in adaptation_info:
+                    lr_mask = adaptation_info['lr_mask']
+                    stats['total_updates'] += 1
+                    if torch.mean(lr_mask) > 0:
+                        stats['positive_updates'] += 1
+                    else:
+                        stats['negative_updates'] += 1
+                    stats['max_lr_scale'] = max(stats['max_lr_scale'], torch.max(lr_mask).item())
+                    stats['min_lr_scale'] = min(stats['min_lr_scale'], torch.min(lr_mask).item())
+                    stats['avg_lr_scale'] += torch.mean(lr_mask).item()
+
+        if stats['total_updates'] > 0:
+            stats['positive_to_negative_ratio'] = stats['positive_updates'] / stats['negative_updates']
+            stats['negative_to_positive_ratio'] = stats['negative_updates'] / stats['positive_updates']
+            stats['avg_lr_scale'] /= stats['total_updates']
+
+        return stats
+
+    def get_lr_mask_analysis(self) -> Dict[str, Any]:
+        """獲取 lr_mask 的詳細分析報告"""
+        if not self.use_lr_mask:
+            return {'message': 'lr_mask 功能未啟用'}
+
+        analysis = {
+            'lr_mask_enabled': True,
+            'configuration': {
+                'lr_bump': self.lr_bump,
+                'min_lr': self.min_lr,
+                'max_lr': self.max_lr,
+                'warmup_steps': self.warmup_steps
+            },
+            'parameter_analysis': [],
+            'global_statistics': {
+                'total_parameters': 0,
+                'warmup_parameters': 0,
+                'post_warmup_parameters': 0,
+                'avg_lr_scale': 0.0,
+                'lr_scale_std': 0.0,
+                'lr_scale_range': [float('inf'), float('-inf')]
+            }
+        }
+
+        all_lr_scales = []
+
+        for group_idx, group_metadata in self.param_groups_metadata.items():
+            for param in group_metadata['param_list']:
+                param_id = id(param)
+                adaptation_info = group_metadata['adaptation_history'].get(param_id, {})
+
+                if 'lr_mask' in adaptation_info:
+                    lr_mask = adaptation_info['lr_mask']
+
+                    # 計算參數級別統計
+                    param_stats = {
+                        'param_shape': list(param.shape),
+                        'param_id': param_id,
+                        'lr_mask_mean': torch.mean(lr_mask).item(),
+                        'lr_mask_std': torch.std(lr_mask).item(),
+                        'lr_mask_min': torch.min(lr_mask).item(),
+                        'lr_mask_max': torch.max(lr_mask).item(),
+                        'avg_lr': adaptation_info.get('avg_lr', 0.0),
+                        'lr_max': adaptation_info.get('lr_max', 0.0),
+                        'warmup_complete': adaptation_info.get('warmup_complete', False),
+                        'has_polarity_tracking': 'last_polarity' in adaptation_info
+                    }
+
+                    analysis['parameter_analysis'].append(param_stats)
+
+                    # 收集全局統計數據
+                    analysis['global_statistics']['total_parameters'] += 1
+                    if param_stats['warmup_complete']:
+                        analysis['global_statistics']['post_warmup_parameters'] += 1
+                    else:
+                        analysis['global_statistics']['warmup_parameters'] += 1
+
+                    all_lr_scales.append(param_stats['lr_mask_mean'])
+
+                    # 更新全局範圍
+                    lr_range = analysis['global_statistics']['lr_scale_range']
+                    lr_range[0] = min(lr_range[0], param_stats['lr_mask_min'])
+                    lr_range[1] = max(lr_range[1], param_stats['lr_mask_max'])
+
+        # 計算全局統計
+        if all_lr_scales:
+            analysis['global_statistics']['avg_lr_scale'] = sum(all_lr_scales) / len(all_lr_scales)
+
+            if len(all_lr_scales) > 1:
+                mean_lr = analysis['global_statistics']['avg_lr_scale']
+                variance = sum((x - mean_lr) ** 2 for x in all_lr_scales) / len(all_lr_scales)
+                analysis['global_statistics']['lr_scale_std'] = variance ** 0.5
+
+        # 如果沒有找到有效範圍，重置為 [0, 0]
+        if analysis['global_statistics']['lr_scale_range'][0] == float('inf'):
+            analysis['global_statistics']['lr_scale_range'] = [0.0, 0.0]
+
+        # 添加訓練階段分析
+        current_step = getattr(self, 'global_step', 0)
+        analysis['training_phase'] = {
+            'current_step': current_step,
+            'in_warmup': current_step < self.warmup_steps,
+            'warmup_progress': min(current_step / self.warmup_steps, 1.0) if self.warmup_steps > 0 else 1.0
+        }
+
+        return analysis
