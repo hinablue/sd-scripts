@@ -285,10 +285,14 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         for i, param1 in enumerate(param_list):
             if param1.dim() != 2:  # 只處理 2D 參數（矩陣）
+                logger.debug(f"參數 1 {param1.shape} 不是 2D 矩陣，跳過")
+
                 continue
 
             for j, param2 in enumerate(param_list[i+1:], i+1):
                 if param2.dim() != 2:
+                    logger.debug(f"參數 2 {param2.shape} 不是 2D 矩陣，跳過")
+
                     continue
 
                 # 計算兩個參數的相容性
@@ -313,8 +317,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         'interaction_type': AdaptiveHinaAdamW._determine_interaction_type(param1, param2)
                     }
 
-                    # logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
-                    #            f"相容性: {compatibility:.3f}")
+                    logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
+                               f"相容性: {compatibility:.3f}")
 
         return new_relationships
 
@@ -327,6 +331,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
         2. 語意相似性 - 基於參數分佈的相關性
         """
         if param1.dim() != 2 or param2.dim() != 2:
+            logger.debug(f"參數 1 {param1.shape} 或 參數 2 {param2.shape} 不是 2D 矩陣，跳過")
+
             return 0.0
 
         shape1, shape2 = param1.shape, param2.shape
@@ -367,10 +373,12 @@ class AdaptiveHinaAdamW(AdamW8bit):
             # 綜合相容性分數
             total_compatibility = (shape_compatibility * 0.7 + correlation * 0.3)
 
+            logger.debug(f"參數相容性分數: {total_compatibility:.3f}")
+
             return total_compatibility
 
         except Exception as e:
-            # logger.warning(f"計算參數相容性時發生錯誤: {e}")
+            logger.warning(f"計算參數相容性時發生錯誤: {e}")
             return 0.0
 
     @staticmethod
@@ -505,6 +513,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         # SPD 懲罰項
         spd_penalty = self.spd_lambda * bias_ratio * param_diff
+
+        logger.debug(f"SPD 懲罰項: {spd_penalty:.3f}")
+
         return spd_penalty
 
     @staticmethod
@@ -588,6 +599,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 grad_flat, param_flat, eps
             )
 
+        logger.debug(f"正交化後的梯度範數: {torch.norm(orthogonal_grad_flat):.3f}")
+
         # 恢復原始形狀
         return orthogonal_grad_flat.view_as(grad)
 
@@ -643,7 +656,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
             else:
                 alignment = 0.0
         except Exception as e:
-            # logger.warning(f"TAM: 計算對齊度時發生錯誤: {e}")
+            logger.warning(f"TAM: 計算對齊度時發生錯誤: {e}")
             alignment = 0.0
 
         # 平滑對齊估計
@@ -654,6 +667,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         # 計算阻尼因子
         damping_factor = (1 + state['momentum_alignment']) / 2
+
+        logger.debug(f"TAM 阻尼因子: {damping_factor:.3f}")
+
         return damping_factor
 
     def update_device(self, device):
@@ -688,7 +704,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
             if (self.global_step - self.last_relationship_update >=
                 self.relationship_discovery_interval):
 
-                # logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
+                logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
 
                 # 更新重要性分數
                 self._update_importance_scores(group_metadata)
@@ -723,7 +739,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 else:
                     # 檢查狀態張量形狀是否相符
                     if state['exp_avg'].shape != param.data.shape:
-                        # logger.warning(f"狀態張量形狀不相符，重新初始化參數 {param.data.shape}")
+                        logger.warning(f"狀態張量形狀不相符，重新初始化參數 {param.data.shape}")
                         state['exp_avg'] = torch.zeros_like(param.data)
                         state['exp_avg_sq'] = torch.zeros_like(param.data)
                         if self.use_adopt_stability:
@@ -737,6 +753,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 # AGR 正則化
                 if self.use_agr:
                     grad = AdaptiveHinaAdamW._apply_agr_regularization(grad)
+                    logger.debug(f"AGR 正則化後的梯度範數: {torch.norm(grad):.3f}")
 
                 # 正交梯度投影 - 記憶體優化版本
                 if self.use_orthogonal_grad:
@@ -749,6 +766,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         )
 
                     grad = AdaptiveHinaAdamW._apply_orthogonal_gradient(grad, param, 1e-30, temp_buffers[buffer_key])
+                    logger.debug(f"正交梯度投影後的梯度範數: {torch.norm(grad):.3f}")
 
                 # 偏差校正的學習率
                 bias_correction1 = 1 - beta1 ** state['step']
@@ -766,6 +784,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 if self.use_adopt_stability and 'exp_avg_sq_prev' in state:
                     denom = (torch.sqrt(torch.maximum(state['exp_avg_sq'], state['exp_avg_sq_prev'])) /
                             math.sqrt(bias_correction2)).add_(group['eps'])
+                    logger.debug(f"啟用 ADOPT 穩定性更新後的分母: {denom:.3f}")
                 else:
                     denom = (state['exp_avg_sq'].sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
 
@@ -779,6 +798,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 # 謹慎更新
                 if self.use_cautious:
                     update = AdaptiveHinaAdamW._apply_cautious_update(update, grad)
+                    logger.debug(f"謹慎更新後的更新: {update:.3f}")
 
                 # 核心功能：動態自適應學習率調整
                 current_step_size = step_size
@@ -786,8 +806,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     lr_scale = self._compute_adaptive_lr_scale(param, group_metadata, state)
                     current_step_size *= lr_scale
 
-                    # if lr_scale != 1.0:
-                    #     logger.debug(f"參數 {param.shape} 學習率調整: {lr_scale:.4f}")
+                    if lr_scale != 1.0:
+                        logger.debug(f"參數 {param.shape} 學習率調整: {lr_scale:.4f}")
 
                 # 應用更新
                 param.data.add_(update, alpha=-current_step_size)
@@ -804,6 +824,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                             self.wd_decay_factor ** min(progress, 2.0)
                         )
                         current_weight_decay *= decay_multiplier
+                    logger.debug(f"動態權重衰減後的權重衰減係數: {current_weight_decay:.3f}")
 
                 if current_weight_decay != 0:
                     param.data.add_(param.data, alpha=-group['lr'] * current_weight_decay)
