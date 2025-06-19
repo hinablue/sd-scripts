@@ -26,126 +26,8 @@ from torch.nn.functional import normalize
 效果：LoRA 訓練時減少 80% 的正規化計算
 """
 
-@torch.jit.script
-def normalize_iteration(X, sqrt_n: float, sqrt_m: float, eps: float):
-    row_norm = torch.linalg.vector_norm(X, dim=1, keepdim=True) + eps
-    X = X * (sqrt_n / row_norm)
-    col_norm = torch.linalg.vector_norm(X, dim=0, keepdim=True) + eps
-    X = X * (sqrt_m / col_norm)
-    return X
-
-@torch.jit.script
-def automagic_lr_adjust(
-    grad: torch.Tensor,
-    last_polarity: torch.Tensor,
-    lr_bump_pos: float,
-    lr_bump_neg: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    current_polarity = grad > 0
-    polarity_match = last_polarity == current_polarity
-
-    # 建立 dummy tensor，確保型態正確
-    dummy = torch.tensor(0.0, device=grad.device, dtype=grad.dtype)
-    row_adj, col_adj, avg_adj = dummy, dummy, dummy
-    if grad.dim() == 2:
-        row_dim = 1
-        row_num_pos = polarity_match.sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
-        row_num_neg = (~polarity_match).sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
-        row_total = torch.tensor(polarity_match.shape[row_dim], dtype=grad.dtype)
-        row_adj = (row_num_pos * lr_bump_pos - row_num_neg * lr_bump_neg) / row_total * 0.5
-
-        col_dim = 0
-        col_num_pos = polarity_match.sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
-        col_num_neg = (~polarity_match).sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
-        col_total = torch.tensor(polarity_match.shape[col_dim], dtype=grad.dtype)
-        col_adj = (col_num_pos * lr_bump_pos - col_num_neg * lr_bump_neg) / col_total * 0.5
-    else:
-        num_pos = polarity_match.sum().to(dtype=grad.dtype)
-        num_neg = (polarity_match.numel() - num_pos).to(dtype=grad.dtype)
-        avg_adj = (num_pos * lr_bump_pos - num_neg * lr_bump_neg) / float(polarity_match.numel())
-
-    return row_adj, col_adj, avg_adj, current_polarity
-
-@torch.jit.script
-def _ratio(delta_new, delta_p):
-    curr_norm, prev_norm = torch.norm(delta_new), torch.norm(delta_p)
-    ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
-    return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
-
-# Implementation from: https://github.com/LucasPrietoAl/grokking-at-the-edge-of-numerical-stability/blob/main/orthograd.py
-@torch.jit.script
-def orthograd_(param: torch.Tensor,
-                  grad: torch.Tensor,
-                  eps: float = 1e-30) -> torch.Tensor:
-    """
-    JIT 版 Orthogonal Gradient 修正
-    Args:
-        param: 權重張量 (與 grad 同形狀)
-        grad : 梯度張量
-        eps  : 穩定常數
-    Returns:
-        與 grad 同形狀的修正梯度
-    """
-    # 扁平化計算投影
-    w = param.view(-1)
-    g = grad.view(-1)
-    g_norm = torch.norm(g, 2)
-
-    proj = torch.dot(w, g) / (torch.dot(w, w) + eps)
-    g_orth = g - proj * w
-
-    scale = g_norm / (torch.norm(g_orth, 2) + eps)
-    g_orth_scaled = g_orth * scale
-
-    return g_orth_scaled.view_as(grad)
-
-@torch.jit.script
-def fused_gradient_transform_2d(
-    param: torch.Tensor,
-    exp_avg: torch.Tensor,
-    grad: torch.Tensor,
-    use_orthograd: bool,
-    num_sinkgd_iter: int,
-    eps: float = 1e-30
-) -> torch.Tensor:
-    """
-    融合的 2D 張量梯度變換，合併 Grams + Orthograd + SinkGD
-    """
-    # Grams: Gradient Descent with Adaptive Momentum Scaling
-    update = exp_avg.abs() * (grad + exp_avg).sign()
-
-    # Orthograd: 正交梯度修正
-    if use_orthograd:
-        w = param.view(-1)
-        g = update.view(-1)
-        g_norm = torch.norm(g, 2)
-        proj = torch.dot(w, g) / (torch.dot(w, w) + eps)
-        g_orth = g - proj * w
-        scale = g_norm / (torch.norm(g_orth, 2) + eps)
-        update = (g_orth * scale).view_as(update)
-
-    # SinkGD: 多重正規化
-    if num_sinkgd_iter > 0:
-        m, n = update.shape
-        sqrt_n = n ** 0.5
-        sqrt_m = m ** 0.5
-        for _ in range(num_sinkgd_iter):
-            update = normalize_iteration(update, sqrt_n, sqrt_m, eps)
-
-    return update
-
-@torch.jit.script
-def fused_gradient_transform_1d(
-    exp_avg: torch.Tensor,
-    grad: torch.Tensor
-) -> torch.Tensor:
-    """
-    融合的 1D 張量梯度變換
-    """
-    # Grams for 1D
-    return exp_avg.abs() * grad.sign()
-
 class Automagic_Sinkgd(torch.optim.Optimizer):
+
     def __init__(
         self,
         params,
@@ -220,6 +102,135 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 pre_init = p.clone()
                 state.setdefault("pre", pre_init)
 
+    @staticmethod
+    @torch.jit.script
+    def normalize_iteration(X, sqrt_n: float, sqrt_m: float, eps: float):
+        row_norm = torch.linalg.vector_norm(X, dim=1, keepdim=True) + eps
+        X = X * (sqrt_n / row_norm)
+        col_norm = torch.linalg.vector_norm(X, dim=0, keepdim=True) + eps
+        X = X * (sqrt_m / col_norm)
+        return X
+
+    @staticmethod
+    @torch.jit.script
+    def automagic_lr_adjust(
+        grad: torch.Tensor,
+        last_polarity: torch.Tensor,
+        lr_bump_pos: float,
+        lr_bump_neg: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        current_polarity = grad > 0
+        polarity_match = last_polarity == current_polarity
+
+        # 建立 dummy tensor，確保型態正確
+        dummy = torch.tensor(0.0, device=grad.device, dtype=grad.dtype)
+        row_adj, col_adj, avg_adj = dummy, dummy, dummy
+        if grad.dim() == 2:
+            row_dim = 1
+            row_num_pos = polarity_match.sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
+            row_num_neg = (~polarity_match).sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
+            row_total = torch.tensor(polarity_match.shape[row_dim], dtype=grad.dtype)
+            row_adj = (row_num_pos * lr_bump_pos - row_num_neg * lr_bump_neg) / row_total * 0.5
+
+            col_dim = 0
+            col_num_pos = polarity_match.sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
+            col_num_neg = (~polarity_match).sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
+            col_total = torch.tensor(polarity_match.shape[col_dim], dtype=grad.dtype)
+            col_adj = (col_num_pos * lr_bump_pos - col_num_neg * lr_bump_neg) / col_total * 0.5
+        else:
+            num_pos = polarity_match.sum().to(dtype=grad.dtype)
+            num_neg = (polarity_match.numel() - num_pos).to(dtype=grad.dtype)
+            avg_adj = (num_pos * lr_bump_pos - num_neg * lr_bump_neg) / float(polarity_match.numel())
+
+        return row_adj, col_adj, avg_adj, current_polarity
+
+    @staticmethod
+    @torch.jit.script
+    def _ratio(delta_new, delta_p):
+        curr_norm, prev_norm = torch.norm(delta_new), torch.norm(delta_p)
+        ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
+        return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
+
+    # Implementation from: https://github.com/LucasPrietoAl/grokking-at-the-edge-of-numerical-stability/blob/main/orthograd.py
+    @staticmethod
+    @torch.jit.script
+    def orthograd_(param: torch.Tensor,
+                      grad: torch.Tensor,
+                      eps: float = 1e-30) -> torch.Tensor:
+        """
+        JIT 版 Orthogonal Gradient 修正
+        Args:
+            param: 權重張量 (與 grad 同形狀)
+            grad : 梯度張量
+            eps  : 穩定常數
+        Returns:
+            與 grad 同形狀的修正梯度
+        """
+        # 扁平化計算投影
+        w = param.view(-1)
+        g = grad.view(-1)
+        g_norm = torch.norm(g, 2)
+
+        proj = torch.dot(w, g) / (torch.dot(w, w) + eps)
+        g_orth = g - proj * w
+
+        scale = g_norm / (torch.norm(g_orth, 2) + eps)
+        g_orth_scaled = g_orth * scale
+
+        return g_orth_scaled.view_as(grad)
+
+    @staticmethod
+    @torch.jit.script
+    def fused_gradient_transform_2d(
+        param: torch.Tensor,
+        exp_avg: torch.Tensor,
+        grad: torch.Tensor,
+        use_orthograd: bool,
+        num_sinkgd_iter: int,
+        eps: float = 1e-30
+    ) -> torch.Tensor:
+        """
+        融合的 2D 張量梯度變換，合併 Grams + Orthograd + SinkGD
+        """
+        # Grams: Gradient Descent with Adaptive Momentum Scaling
+        update = exp_avg.abs() * (grad + exp_avg).sign()
+
+        # Orthograd: 正交梯度修正
+        if use_orthograd:
+            w = param.view(-1)
+            g = update.view(-1)
+            g_norm = torch.norm(g, 2)
+            proj = torch.dot(w, g) / (torch.dot(w, w) + eps)
+            g_orth = g - proj * w
+            scale = g_norm / (torch.norm(g_orth, 2) + eps)
+            update = (g_orth * scale).view_as(update)
+
+        # SinkGD: 多重正規化
+        if num_sinkgd_iter > 0:
+            m, n = update.shape
+            sqrt_n = n ** 0.5
+            sqrt_m = m ** 0.5
+            for _ in range(num_sinkgd_iter):
+                # 使用靜態方法調用
+                row_norm = torch.linalg.vector_norm(update, dim=1, keepdim=True) + eps
+                update = update * (sqrt_n / row_norm)
+                col_norm = torch.linalg.vector_norm(update, dim=0, keepdim=True) + eps
+                update = update * (sqrt_m / col_norm)
+
+        return update
+
+    @staticmethod
+    @torch.jit.script
+    def fused_gradient_transform_1d(
+        exp_avg: torch.Tensor,
+        grad: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        融合的 1D 張量梯度變換
+        """
+        # Grams for 1D
+        return exp_avg.abs() * grad.sign()
+
     def _update_cached_stats(self, grads_this_group, current_step, group):
         """批次化統計更新，減少同步頻率"""
         stats_freq = group.get('stats_update_freq', 5)
@@ -285,7 +296,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 # 使用融合的 JIT 函數進行梯度變換 (優化建議 1)
                 if grad.ndim == 2:
                     use_orthograd = group["orthograd"] and not is_early_warmup
-                    update = fused_gradient_transform_2d(
+                    update = self.fused_gradient_transform_2d(
                         p.data,
                         exp_avg,
                         grad,
@@ -293,7 +304,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                         self.sinkgd_iters
                     )
                 else:
-                    update = fused_gradient_transform_1d(exp_avg, grad)
+                    update = self.fused_gradient_transform_1d(exp_avg, grad)
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
@@ -324,7 +335,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     else:
                         lr_bump_pos = lr_bump_neg = self.lr_bump
 
-                    row_adj, col_adj, avg_adj, current_polarity = automagic_lr_adjust(
+                    row_adj, col_adj, avg_adj, current_polarity = self.automagic_lr_adjust(
                         grad, state["last_polarity"], lr_bump_pos, lr_bump_neg
                     )
 
