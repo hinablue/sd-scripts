@@ -54,7 +54,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
         importance_decay: float = 0.95,  # 重要性分數的衰減係數
         compatibility_threshold: float = 0.3,  # 參數相容性閾值
         # lr_mask 機制配置（策略 B：組合式整合）
-        use_lr_mask: bool = False,
+        use_lr_mask: bool = True,
         lr_bump: float = 3e-6,  # lr_mask 調整幅度
         min_lr: float = 1e-7,   # lr_mask 最小學習率
         max_lr: float = 1e-3,   # lr_mask 最大學習率
