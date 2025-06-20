@@ -11,6 +11,7 @@ from library.utils import setup_logging
 setup_logging()
 import logging
 
+logging.basicConfig(level=logging.INFO) # 設定日誌等級為 INFO，測試時可以調整為 DEBUG
 logger = logging.getLogger(__name__)
 
 class AdaptiveHinaAdamW(AdamW8bit):
@@ -238,7 +239,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     }
                     group_metadata['adaptation_history'][param_id].update(lr_mask_metadata)
 
-                    logger.debug(f"為參數 {param.shape} 初始化 lr_mask 狀態")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"為參數 {param.shape} 初始化 lr_mask 狀態")
 
     def _store_initial_parameters(self):
         """存儲初始參數以供 SPD 使用"""
@@ -325,15 +327,17 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
         for i, param1 in enumerate(param_list):
             if param1.dim() != 2:  # 只處理 2D 參數（矩陣）
-                logger.debug(f"參數 1 {param1.shape} 不是 2D 矩陣，跳過")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"參數 1 {param1.shape} 不是 2D 矩陣，跳過")
 
-                continue
+            continue
 
-            for j, param2 in enumerate(param_list[i+1:], i+1):
-                if param2.dim() != 2:
+        for j, param2 in enumerate(param_list[i+1:], i+1):
+            if param2.dim() != 2:
+                if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"參數 2 {param2.shape} 不是 2D 矩陣，跳過")
 
-                    continue
+                continue
 
                 # 計算兩個參數的相容性
                 compatibility = self._compute_parameter_compatibility(param1, param2)
@@ -357,8 +361,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         'interaction_type': AdaptiveHinaAdamW._determine_interaction_type(param1, param2)
                     }
 
-                    logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
-                               f"相容性: {compatibility:.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"發現參數關係: {param1.shape} <-> {param2.shape}, "
+                                   f"相容性: {compatibility:.3f}")
 
         return new_relationships
 
@@ -371,7 +376,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
         2. 語意相似性 - 基於參數分佈的相關性
         """
         if param1.dim() != 2 or param2.dim() != 2:
-            logger.debug(f"參數 1 {param1.shape} 或 參數 2 {param2.shape} 不是 2D 矩陣，跳過")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"參數 1 {param1.shape} 或 參數 2 {param2.shape} 不是 2D 矩陣，跳過")
 
             return 0.0
 
@@ -413,7 +419,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
             # 綜合相容性分數
             total_compatibility = (shape_compatibility * 0.7 + correlation * 0.3)
 
-            logger.debug(f"參數相容性分數: {total_compatibility:.3f}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"參數相容性分數: {total_compatibility:.3f}")
 
             return total_compatibility
 
@@ -499,9 +506,10 @@ class AdaptiveHinaAdamW(AdamW8bit):
 
                         relationship_scale = interaction_scale * compatibility_scale
 
-                        logger.debug(f"參數 {param.shape} 關係調整: "
-                                   f"交互={interaction_scale:.3f}, "
-                                   f"相容性={compatibility_scale:.3f}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"參數 {param.shape} 關係調整: "
+                                       f"交互={interaction_scale:.3f}, "
+                                       f"相容性={compatibility_scale:.3f}")
 
                 except Exception as e:
                     logger.warning(f"計算配對效應時發生錯誤: {e}")
@@ -519,10 +527,11 @@ class AdaptiveHinaAdamW(AdamW8bit):
         final_scale = max(0.001, min(10.0, final_scale))
 
         # 詳細日誌記錄（僅在 debug 模式）
-        logger.debug(f"參數 {param.shape} 學習率縮放組合：")
-        logger.debug(f"  lr_mask_scale: {lr_mask_scale:.4f}")
-        logger.debug(f"  adaptive_scale: {adaptive_scale:.4f}")
-        logger.debug(f"  final_scale: {final_scale:.4f}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"參數 {param.shape} 學習率縮放組合：")
+            logger.debug(f"  lr_mask_scale: {lr_mask_scale:.4f}")
+            logger.debug(f"  adaptive_scale: {adaptive_scale:.4f}")
+            logger.debug(f"  final_scale: {final_scale:.4f}")
 
         return final_scale
 
@@ -587,7 +596,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
         # SPD 懲罰項
         spd_penalty = self.spd_lambda * bias_ratio * param_diff
 
-        logger.debug(f"SPD 懲罰項: {spd_penalty:.3f}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"SPD 懲罰項範數: {torch.norm(spd_penalty).item():.3f}")
 
         return spd_penalty
 
@@ -672,7 +682,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 grad_flat, param_flat, eps
             )
 
-        logger.debug(f"正交化後的梯度範數: {torch.norm(orthogonal_grad_flat):.3f}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"正交化後的梯度範數: {torch.norm(orthogonal_grad_flat):.3f}")
 
         # 恢復原始形狀
         return orthogonal_grad_flat.view_as(grad)
@@ -741,7 +752,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
         # 計算阻尼因子
         damping_factor = (1 + state['momentum_alignment']) / 2
 
-        logger.debug(f"TAM 阻尼因子: {damping_factor:.3f}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"TAM 阻尼因子: {damping_factor:.3f}")
 
         return damping_factor
 
@@ -777,7 +789,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
             if (self.global_step - self.last_relationship_update >=
                 self.relationship_discovery_interval):
 
-                logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"第 {self.global_step} 步：更新參數關係和重要性分數")
 
                 # 更新重要性分數
                 self._update_importance_scores(group_metadata)
@@ -826,7 +839,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 # AGR 正則化
                 if self.use_agr:
                     grad = AdaptiveHinaAdamW._apply_agr_regularization(grad)
-                    logger.debug(f"AGR 正則化後的梯度範數: {torch.norm(grad):.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"AGR 正則化後的梯度範數: {torch.norm(grad):.3f}")
 
                 # 正交梯度投影 - 記憶體優化版本
                 if self.use_orthogonal_grad:
@@ -839,7 +853,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                         )
 
                     grad = AdaptiveHinaAdamW._apply_orthogonal_gradient(grad, param, 1e-30, temp_buffers[buffer_key])
-                    logger.debug(f"正交梯度投影後的梯度範數: {torch.norm(grad):.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"正交梯度投影後的梯度範數: {torch.norm(grad):.3f}")
 
                 # 偏差校正的學習率
                 bias_correction1 = 1 - beta1 ** state['step']
@@ -856,7 +871,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 if self.use_adopt_stability and 'exp_avg_sq_prev' in state:
                     denom = (torch.sqrt(torch.maximum(state['exp_avg_sq'], state['exp_avg_sq_prev'])) /
                             math.sqrt(bias_correction2)).add_(group['eps'])
-                    logger.debug(f"啟用 ADOPT 穩定性更新後的分母: {denom:.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"啟用 ADOPT 穩定性更新後的分母範數: {torch.norm(denom).item():.3f}")
                 else:
                     denom = (state['exp_avg_sq'].sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
 
@@ -870,7 +886,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                 # 謹慎更新
                 if self.use_cautious:
                     update = AdaptiveHinaAdamW._apply_cautious_update(update, grad)
-                    logger.debug(f"謹慎更新後的更新: {update:.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"謹慎更新後的更新範數: {torch.norm(update).item():.3f}")
 
                 # 核心功能：動態自適應學習率調整
                 current_step_size = step_size
@@ -884,7 +901,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
                     )
                     current_step_size *= lr_scale
 
-                    if lr_scale != 1.0:
+                    if lr_scale != 1.0 and logger.isEnabledFor(logging.DEBUG):
                         logger.debug(f"參數 {param.shape} 組合學習率調整: {lr_scale:.4f}")
 
                 # 應用更新
@@ -902,7 +919,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
                             self.wd_decay_factor ** min(progress, 2.0)
                         )
                         current_weight_decay *= decay_multiplier
-                    logger.debug(f"動態權重衰減後的權重衰減係數: {current_weight_decay:.3f}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"動態權重衰減後的權重衰減係數: {current_weight_decay:.3f}")
 
                 if current_weight_decay != 0:
                     param.data.add_(param.data, alpha=-group['lr'] * current_weight_decay)
@@ -1109,7 +1127,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
             adaptation_info['lr_mask'] = torch.ones(shape, device=device, dtype=torch.float32) * self.defaults['lr']
             adaptation_info['last_polarity'] = torch.zeros(shape, dtype=torch.bool, device=device)
 
-            logger.debug(f"首次初始化參數 {param.shape} 的 lr_mask")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"首次初始化參數 {param.shape} 的 lr_mask")
 
         if global_step < self.warmup_steps:
             return self._update_warmup_lr_mask(adaptation_info, grad, global_step)
@@ -1166,8 +1185,9 @@ class AdaptiveHinaAdamW(AdamW8bit):
         base_lr = self.defaults['lr']
         lr_scale = new_lr_mask / base_lr if base_lr > 0 else new_lr_mask
 
-        logger.debug(f"Warmup lr_mask 更新：avg_lr={adaptation_info['avg_lr']:.6f}, "
-                   f"scale_range=[{lr_scale.min().item():.3f}, {lr_scale.max().item():.3f}]")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Warmup lr_mask 更新：avg_lr={adaptation_info['avg_lr']:.6f}, "
+                       f"scale_range=[{lr_scale.min().item():.3f}, {lr_scale.max().item():.3f}]")
 
         return lr_scale
 
@@ -1187,7 +1207,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
             if 'last_polarity' in adaptation_info:
                 del adaptation_info['last_polarity']
             adaptation_info['warmup_complete'] = True
-            logger.debug("lr_mask warmup 階段完成，進入穩定模式")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("lr_mask warmup 階段完成，進入穩定模式")
 
         # 獲取當前 lr_mask
         lr_mask = adaptation_info['lr_mask']
@@ -1206,7 +1227,8 @@ class AdaptiveHinaAdamW(AdamW8bit):
         base_lr = self.defaults['lr']
         lr_scale = lr_mask / base_lr if base_lr > 0 else lr_mask
 
-        logger.debug(f"Post-warmup lr_mask：avg_lr={torch.mean(lr_mask).item():.6f}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Post-warmup lr_mask：avg_lr={torch.mean(lr_mask).item():.6f}")
 
         return lr_scale
 
