@@ -27,8 +27,9 @@ from .utils import setup_logging
 
 setup_logging()
 import logging
-logger = logging.getLogger(__name__)
 
+logging.basicConfig(level=logging.INFO) # 設定日誌等級為 INFO，測試時可以調整為 DEBUG
+logger = logging.getLogger(__name__)
 
 class HinaAdamWOptimizer(AdamW8bit):
     """
@@ -285,7 +286,8 @@ class HinaAdamWOptimizer(AdamW8bit):
 
                     if can_multiply:
                         group_metadata['lora_pairs'][a_param] = b_param
-                        logger.debug(f"LoRA pair matched: {base_name} - A shape: {a_shape}, B shape: {b_shape}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"LoRA pair matched: {base_name} - A shape: {a_shape}, B shape: {b_shape}")
                     else:
                         logger.warning(f"LoRA parameters have incompatible shapes: {base_name} - A shape: {a_shape}, B shape: {b_shape}")
                     break
@@ -329,7 +331,8 @@ class HinaAdamWOptimizer(AdamW8bit):
             # 建立 w1-w2 配對關係（LoKr 的核心結構）
             if params_dict['w1'] is not None and params_dict['w2'] is not None:
                 group_metadata['lokr_pairs'][params_dict['w1']] = params_dict['w2']
-                logger.debug(f"LoKr pair matched: {base_name} - w1 shape: {params_dict['w1'].shape}, w2 shape: {params_dict['w2'].shape}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"LoKr pair matched: {base_name} - w1 shape: {params_dict['w1'].shape}, w2 shape: {params_dict['w2'].shape}")
 
     def _pair_norm_parameters(self, group_metadata):
         """建立 Norm 參數的 w_norm-b_norm 配對關係"""
@@ -365,7 +368,8 @@ class HinaAdamWOptimizer(AdamW8bit):
         for base_name, params_dict in norm_base_names.items():
             if params_dict['w_norm'] is not None and params_dict['b_norm'] is not None:
                 group_metadata['norm_pairs'][params_dict['w_norm']] = params_dict['b_norm']
-                logger.debug(f"Norm pair matched: {base_name}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Norm pair matched: {base_name}")
 
     def _store_initial_parameters(self):
         """存儲初始參數以供 SPD 使用"""
@@ -765,7 +769,8 @@ class HinaAdamWOptimizer(AdamW8bit):
                                 try:
                                     lr_scale = self._compute_lokr_lr_scale(lokr_group)
                                     current_step_size *= lr_scale
-                                    logger.debug(f"Applied LoKr lr_scale {lr_scale} to parameter in group {base_name}")
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(f"Applied LoKr lr_scale {lr_scale} to parameter in group {base_name}")
                                 except Exception as e:
                                     logger.warning(f"Failed to compute LoKr lr scale for group {base_name}: {e}")
                                 break
@@ -774,7 +779,8 @@ class HinaAdamWOptimizer(AdamW8bit):
                         # 對於 LoKr w2 參數，通常應用較高的學習率（類似 LoRA B）
                         if param_type == 'lokr_w2':
                             current_step_size *= (self.alora_ratio * 0.6)  # 比 LoRA 更保守的調整
-                            logger.debug(f"Applied LoKr w2 ratio adjustment to parameter")
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"Applied LoKr w2 ratio adjustment to parameter")
                     else:
                         # 檢查是否為配對的 LoRA 參數 - 使用 id() 比較避免張量比較錯誤
                         lora_pairs = group_metadata.get('lora_pairs', {})
@@ -791,7 +797,8 @@ class HinaAdamWOptimizer(AdamW8bit):
                                 try:
                                     lr_scale = self._compute_alora_lr_scale(param, paired_param)
                                     current_step_size *= lr_scale
-                                    logger.debug(f"Applied ALoRA lr_scale {lr_scale} to paired LoRA parameter")
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(f"Applied ALoRA lr_scale {lr_scale} to paired LoRA parameter")
                                 except Exception as e:
                                     logger.warning(f"Failed to compute ALoRA lr scale for paired parameter: {e}")
 
@@ -804,7 +811,8 @@ class HinaAdamWOptimizer(AdamW8bit):
                                 param_in_paired_values = any(id(param) == id(p) for p in lora_pairs.values())
                                 if not param_in_paired_values:
                                     current_step_size *= self.alora_ratio
-                                    logger.debug(f"Applied ALoRA ratio {self.alora_ratio} to unpaired LoRA B parameter")
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(f"Applied ALoRA ratio {self.alora_ratio} to unpaired LoRA B parameter")
 
                 # 應用更新
                 param.data.add_(update, alpha=-current_step_size)

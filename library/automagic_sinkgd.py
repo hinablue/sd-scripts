@@ -50,7 +50,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         self.lr_bump = lr_bump
         self.full_finetune = full_finetune
         # 預計算動態迭代次數 (優化建議 4)
-        self.sinkgd_iters = 3 if not full_finetune else 5
+        self.sinkgd_iters = 4 if not full_finetune else 5
         defaults = dict(
             lr=lr,
             avg_lr_max=lr,
@@ -79,17 +79,14 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         device, shape = p.device, p.shape
         state = self.state[p]
         state.setdefault("step", 0)
-        state.setdefault("avg_lr_max", self.lr)  # 保持為 float，但減少更新頻率
+        state.setdefault("avg_lr", self.lr)
+        state.setdefault("avg_lr_max", self.lr)
         state.setdefault("lr_max", self.lr)
 
+        state.setdefault("exp_avg", torch.zeros_like(p))
         # lr_mask - 保持為 tensor 避免同步
         state.setdefault('last_polarity', torch.zeros(shape, dtype=torch.bool, device=device))
-        state.setdefault("avg_lr", torch.tensor(self.lr, device=device, dtype=p.dtype))
-        state.setdefault("exp_avg", torch.zeros_like(p))
-
-        if len(p.shape) == 2:
-            state['row_lr_mask'] = torch.ones(shape[0], 1, device=device, dtype=p.dtype) * (self.lr / 2)
-            state['col_lr_mask'] = torch.ones(1, shape[1], device=device, dtype=p.dtype) * (self.lr / 2)
+        state.setdefault("lr_mask", torch.ones(shape, device=device, dtype=torch.float16) * self.lr)
 
         if group['full_finetune'] == False:
             state.setdefault("pre", None)
@@ -110,39 +107,6 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         col_norm = torch.linalg.vector_norm(X, dim=0, keepdim=True) + eps
         X = X * (sqrt_m / col_norm)
         return X
-
-    @staticmethod
-    @torch.jit.script
-    def automagic_lr_adjust(
-        grad: torch.Tensor,
-        last_polarity: torch.Tensor,
-        lr_bump_pos: float,
-        lr_bump_neg: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        current_polarity = grad > 0
-        polarity_match = last_polarity == current_polarity
-
-        # 建立 dummy tensor，確保型態正確
-        dummy = torch.tensor(0.0, device=grad.device, dtype=grad.dtype)
-        row_adj, col_adj, avg_adj = dummy, dummy, dummy
-        if grad.dim() == 2:
-            row_dim = 1
-            row_num_pos = polarity_match.sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
-            row_num_neg = (~polarity_match).sum(dim=row_dim, keepdim=True).to(dtype=grad.dtype)
-            row_total = torch.tensor(polarity_match.shape[row_dim], dtype=grad.dtype)
-            row_adj = (row_num_pos * lr_bump_pos - row_num_neg * lr_bump_neg) / row_total * 0.5
-
-            col_dim = 0
-            col_num_pos = polarity_match.sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
-            col_num_neg = (~polarity_match).sum(dim=col_dim, keepdim=True).to(dtype=grad.dtype)
-            col_total = torch.tensor(polarity_match.shape[col_dim], dtype=grad.dtype)
-            col_adj = (col_num_pos * lr_bump_pos - col_num_neg * lr_bump_neg) / col_total * 0.5
-        else:
-            num_pos = polarity_match.sum().to(dtype=grad.dtype)
-            num_neg = (polarity_match.numel() - num_pos).to(dtype=grad.dtype)
-            avg_adj = (num_pos * lr_bump_pos - num_neg * lr_bump_neg) / float(polarity_match.numel())
-
-        return row_adj, col_adj, avg_adj, current_polarity
 
     @staticmethod
     @torch.jit.script
@@ -295,7 +259,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
 
                 # 使用融合的 JIT 函數進行梯度變換 (優化建議 1)
                 if grad.ndim == 2:
-                    use_orthograd = group["orthograd"] and not is_early_warmup
+                    use_orthograd = group["orthograd"] and is_post_warmup
                     update = self.fused_gradient_transform_2d(
                         p.data,
                         exp_avg,
@@ -317,66 +281,41 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                         del state["pre"]
 
                 lr_decay = 1.0
-                if is_post_warmup:
-                    if group["lr"] > state["lr_max"]:
-                        state["lr_max"] = group["lr"]
-                    if group["lr"] < state["lr_max"]:
-                        lr_decay = max((group["lr"] / state["lr_max"]), 0.1)
-
-                # Automagic lrmask - 減少分支和同步
-                if not is_post_warmup:
-                    lr_bump = self.lr_bump
-                    min_lr = max(self.min_lr, state['avg_lr_max'] / 10)
-                    max_lr = self.max_lr
-
-                    if is_early_warmup:
+                if state["step"] < group["warmup_steps"]:
+                    last_polarity = state['last_polarity']
+                    lr_mask = state['lr_mask']
+                    #Prodigy: An Expeditiously Adaptive Parameter-Free Learner
+                    #https://arxiv.org/pdf/2306.06101
+                    #https://github.com/konstmish/prodigy
+                    if state["step"] < group["warmup_steps"] / 2:
                         lr_bump_pos = self.lr_bump * group['d_coef'] if condition > 0.0 else self.lr_bump
                         lr_bump_neg = self.lr_bump * group['d_coef'] if condition < 0.0 else self.lr_bump
                     else:
-                        lr_bump_pos = lr_bump_neg = self.lr_bump
-
-                    row_adj, col_adj, avg_adj, current_polarity = self.automagic_lr_adjust(
-                        grad, state["last_polarity"], lr_bump_pos, lr_bump_neg
-                    )
-
-                    if grad.ndim == 2:
-                        half_min, half_max = min_lr * 0.5, max_lr * 0.5
-                        state['row_lr_mask'].add_(row_adj).clamp_(half_min, half_max)
-                        state['col_lr_mask'].add_(col_adj).clamp_(half_min, half_max)
-                        new_lr = state['row_lr_mask'] + state['col_lr_mask']
-                        # 避免同步：延後更新 avg_lr_max 到每 N 步
-                        if state["step"] % 10 == 0:
-                            avg_lr_tensor = new_lr.mean()
-                            state['avg_lr_max'] = max(avg_lr_tensor.item(), state['avg_lr_max'])
-                    else:
-                        state['avg_lr'].add_(avg_adj).clamp_(min=min_lr, max=max_lr)
-                        new_lr = state['avg_lr']
-                        if state["step"] % 10 == 0:
-                            state['avg_lr_max'] = max(state['avg_lr'].item(), state['avg_lr_max'])
-
+                        lr_bump_pos, lr_bump_neg = self.lr_bump, self.lr_bump
+                    current_polarity = (grad > 0)
+                    state['lr_mask'] = torch.where(
+                        last_polarity == current_polarity,
+                        lr_mask + lr_bump_pos,
+                        lr_mask - lr_bump_neg
+                    ).clamp_(min=self.min_lr, max=self.max_lr)
+                    new_lr = state['lr_mask']
+                    state['avg_lr'] = new_lr.mean().item()
+                    state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
                     state['last_polarity'] = current_polarity
                 else:
-                    state.pop('last_polarity', None)
-                    # 使用 tensor 計算避免頻繁同步
-                    avg_lr_tensor = state['avg_lr'] if grad.ndim == 1 else state['row_lr_mask'].mean() + state['col_lr_mask'].mean()
-                    decay_rate = avg_lr_tensor * ((avg_lr_tensor / state['avg_lr_max']) / group["warmup_steps"])
-
-                    if grad.ndim == 2:
-                        state['row_lr_mask'].sub_(decay_rate)
-                        state['col_lr_mask'].sub_(decay_rate)
-                        new_lr = state['row_lr_mask'] + state['col_lr_mask']
-                    else:
-                        if "new_avg_lr" not in state:
-                            state['new_avg_lr'] = state['avg_lr'].clone()
-                        state['new_avg_lr'] = state['new_avg_lr'] - decay_rate
-                        new_lr = state['new_avg_lr']
-
-                    # Neural Thermodynamic Laws
-                    new_lr = torch.clamp(new_lr, min=state['avg_lr_max'] / 10, max=state['avg_lr_max'] * lr_decay)
+                    new_lr = state['lr_mask']
+                    if "decay_rate" not in state:
+                        state["decay_rate"] = (state['avg_lr'] / state['avg_lr_max']) / group["warmup_steps"]
+                        state["lr_decay"] = 1.0
+                    state["lr_decay"] = state["lr_decay"] - state["decay_rate"]
+                    if group["lr"] > state["lr_max"]:
+                        state["lr_max"] = group["lr"]
+                    lr_decay = max(min(state["lr_decay"], group["lr"] / state["lr_max"]), 0.1)
 
                 # ==== VRAdam ====
                 vr = 1 / (1 + min(3 * (exp_avg ** 2).sum(), 10))
-                allora = state.get("row_scaling", 1.0)
+                allora = state.get("row_scaling", torch.tensor(1.0))
+                new_lr = new_lr * allora * vr * lr_decay
 
                 # 權重衰減處理
                 if use_weight_decay:
@@ -384,11 +323,11 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     norm_grad = (param_abs_grad - mean_norm) / std_norm
                     ada_alpha = 4
                     theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
-                    p.data.mul_(1 - new_lr * allora * vr * group["weight_decay"] * theta)
+                    weight_decay = state['avg_lr'] * allora.mean().item() * vr * theta
+                    p.data.mul_(1 - weight_decay)
 
                 # 應用最終的學習率縮放和更新
-                final_lr = new_lr * allora * vr
-                update = update * final_lr
+                update = update.mul_(new_lr)
                 p.add_(-update)
 
         return loss
