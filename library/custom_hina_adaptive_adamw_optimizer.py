@@ -159,7 +159,7 @@ class AdaptiveHinaAdamW(AdamW8bit):
         if self.use_spd:
             self._store_initial_parameters()
 
-        logger.info(f"AdaptiveHinaAdamWOptimizer 初始化完成，動態自適應: {use_dynamic_adaptation}，lr_mask: {use_lr_mask}")
+        logger.info(f"AdaptiveHinaAdamWOptimizer 初始化完成。")
 
     def _get_buffer(self, shape, dtype, device):
         """
