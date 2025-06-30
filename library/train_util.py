@@ -35,6 +35,7 @@ from library.automagic_adams import Automagic_AdamS
 from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
 from library.automagic_sinkgd import Automagic_Sinkgd
+from library.automagic_splus import Automagic_Splus
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -4833,6 +4834,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
     elif optimizer_type == "Automagic_Sinkgd".lower():
         logger.info(f"use Automagic_Sinkgd optimizer | {optimizer_kwargs}")
         optimizer_class = Automagic_Sinkgd
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_Splus".lower():
+        logger.info(f"use Automagic_Splus optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_Splus
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "Automagic_AdamS".lower():

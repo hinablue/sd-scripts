@@ -39,6 +39,8 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         beta1: float = 0.9,
         d_coef: float = 2,
         weight_decay: float = 5e-4,
+        weight_decay2: float = 1.0,
+        sinkgd_iters: int = 3,
         warmup_steps: int = 500,
         full_finetune: bool = False,
         orthograd: bool = False,
@@ -49,17 +51,18 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         self.max_lr = max_lr
         self.lr_bump = lr_bump
         self.full_finetune = full_finetune
-        # 預計算動態迭代次數 (優化建議 4)
-        self.sinkgd_iters = 4 if not full_finetune else 5
+        self.sinkgd_iters = sinkgd_iters
         defaults = dict(
             lr=lr,
             avg_lr_max=lr,
+            lr_bump=lr_bump,
             eta=eta,
             beta1=beta1,
             d_coef=d_coef,
             warmup_steps=warmup_steps,
             full_finetune = full_finetune,
             weight_decay=weight_decay,
+            weight_decay2=weight_decay2,
             orthograd=orthograd,
             stats_update_freq=stats_update_freq
         )
@@ -157,7 +160,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         融合的 2D 張量梯度變換，合併 Grams + Orthograd + SinkGD
         """
         # Grams: Gradient Descent with Adaptive Momentum Scaling
-        update = exp_avg.abs() * (grad + exp_avg).sign()
+        update = exp_avg + grad
 
         # Orthograd: 正交梯度修正
         if use_orthograd:
@@ -193,7 +196,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         融合的 1D 張量梯度變換
         """
         # Grams for 1D
-        return exp_avg.abs() * grad.sign()
+        return exp_avg.abs().mul_(grad.sign())
 
     def _update_cached_stats(self, grads_this_group, current_step, group):
         """批次化統計更新，減少同步頻率"""
@@ -206,6 +209,16 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 self._cached_stats['mean_norm'] = abs_all_group_grads.mean()
                 self._cached_stats['std_norm'] = abs_all_group_grads.std(unbiased=False) + 1e-12
                 self._cached_stats['last_stats_step'] = current_step
+
+    @staticmethod
+    @torch.jit.script
+    def spectral_norm(mat):
+        # Power iteration, 2~3次就夠快
+        x = torch.randn(mat.shape[1], 1, device=mat.device)
+        for _ in range(3):
+            x = mat @ x
+            x = x / (x.norm() + 1e-8)
+        return (mat @ x).norm()
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -274,48 +287,70 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
 
                 condition = 0.0
                 if group['d_coef'] != 1 and is_early_warmup:
-                    delta_p = p - state["pre"] if state["pre"] else p
+                    delta_p = p - state["pre"] if state["pre"] is not None else p
                     condition = -torch.sum(p.grad * delta_p)
                 else:
                     if 'pre' in state:
                         del state["pre"]
 
+                allora = state.get("row_scaling", torch.tensor(1.0))
                 lr_decay = 1.0
-                if state["step"] < group["warmup_steps"]:
+                if is_early_warmup:
                     last_polarity = state['last_polarity']
                     lr_mask = state['lr_mask']
-                    #Prodigy: An Expeditiously Adaptive Parameter-Free Learner
-                    #https://arxiv.org/pdf/2306.06101
-                    #https://github.com/konstmish/prodigy
-                    if state["step"] < group["warmup_steps"] / 2:
-                        lr_bump_pos = self.lr_bump * group['d_coef'] if condition > 0.0 else self.lr_bump
-                        lr_bump_neg = self.lr_bump * group['d_coef'] if condition < 0.0 else self.lr_bump
-                    else:
-                        lr_bump_pos, lr_bump_neg = self.lr_bump, self.lr_bump
-                    current_polarity = (grad > 0)
-                    state['lr_mask'] = torch.where(
-                        last_polarity == current_polarity,
-                        lr_mask + lr_bump_pos,
-                        lr_mask - lr_bump_neg
-                    ).clamp_(min=self.min_lr, max=self.max_lr)
-                    new_lr = state['lr_mask']
-                    state['avg_lr'] = new_lr.mean().item()
-                    state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
+                    lr_bump, d_coef= self.lr_bump, group["d_coef"]
+
+                    current_polarity = grad > 0
+                    same = (last_polarity == current_polarity).to(torch.float16)
                     state['last_polarity'] = current_polarity
-                else:
+                    if is_early_warmup:
+                        if condition >= 0.0:
+                            lr_adjustment = (d_coef * same - (1 - same)) * lr_bump
+                        elif condition < 0.0:
+                            lr_adjustment = (same - d_coef * (1 - same)) * lr_bump
+                    else:
+                        lr_adjustment = (same * 2 - 1) * lr_bump
+                    lr_mask.add_(lr_adjustment).clamp_(min=self.min_lr, max=self.max_lr)
+                    state['avg_lr'] = state['lr_mask'].mean().item()
+                    if self._step % 25 == 0:
+                        lr_mask_f = lr_mask.float()
+                        lr_medians = torch.quantile(
+                            lr_mask_f, torch.tensor([0.9, 0.7, 0.5, 0.3, 0.1], device=lr_mask.device)
+                        )
+                        diff = torch.stack([torch.abs(lr_mask_f - m) for m in lr_medians], dim=-1)
+                        nearest_idx = torch.argmin(diff, dim=-1)
+                        lr_mask_flat = lr_mask.flatten()
+                        nearest_idx_flat = nearest_idx.flatten()
+                        lr_mask_flat = lr_medians[nearest_idx_flat]
+                        state['lr_mask'] = lr_mask_flat.view_as(lr_mask).to(torch.float16)
+                        state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
                     new_lr = state['lr_mask']
-                    if "decay_rate" not in state:
-                        state["decay_rate"] = (state['avg_lr'] / state['avg_lr_max']) / group["warmup_steps"]
-                        state["lr_decay"] = 1.0
-                    state["lr_decay"] = state["lr_decay"] - state["decay_rate"]
+                    new_lr = new_lr * allora
+                else:
                     if group["lr"] > state["lr_max"]:
                         state["lr_max"] = group["lr"]
-                    lr_decay = max(min(state["lr_decay"], group["lr"] / state["lr_max"]), 0.1)
-
+                    lr_decay = max(group["lr"] / state["lr_max"], 0.1)
+                    if "last_polarity" in state:
+                        del state['last_polarity']
+                        lr_mask = state['lr_mask']
+                        lr_mask.mul_(allora)
+                        lr_mask_f = lr_mask.float()
+                        lr_medians = torch.quantile(
+                            lr_mask_f, torch.tensor([0.9, 0.7, 0.5, 0.3, 0.1], device=lr_mask.device)
+                        )
+                        diff = torch.stack([torch.abs(lr_mask_f - m) for m in lr_medians], dim=-1)
+                        nearest_idx = torch.argmin(diff, dim=-1)
+                        lr_mask_flat = lr_mask.flatten()
+                        nearest_idx_flat = nearest_idx.flatten()
+                        lr_mask_flat = lr_medians[nearest_idx_flat]
+                        state['lr_mask'] = lr_mask_flat.view_as(lr_mask).to(torch.float16)
+                        state['avg_lr'] = state['lr_mask'].mean().item()
+                        state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
+                    new_lr = state['lr_mask'] * lr_decay
                 # ==== VRAdam ====
                 vr = 1 / (1 + min(3 * (exp_avg ** 2).sum(), 10))
-                allora = state.get("row_scaling", torch.tensor(1.0))
-                new_lr = new_lr * allora * vr * lr_decay
+                update = update.mul_(new_lr * vr)
+                p.add_(-update)
 
                 # 權重衰減處理
                 if use_weight_decay:
@@ -323,11 +358,10 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     norm_grad = (param_abs_grad - mean_norm) / std_norm
                     ada_alpha = 4
                     theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
-                    weight_decay = state['avg_lr'] * allora.mean().item() * vr * theta
+                    if condition < 0.0:
+                        weight_decay = state['avg_lr'] * allora.mean().item() * vr * group["weight_decay2"] * theta
+                    else:
+                        weight_decay = state['avg_lr'] * allora.mean().item() * vr * group["weight_decay"] * theta
                     p.data.mul_(1 - weight_decay)
-
-                # 應用最終的學習率縮放和更新
-                update = update.mul_(new_lr)
-                p.add_(-update)
 
         return loss
