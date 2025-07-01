@@ -34,6 +34,7 @@ from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
 from library.automagic_adams import Automagic_AdamS
 from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
+from library.custom_hina_adaptive_adamw_memory_optimized import MemoryOptimizedAdaptiveHinaAdamW
 from library.automagic_sinkgd import Automagic_Sinkgd
 from library.automagic_splus import Automagic_Splus
 
@@ -4857,6 +4858,18 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             optimizer_class = bnb.optim.AdamW8bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "HinaAdaptiveAdamWMemoryOptimized8bit".lower():
+            logger.info(f"use Memory Optimized Adaptive Hina AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = MemoryOptimizedAdaptiveHinaAdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Features: {opt_info['features']}")
+                logger.info(f"Adaptation: {opt_info['adaptation_config']}")
+                logger.info(f"Memory Optimization: {opt_info['memory_optimization']}")
+
         elif optimizer_type == "HinaAdaptiveAdamW8bit".lower():
             logger.info(f"use Adaptive Hina AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = AdaptiveHinaAdamW
@@ -5769,6 +5782,74 @@ def get_last_ckpt_name(args: argparse.Namespace, ext: str):
     model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
     return model_name + ext
 
+def get_unique_directory_name(dir_path: str) -> str:
+    """
+    如果目錄已存在，則生成一個唯一的目錄名稱，在目錄名後添加數字後綴。
+    If the directory already exists, generate a unique directory name by adding a numeric suffix.
+
+    Args:
+        dir_path: 原始目錄路徑 / Original directory path
+
+    Returns:
+        str: 唯一的目錄路徑 / Unique directory path
+    """
+    if not os.path.exists(dir_path):
+        return dir_path
+
+    base_name = os.path.basename(dir_path)
+    parent_dir = os.path.dirname(dir_path)
+    counter = 1
+
+    while True:
+        new_dir = os.path.join(parent_dir, f"{base_name}_{counter:03d}")
+        if not os.path.exists(new_dir):
+            return new_dir
+        counter += 1
+
+        # 安全機制：避免無限迴圈
+        # Safety mechanism: avoid infinite loop
+        if counter > 999:
+            # 如果超過999，使用時間戳
+            # If counter exceeds 999, use timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"{base_name}_{timestamp}"
+
+
+def get_unique_filename(file_path: str) -> str:
+    """
+    如果檔案已存在，則生成一個唯一的檔案名稱，在檔案名後添加數字後綴。
+    If the file already exists, generate a unique filename by adding a numeric suffix.
+
+    Args:
+        file_path: 原始檔案路徑 / Original file path
+
+    Returns:
+        str: 唯一的檔案路徑 / Unique file path
+    """
+    if not os.path.exists(file_path):
+        return file_path
+
+    # 分離檔案路徑和副檔名
+    # Separate file path and extension
+    base_path, ext = os.path.splitext(file_path)
+    counter = 1
+
+    # 持續嘗試直到找到不存在的檔案名稱
+    # Keep trying until we find a non-existing filename
+    while True:
+        new_path = f"{base_path}_{counter:03d}{ext}"
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
+
+        # 安全機制：避免無限迴圈
+        # Safety mechanism: avoid infinite loop
+        if counter > 999:
+            # 如果超過999，使用時間戳
+            # If counter exceeds 999, use timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"{base_path}_{timestamp}{ext}"
+
 
 def get_remove_epoch_no(args: argparse.Namespace, epoch_no: int):
     if args.save_last_n_epochs is None:
@@ -5872,6 +5953,16 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
             ckpt_name = get_step_ckpt_name(args, ext, global_step)
 
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
+
+        # 檢查檔案是否已存在，如果存在則生成唯一檔案名稱
+        # Check if file already exists, generate unique filename if it does
+        original_ckpt_file = ckpt_file
+        ckpt_file = get_unique_filename(ckpt_file)
+
+        if ckpt_file != original_ckpt_file:
+            logger.info(f"檔案已存在，重新命名為: {os.path.basename(ckpt_file)}")
+            logger.info(f"File already exists, renamed to: {os.path.basename(ckpt_file)}")
+
         logger.info("")
         logger.info(f"saving checkpoint: {ckpt_file}")
         sd_saver(ckpt_file, epoch_no, global_step)
@@ -5896,6 +5987,15 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
             out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, epoch_no))
         else:
             out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, global_step))
+
+        # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+        # Check if directory already exists, generate unique directory name if it does
+        original_out_dir = out_dir
+        out_dir = get_unique_directory_name(out_dir)
+
+        if out_dir != original_out_dir:
+            logger.info(f"目錄已存在，重新命名為: {os.path.basename(out_dir)}")
+            logger.info(f"Directory already exists, renamed to: {os.path.basename(out_dir)}")
 
         logger.info("")
         logger.info(f"saving model: {out_dir}")
@@ -6030,6 +6130,15 @@ def save_sd_model_on_train_end_common(
         ckpt_name = model_name + (".safetensors" if use_safetensors else ".ckpt")
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
+        # 檢查檔案是否已存在，如果存在則生成唯一檔案名稱
+        # Check if file already exists, generate unique filename if it does
+        original_ckpt_file = ckpt_file
+        ckpt_file = get_unique_filename(ckpt_file)
+
+        if ckpt_file != original_ckpt_file:
+            logger.info(f"檔案已存在，重新命名為: {os.path.basename(ckpt_file)}")
+            logger.info(f"File already exists, renamed to: {os.path.basename(ckpt_file)}")
+
         logger.info(f"save trained model as StableDiffusion checkpoint to {ckpt_file}")
         sd_saver(ckpt_file, epoch, global_step)
 
@@ -6037,6 +6146,16 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=True)
     else:
         out_dir = os.path.join(args.output_dir, model_name)
+
+        # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+        # Check if directory already exists, generate unique directory name if it does
+        original_out_dir = out_dir
+        out_dir = get_unique_directory_name(out_dir)
+
+        if out_dir != original_out_dir:
+            logger.info(f"目錄已存在，重新命名為: {os.path.basename(out_dir)}")
+            logger.info(f"Directory already exists, renamed to: {os.path.basename(out_dir)}")
+
         os.makedirs(out_dir, exist_ok=True)
 
         logger.info(f"save trained model as Diffusers to {out_dir}")
