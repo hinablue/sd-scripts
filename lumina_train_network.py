@@ -244,6 +244,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
+        global_step=None,
         is_train=True,
     ):
         assert isinstance(noise_scheduler, sd3_train_utils.FlowMatchEulerDiscreteScheduler)
@@ -318,7 +319,7 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
 
         return model_pred, target, timesteps, weighting
 
-    def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+    def post_process_loss(self, loss, args, timesteps, noise_scheduler, global_step=None):
         return loss
 
     def get_sai_model_spec(self, args):

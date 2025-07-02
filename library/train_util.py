@@ -4772,22 +4772,31 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         ), "fused_backward_pass does not work with gradient_accumulation_steps > 1 / fused_backward_passはgradient_accumulation_steps>1では機能しません"
 
     # 引数を分解する
+    def safe_parse_value(value):
+        """安全地解析配置值"""
+        # 先嘗試 ast.literal_eval
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            # 如果失敗，檢查是否是布爾值
+            if value.lower() in ('true', 'false'):
+                return value.lower() == 'true'
+            # 嘗試解析為數字
+            try:
+                if '.' in value:
+                    return float(value)
+                else:
+                    return int(value)
+            except ValueError:
+                pass
+            # 最後當作字符串處理
+            return value
+
     optimizer_kwargs = {}
     if args.optimizer_args is not None and len(args.optimizer_args) > 0:
         for arg in args.optimizer_args:
-            key, value = arg.split("=")
-            value = ast.literal_eval(value)
-
-            # value = value.split(",")
-            # for i in range(len(value)):
-            #     if value[i].lower() == "true" or value[i].lower() == "false":
-            #         value[i] = value[i].lower() == "true"
-            #     else:
-            #         value[i] = ast.float(value[i])
-            # if len(value) == 1:
-            #     value = value[0]
-            # else:
-            #     value = tuple(value)
+            key, value = arg.split("=", 1)
+            value = safe_parse_value(value)
 
             optimizer_kwargs[key] = value
     # logger.info(f"optkwargs {optimizer}_{kwargs}")
