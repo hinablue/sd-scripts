@@ -1287,6 +1287,25 @@ class NetworkTrainer:
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
+            # 處理檔案重命名並建立對應表
+            # Handle file renaming and create mapping table
+            mapping_file = os.path.join(args.output_dir, ".checkpoint_mapping.json")
+            checkpoint_mapping = {}
+            if os.path.exists(mapping_file):
+                try:
+                    with open(mapping_file, "r", encoding="utf-8") as f:
+                        checkpoint_mapping = json.load(f)
+                except Exception as e:
+                    logger.warning(f"無法讀取檢查點對應表: {e}")
+                    checkpoint_mapping = {}
+
+            # 如果檔案已存在，使用唯一檔名
+            original_ckpt_file = ckpt_file
+            if os.path.exists(ckpt_file):
+                ckpt_file = train_util.get_unique_filename(ckpt_file)
+                ckpt_name = os.path.basename(ckpt_file)
+                accelerator.print(f"檔案已存在，重新命名為: {ckpt_file}")
+
             accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
             metadata["ss_training_finished_at"] = str(time.time())
             metadata["ss_steps"] = str(steps)
@@ -1297,14 +1316,81 @@ class NetworkTrainer:
             metadata_to_save.update(sai_metadata)
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            # 更新對應表
+            # Update mapping table
+            if ckpt_file != original_ckpt_file:
+                # 根據 steps 或 epoch_no 建立 mapping key
+                if "step" in ckpt_name.lower():
+                    mapping_key = f"step_{steps}"
+                elif "epoch" in ckpt_name.lower():
+                    mapping_key = f"epoch_{epoch_no}"
+                else:
+                    mapping_key = "last"
+
+                checkpoint_mapping[mapping_key] = ckpt_name
+
+                # 儲存對應表
+                try:
+                    with open(mapping_file, "w", encoding="utf-8") as f:
+                        json.dump(checkpoint_mapping, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"無法儲存檢查點對應表: {e}")
+
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
         def remove_model(old_ckpt_name):
-            old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
+            # 嘗試從對應表中找到實際的檔案名稱
+            # Try to find actual filename from mapping table
+            mapping_file = os.path.join(args.output_dir, ".checkpoint_mapping.json")
+            actual_ckpt_name = old_ckpt_name
+
+            if os.path.exists(mapping_file):
+                try:
+                    with open(mapping_file, "r", encoding="utf-8") as f:
+                        checkpoint_mapping = json.load(f)
+
+                    # 根據檔案名稱推斷 mapping key
+                    mapping_key = None
+                    if "step" in old_ckpt_name.lower():
+                        # 從檔案名稱中提取 step 數字
+                        import re
+                        match = re.search(r'step-?(\d+)', old_ckpt_name, re.IGNORECASE)
+                        if match:
+                            mapping_key = f"step_{match.group(1)}"
+                    elif "epoch" in old_ckpt_name.lower():
+                        # 從檔案名稱中提取 epoch 數字
+                        import re
+                        match = re.search(r'epoch-?(\d+)', old_ckpt_name, re.IGNORECASE)
+                        if match:
+                            mapping_key = f"epoch_{match.group(1)}"
+                    elif "last" in old_ckpt_name.lower():
+                        mapping_key = "last"
+
+                    # 如果在對應表中找到，使用實際的檔案名稱
+                    if mapping_key and mapping_key in checkpoint_mapping:
+                        actual_ckpt_name = checkpoint_mapping[mapping_key]
+                        accelerator.print(f"從對應表找到實際檔案名稱: {old_ckpt_name} -> {actual_ckpt_name}")
+
+                        # 成功使用後從對應表中移除
+                        del checkpoint_mapping[mapping_key]
+                        with open(mapping_file, "w", encoding="utf-8") as f:
+                            json.dump(checkpoint_mapping, f, indent=2, ensure_ascii=False)
+
+                except Exception as e:
+                    logger.warning(f"讀取檢查點對應表時發生錯誤: {e}")
+
+            old_ckpt_file = os.path.join(args.output_dir, actual_ckpt_name)
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            else:
+                # 回退機制：嘗試使用原始檔案名稱
+                fallback_file = os.path.join(args.output_dir, old_ckpt_name)
+                if os.path.exists(fallback_file):
+                    accelerator.print(f"removing old checkpoint (fallback): {fallback_file}")
+                    os.remove(fallback_file)
 
         # if text_encoder is not needed for training, delete it to save memory.
         # TODO this can be automated after SDXL sample prompt cache is implemented

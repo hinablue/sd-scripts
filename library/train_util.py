@@ -5944,6 +5944,19 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         remove_no = get_remove_step_no(args, global_step)
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Initialize a mapping file for tracking renamed checkpoints
+    # 初始化檔案名稱對應表以追蹤重新命名的檢查點
+    mapping_file = os.path.join(args.output_dir, ".checkpoint_mapping.json")
+    checkpoint_mapping = {}
+    if os.path.exists(mapping_file):
+        try:
+            import json
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                checkpoint_mapping = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            checkpoint_mapping = {}
+
     if save_stable_diffusion_format:
         ext = ".safetensors" if use_safetensors else ".ckpt"
 
@@ -5959,9 +5972,13 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         original_ckpt_file = ckpt_file
         ckpt_file = get_unique_filename(ckpt_file)
 
-        if ckpt_file != original_ckpt_file:
-            logger.info(f"檔案已存在，重新命名為: {os.path.basename(ckpt_file)}")
-            logger.info(f"File already exists, renamed to: {os.path.basename(ckpt_file)}")
+        # Update mapping for current save
+        # 更新當前儲存的對應關係
+        if on_epoch_end:
+            mapping_key = f"epoch_{epoch_no}"
+        else:
+            mapping_key = f"step_{global_step}"
+        checkpoint_mapping[mapping_key] = os.path.basename(ckpt_file)
 
         logger.info("")
         logger.info(f"saving checkpoint: {ckpt_file}")
@@ -5970,17 +5987,46 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         if args.huggingface_repo_id is not None:
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name)
 
-        # remove older checkpoints
+        # remove older checkpoints using mapping
+        # 使用對應表移除舊檢查點
         if remove_no is not None:
             if on_epoch_end:
-                remove_ckpt_name = get_epoch_ckpt_name(args, ext, remove_no)
+                remove_mapping_key = f"epoch_{remove_no}"
             else:
-                remove_ckpt_name = get_step_ckpt_name(args, ext, remove_no)
+                remove_mapping_key = f"step_{remove_no}"
 
-            remove_ckpt_file = os.path.join(args.output_dir, remove_ckpt_name)
-            if os.path.exists(remove_ckpt_file):
-                logger.info(f"removing old checkpoint: {remove_ckpt_file}")
-                os.remove(remove_ckpt_file)
+            # Check if we have a mapping for the file to remove
+            # 檢查是否有要移除檔案的對應關係
+            if remove_mapping_key in checkpoint_mapping:
+                remove_ckpt_filename = checkpoint_mapping[remove_mapping_key]
+                remove_ckpt_file = os.path.join(args.output_dir, remove_ckpt_filename)
+                if os.path.exists(remove_ckpt_file):
+                    logger.info(f"removing old checkpoint: {remove_ckpt_file}")
+                    os.remove(remove_ckpt_file)
+                    # Remove from mapping after successful deletion
+                    # 成功刪除後從對應表中移除
+                    del checkpoint_mapping[remove_mapping_key]
+            else:
+                # Fallback to original logic if no mapping exists
+                # 如果沒有對應關係則回到原始邏輯
+                if on_epoch_end:
+                    remove_ckpt_name = get_epoch_ckpt_name(args, ext, remove_no)
+                else:
+                    remove_ckpt_name = get_step_ckpt_name(args, ext, remove_no)
+
+                remove_ckpt_file = os.path.join(args.output_dir, remove_ckpt_name)
+                if os.path.exists(remove_ckpt_file):
+                    logger.info(f"removing old checkpoint: {remove_ckpt_file}")
+                    os.remove(remove_ckpt_file)
+
+        # Save updated mapping
+        # 儲存更新的對應表
+        try:
+            import json
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_mapping, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint mapping: {e}")
 
     else:
         if on_epoch_end:
@@ -5993,9 +6039,13 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         original_out_dir = out_dir
         out_dir = get_unique_directory_name(out_dir)
 
-        if out_dir != original_out_dir:
-            logger.info(f"目錄已存在，重新命名為: {os.path.basename(out_dir)}")
-            logger.info(f"Directory already exists, renamed to: {os.path.basename(out_dir)}")
+        # Update mapping for current save (diffusers format)
+        # 更新當前儲存的對應關係（diffusers 格式）
+        if on_epoch_end:
+            mapping_key = f"epoch_{epoch_no}_diffusers"
+        else:
+            mapping_key = f"step_{global_step}_diffusers"
+        checkpoint_mapping[mapping_key] = os.path.basename(out_dir)
 
         logger.info("")
         logger.info(f"saving model: {out_dir}")
@@ -6004,16 +6054,45 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
         if args.huggingface_repo_id is not None:
             huggingface_util.upload(args, out_dir, "/" + model_name)
 
-        # remove older checkpoints
+        # remove older checkpoints using mapping (diffusers format)
+        # 使用對應表移除舊檢查點（diffusers 格式）
         if remove_no is not None:
             if on_epoch_end:
-                remove_out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+                remove_mapping_key = f"epoch_{remove_no}_diffusers"
             else:
-                remove_out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+                remove_mapping_key = f"step_{remove_no}_diffusers"
 
-            if os.path.exists(remove_out_dir):
-                logger.info(f"removing old model: {remove_out_dir}")
-                shutil.rmtree(remove_out_dir)
+            # Check if we have a mapping for the directory to remove
+            # 檢查是否有要移除目錄的對應關係
+            if remove_mapping_key in checkpoint_mapping:
+                remove_dir_name = checkpoint_mapping[remove_mapping_key]
+                remove_out_dir = os.path.join(args.output_dir, remove_dir_name)
+                if os.path.exists(remove_out_dir):
+                    logger.info(f"removing old model: {remove_out_dir}")
+                    shutil.rmtree(remove_out_dir)
+                    # Remove from mapping after successful deletion
+                    # 成功刪除後從對應表中移除
+                    del checkpoint_mapping[remove_mapping_key]
+            else:
+                # Fallback to original logic if no mapping exists
+                # 如果沒有對應關係則回到原始邏輯
+                if on_epoch_end:
+                    remove_out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+                else:
+                    remove_out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, remove_no))
+
+                if os.path.exists(remove_out_dir):
+                    logger.info(f"removing old model: {remove_out_dir}")
+                    shutil.rmtree(remove_out_dir)
+
+        # Save updated mapping
+        # 儲存更新的對應表
+        try:
+            import json
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_mapping, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint mapping: {e}")
 
     if args.save_state:
         if on_epoch_end:
@@ -6030,7 +6109,41 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator, ep
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
+
+    # 處理目錄重命名並建立對應表
+    # Handle directory renaming and create mapping table
+    mapping_file = os.path.join(args.output_dir, ".state_mapping.json")
+    state_mapping = {}
+    if os.path.exists(mapping_file):
+        try:
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                state_mapping = json.load(f)
+        except Exception as e:
+            logger.warning(f"無法讀取 state mapping 檔案: {e}")
+            state_mapping = {}
+
+    # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+    # Check if directory already exists, generate unique directory name if it does
+    original_state_dir = state_dir
+    state_dir = get_unique_directory_name(state_dir)
+
+    # 記錄到對應表
+    # Record in mapping table
+    mapping_key = f"epoch_{epoch_no}"
+    state_mapping[mapping_key] = os.path.basename(state_dir)
+
+    logger.info("")
+    logger.info(f"saving state: {state_dir}")
     accelerator.save_state(state_dir)
+
+    # 儲存對應表
+    # Save mapping table
+    try:
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(state_mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"無法儲存 state mapping 檔案: {e}")
+
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_util.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -6038,10 +6151,33 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator, ep
     last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
     if last_n_epochs is not None:
         remove_epoch_no = epoch_no - args.save_every_n_epochs * last_n_epochs
-        state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
+
+        # 使用對應表來尋找要移除的目錄
+        # Use mapping table to find directory to remove
+        remove_mapping_key = f"epoch_{remove_epoch_no}"
+        if remove_mapping_key in state_mapping:
+            # 從對應表找到實際的目錄名稱
+            # Find actual directory name from mapping
+            actual_dir_name = state_mapping[remove_mapping_key]
+            state_dir_old = os.path.join(args.output_dir, actual_dir_name)
+        else:
+            # 如果對應表中沒有，回退到原始邏輯
+            # If not in mapping, fallback to original logic
+            state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
+
         if os.path.exists(state_dir_old):
             logger.info(f"removing old state: {state_dir_old}")
             shutil.rmtree(state_dir_old)
+
+            # 成功刪除後，從對應表中移除該條目
+            # Remove entry from mapping after successful deletion
+            if remove_mapping_key in state_mapping:
+                del state_mapping[remove_mapping_key]
+                try:
+                    with open(mapping_file, "w", encoding="utf-8") as f:
+                        json.dump(state_mapping, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"無法更新 state mapping 檔案: {e}")
 
 
 def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_no):
@@ -6052,7 +6188,41 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_n
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
+
+    # 處理目錄重命名並建立對應表
+    # Handle directory renaming and create mapping table
+    mapping_file = os.path.join(args.output_dir, ".state_mapping.json")
+    state_mapping = {}
+    if os.path.exists(mapping_file):
+        try:
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                state_mapping = json.load(f)
+        except Exception as e:
+            logger.warning(f"無法讀取 state mapping 檔案: {e}")
+            state_mapping = {}
+
+    # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+    # Check if directory already exists, generate unique directory name if it does
+    original_state_dir = state_dir
+    state_dir = get_unique_directory_name(state_dir)
+
+    # 記錄到對應表
+    # Record in mapping table
+    mapping_key = f"step_{step_no}"
+    state_mapping[mapping_key] = os.path.basename(state_dir)
+
+    logger.info("")
+    logger.info(f"saving state: {state_dir}")
     accelerator.save_state(state_dir)
+
+    # 儲存對應表
+    # Save mapping table
+    try:
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(state_mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"無法儲存 state mapping 檔案: {e}")
+
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_util.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -6064,10 +6234,32 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator, step_n
         remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
 
         if remove_step_no > 0:
-            state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
+            # 使用對應表來尋找要移除的目錄
+            # Use mapping table to find directory to remove
+            remove_mapping_key = f"step_{remove_step_no}"
+            if remove_mapping_key in state_mapping:
+                # 從對應表找到實際的目錄名稱
+                # Find actual directory name from mapping
+                actual_dir_name = state_mapping[remove_mapping_key]
+                state_dir_old = os.path.join(args.output_dir, actual_dir_name)
+            else:
+                # 如果對應表中沒有，回退到原始邏輯
+                # If not in mapping, fallback to original logic
+                state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
+
             if os.path.exists(state_dir_old):
                 logger.info(f"removing old state: {state_dir_old}")
                 shutil.rmtree(state_dir_old)
+
+                # 成功刪除後，從對應表中移除該條目
+                # Remove entry from mapping after successful deletion
+                if remove_mapping_key in state_mapping:
+                    del state_mapping[remove_mapping_key]
+                    try:
+                        with open(mapping_file, "w", encoding="utf-8") as f:
+                            json.dump(state_mapping, f, indent=2, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"無法更新 state mapping 檔案: {e}")
 
 
 def save_state_on_train_end(args: argparse.Namespace, accelerator):
@@ -6078,7 +6270,40 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator):
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
+
+    # 處理目錄重命名並建立對應表
+    # Handle directory renaming and create mapping table
+    mapping_file = os.path.join(args.output_dir, ".state_mapping.json")
+    state_mapping = {}
+    if os.path.exists(mapping_file):
+        try:
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                state_mapping = json.load(f)
+        except Exception as e:
+            logger.warning(f"無法讀取 state mapping 檔案: {e}")
+            state_mapping = {}
+
+    # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+    # Check if directory already exists, generate unique directory name if it does
+    original_state_dir = state_dir
+    state_dir = get_unique_directory_name(state_dir)
+
+    # 記錄到對應表 (使用 "last" 作為特殊標識)
+    # Record in mapping table (use "last" as special identifier)
+    mapping_key = "last"
+    state_mapping[mapping_key] = os.path.basename(state_dir)
+
+    logger.info("")
+    logger.info(f"saving state: {state_dir}")
     accelerator.save_state(state_dir)
+
+    # 儲存對應表
+    # Save mapping table
+    try:
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(state_mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"無法儲存 state mapping 檔案: {e}")
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")
