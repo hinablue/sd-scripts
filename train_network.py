@@ -265,11 +265,12 @@ class NetworkTrainer:
         network,
         weight_dtype,
         train_unet,
-        is_train=True,
+        global_step=None,
+        is_train=True
     ):
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
-        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
+        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, global_step)
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -323,15 +324,23 @@ class NetworkTrainer:
 
         return noise_pred, target, timesteps, None
 
-    def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
+    def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler, global_step=None) -> torch.FloatTensor:
+        skip_double_debiased = False
+
         if args.min_snr_gamma:
-            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+            if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
+                skip_double_debiased = True
+            else:
+                loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
         if args.scale_v_pred_loss_like_noise_pred:
             loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
         if args.v_pred_like_loss:
             loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-        if args.debiased_estimation_loss:
-            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+        if skip_double_debiased == True:
+            if args.min_snr_gamma_mix_debiased != None and global_step >= math.ceil(args.min_snr_gamma_mix_debiased * args.max_train_steps):
+                loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+        if args.debiased_estimation_loss and skip_double_debiased == False:
+            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
         return loss
 
     def get_sai_model_spec(self, args):
@@ -380,6 +389,8 @@ class NetworkTrainer:
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
+        step=None,
+        global_step=None,
     ) -> torch.Tensor:
         """
         Process a batch for the network
@@ -458,11 +469,12 @@ class NetworkTrainer:
             network,
             weight_dtype,
             train_unet,
-            is_train=is_train,
+            global_step=global_step,
+            is_train=is_train
         )
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step)
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -472,7 +484,7 @@ class NetworkTrainer:
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
 
-        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, global_step)
 
         return loss.mean()
 
@@ -1417,6 +1429,8 @@ class NetworkTrainer:
                         is_train=True,
                         train_text_encoder=train_text_encoder,
                         train_unet=train_unet,
+                        step=step,
+                        global_step=global_step
                     )
 
                     accelerator.backward(loss)
@@ -1548,6 +1562,8 @@ class NetworkTrainer:
                                 is_train=False,
                                 train_text_encoder=train_text_encoder,  # this is needed for validation because Text Encoders must be called if train_text_encoder is True
                                 train_unet=train_unet,
+                                step=val_step,
+                                global_step=global_step
                             )
 
                             current_loss = loss.detach().item()
@@ -1626,6 +1642,8 @@ class NetworkTrainer:
                             is_train=False,
                             train_text_encoder=train_text_encoder,
                             train_unet=train_unet,
+                            step=val_step,
+                            global_step=global_step
                         )
 
                         current_loss = loss.detach().item()

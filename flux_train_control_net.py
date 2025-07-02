@@ -687,7 +687,7 @@ def train(args):
 
                 # calculate loss
                 loss = train_util.conditional_loss(
-                    model_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=None
+                    model_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=None, step, global_step
                 )
                 if weighting is not None:
                     loss = loss * weighting

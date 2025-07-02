@@ -29,6 +29,15 @@ import toml
 from tqdm import tqdm
 from packaging.version import Version
 
+from library.automagic_cameamp import Automagic_CameAMP, Automagic_CameAMP8bit
+from library.automagic_cameamp_improved import Automagic_CameAMP_Improved
+from library.automagic_adams import Automagic_AdamS
+from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
+from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
+from library.custom_hina_adaptive_adamw_memory_optimized import MemoryOptimizedAdaptiveHinaAdamW
+from library.automagic_sinkgd import Automagic_Sinkgd
+from library.automagic_splus import Automagic_Splus
+
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
@@ -2385,7 +2394,7 @@ class ControlNetDataset(BaseDataset):
         bucket_no_upscale: bool,
         debug_dataset: bool,
         validation_split: float,
-        validation_seed: Optional[int],        
+        validation_seed: Optional[int],
         resize_interpolation: Optional[str] = None,
     ) -> None:
         super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
@@ -2448,7 +2457,7 @@ class ControlNetDataset(BaseDataset):
         self.num_train_images = self.dreambooth_dataset_delegate.num_train_images
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images
         self.validation_split = validation_split
-        self.validation_seed = validation_seed 
+        self.validation_seed = validation_seed
         self.resize_interpolation = resize_interpolation
 
         # assert all conditioning data exists
@@ -4796,6 +4805,50 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = lion_pytorch.Lion
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "CAME".lower():
+        try:
+            from came_pytorch import CAME
+        except ImportError:
+            raise ImportError("No came-pytorch / came-pytorchがインストールされていないようです")
+        logger.info(f"use CAME optimizer | {optimizer_kwargs}")
+        optimizer_class = CAME
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_CameAMP".lower():
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+
+        logger.info(f"use Automagic_CameAMP optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_CameAMP
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_CameAMP_Improved".lower():
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
+
+        logger.info(f"use Automagic_CameAMP_Improved optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_CameAMP_Improved
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_Sinkgd".lower():
+        logger.info(f"use Automagic_Sinkgd optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_Sinkgd
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_Splus".lower():
+        logger.info(f"use Automagic_Splus optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_Splus
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Automagic_AdamS".lower():
+        logger.info(f"use Automagic_AdamS optimizer | {optimizer_kwargs}")
+        optimizer_class = Automagic_AdamS
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type.endswith("8bit".lower()):
         try:
             import bitsandbytes as bnb
@@ -4806,6 +4859,43 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
             optimizer_class = bnb.optim.AdamW8bit
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "HinaAdaptiveAdamWMemoryOptimized8bit".lower():
+            logger.info(f"use Memory Optimized Adaptive Hina AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = MemoryOptimizedAdaptiveHinaAdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Features: {opt_info['features']}")
+                logger.info(f"Adaptation: {opt_info['adaptation_config']}")
+                logger.info(f"Memory Optimization: {opt_info['memory_optimization']}")
+
+        elif optimizer_type == "HinaAdaptiveAdamW8bit".lower():
+            logger.info(f"use Adaptive Hina AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = AdaptiveHinaAdamW
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Features: {opt_info['features']}")
+                logger.info(f"Adaptation: {opt_info['adaptation_config']}")
+
+        elif optimizer_type == "HinaAdamWOptimizer8bit".lower():
+            logger.info(f"use Hina Custom AdamW optimizer with enhanced features | {optimizer_kwargs}")
+            optimizer_class = HinaAdamWOptimizer
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+            # ログ出力追加の最適化情報
+            if hasattr(optimizer, 'get_optimization_info'):
+                opt_info = optimizer.get_optimization_info()
+                logger.info(f"Custom optimizer features: {opt_info['features']}")
+                if 'lora_stats' in opt_info:
+                    logger.info(f"LoRA parameters detected: {opt_info['lora_stats']}")
+                if 'lokr_stats' in opt_info:
+                    logger.info(f"LoKr parameters detected: {opt_info['lokr_stats']}")
 
         elif optimizer_type == "SGDNesterov8bit".lower():
             logger.info(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")
@@ -5021,6 +5111,10 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         elif optimizer_type == "SGDScheduleFree".lower():
             optimizer_class = sf.SGDScheduleFree
             logger.info(f"use SGDScheduleFree optimizer | {optimizer_kwargs}")
+        elif optimizer_type == "ProdigyPlusScheduleFree".lower():
+            import prodigyplus as pf
+            optimizer_class = pf.ProdigyPlusScheduleFree
+            logger.info(f"use ProdigyPlusSchudleFree optimizer | {optimizer_kwargs}")
         else:
             optimizer_class = None
 
@@ -5500,11 +5594,11 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
 
 def patch_accelerator_for_fp16_training(accelerator):
-    
+
     from accelerate import DistributedType
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         return
-    
+
     org_unscale_grads = accelerator.scaler._unscale_grads_
 
     def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
@@ -5690,6 +5784,74 @@ def get_last_ckpt_name(args: argparse.Namespace, ext: str):
     model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
     return model_name + ext
 
+def get_unique_directory_name(dir_path: str) -> str:
+    """
+    如果目錄已存在，則生成一個唯一的目錄名稱，在目錄名後添加數字後綴。
+    If the directory already exists, generate a unique directory name by adding a numeric suffix.
+
+    Args:
+        dir_path: 原始目錄路徑 / Original directory path
+
+    Returns:
+        str: 唯一的目錄路徑 / Unique directory path
+    """
+    if not os.path.exists(dir_path):
+        return dir_path
+
+    base_name = os.path.basename(dir_path)
+    parent_dir = os.path.dirname(dir_path)
+    counter = 1
+
+    while True:
+        new_dir = os.path.join(parent_dir, f"{base_name}_{counter:03d}")
+        if not os.path.exists(new_dir):
+            return new_dir
+        counter += 1
+
+        # 安全機制：避免無限迴圈
+        # Safety mechanism: avoid infinite loop
+        if counter > 999:
+            # 如果超過999，使用時間戳
+            # If counter exceeds 999, use timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"{base_name}_{timestamp}"
+
+
+def get_unique_filename(file_path: str) -> str:
+    """
+    如果檔案已存在，則生成一個唯一的檔案名稱，在檔案名後添加數字後綴。
+    If the file already exists, generate a unique filename by adding a numeric suffix.
+
+    Args:
+        file_path: 原始檔案路徑 / Original file path
+
+    Returns:
+        str: 唯一的檔案路徑 / Unique file path
+    """
+    if not os.path.exists(file_path):
+        return file_path
+
+    # 分離檔案路徑和副檔名
+    # Separate file path and extension
+    base_path, ext = os.path.splitext(file_path)
+    counter = 1
+
+    # 持續嘗試直到找到不存在的檔案名稱
+    # Keep trying until we find a non-existing filename
+    while True:
+        new_path = f"{base_path}_{counter:03d}{ext}"
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
+
+        # 安全機制：避免無限迴圈
+        # Safety mechanism: avoid infinite loop
+        if counter > 999:
+            # 如果超過999，使用時間戳
+            # If counter exceeds 999, use timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            return f"{base_path}_{timestamp}{ext}"
+
 
 def get_remove_epoch_no(args: argparse.Namespace, epoch_no: int):
     if args.save_last_n_epochs is None:
@@ -5793,6 +5955,16 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
             ckpt_name = get_step_ckpt_name(args, ext, global_step)
 
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
+
+        # 檢查檔案是否已存在，如果存在則生成唯一檔案名稱
+        # Check if file already exists, generate unique filename if it does
+        original_ckpt_file = ckpt_file
+        ckpt_file = get_unique_filename(ckpt_file)
+
+        if ckpt_file != original_ckpt_file:
+            logger.info(f"檔案已存在，重新命名為: {os.path.basename(ckpt_file)}")
+            logger.info(f"File already exists, renamed to: {os.path.basename(ckpt_file)}")
+
         logger.info("")
         logger.info(f"saving checkpoint: {ckpt_file}")
         sd_saver(ckpt_file, epoch_no, global_step)
@@ -5817,6 +5989,15 @@ def save_sd_model_on_epoch_end_or_stepwise_common(
             out_dir = os.path.join(args.output_dir, EPOCH_DIFFUSERS_DIR_NAME.format(model_name, epoch_no))
         else:
             out_dir = os.path.join(args.output_dir, STEP_DIFFUSERS_DIR_NAME.format(model_name, global_step))
+
+        # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+        # Check if directory already exists, generate unique directory name if it does
+        original_out_dir = out_dir
+        out_dir = get_unique_directory_name(out_dir)
+
+        if out_dir != original_out_dir:
+            logger.info(f"目錄已存在，重新命名為: {os.path.basename(out_dir)}")
+            logger.info(f"Directory already exists, renamed to: {os.path.basename(out_dir)}")
 
         logger.info("")
         logger.info(f"saving model: {out_dir}")
@@ -5951,6 +6132,15 @@ def save_sd_model_on_train_end_common(
         ckpt_name = model_name + (".safetensors" if use_safetensors else ".ckpt")
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
+        # 檢查檔案是否已存在，如果存在則生成唯一檔案名稱
+        # Check if file already exists, generate unique filename if it does
+        original_ckpt_file = ckpt_file
+        ckpt_file = get_unique_filename(ckpt_file)
+
+        if ckpt_file != original_ckpt_file:
+            logger.info(f"檔案已存在，重新命名為: {os.path.basename(ckpt_file)}")
+            logger.info(f"File already exists, renamed to: {os.path.basename(ckpt_file)}")
+
         logger.info(f"save trained model as StableDiffusion checkpoint to {ckpt_file}")
         sd_saver(ckpt_file, epoch, global_step)
 
@@ -5958,6 +6148,16 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=True)
     else:
         out_dir = os.path.join(args.output_dir, model_name)
+
+        # 檢查目錄是否已存在，如果存在則生成唯一目錄名稱
+        # Check if directory already exists, generate unique directory name if it does
+        original_out_dir = out_dir
+        out_dir = get_unique_directory_name(out_dir)
+
+        if out_dir != original_out_dir:
+            logger.info(f"目錄已存在，重新命名為: {os.path.basename(out_dir)}")
+            logger.info(f"Directory already exists, renamed to: {os.path.basename(out_dir)}")
+
         os.makedirs(out_dir, exist_ok=True)
 
         logger.info(f"save trained model as Diffusers to {out_dir}")
@@ -5967,17 +6167,29 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device) -> torch.Tensor:
+def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device, use_log_norm_timesteps=None, loss_type=None, global_step=None, max_train_steps=None) -> torch.Tensor:
     if min_timestep < max_timestep:
         timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
     else:
         timesteps = torch.full((b_size,), max_timestep, device="cpu")
+
+    if use_log_norm_timesteps and loss_type == "l2":
+        if global_step and max_train_steps:
+            m = torch.distributions.LogNormal(0 + (0.65 * global_step / max_train_steps), 1)
+        else:
+            m = torch.distributions.LogNormal(0.65, 1)
+        timesteps = m.sample((b_size,)).to(device) * 250
+        while torch.any(timesteps > max_timestep - 1):
+            timesteps = m.sample((b_size,)).to(device) * 250
+        timesteps = torch.round(timesteps)
+
     timesteps = timesteps.long().to(device)
+
     return timesteps
 
 
 def get_noise_noisy_latents_and_timesteps(
-    args, noise_scheduler, latents: torch.FloatTensor
+    args, noise_scheduler, latents: torch.FloatTensor, global_step=None
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
@@ -5997,7 +6209,7 @@ def get_noise_noisy_latents_and_timesteps(
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.use_log_norm_timesteps,args.loss_type, global_step, args.max_train_steps)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -6035,9 +6247,212 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
 
     return result
 
+def compute_adaptive_stability_factor(model_pred: torch.Tensor,
+                                    target: torch.Tensor,
+                                    current_step: int = 0,
+                                    total_steps: int = 1000,
+                                    loss_history: list = None) -> torch.Tensor:
+    """
+    綜合多種因素計算自適應穩定性因子
+    """
+    with torch.no_grad():
+        # 1. 基於誤差統計的因子
+        error_magnitude = torch.abs(model_pred - target)
+        error_std = torch.std(error_magnitude)
+        error_mean = torch.mean(error_magnitude)
+
+        # 誤差相對穩定性
+        error_stability = torch.exp(-error_std / (error_mean + 1e-8))
+
+        # 2. 基於訓練進度的因子
+        progress = current_step / max(total_steps, 1)
+        progress_factor = 0.5 + 0.5 * progress  # 從0.5增長到1.0
+
+        # 3. 基於數值範圍的因子
+        pred_range = torch.max(model_pred) - torch.min(model_pred)
+        target_range = torch.max(target) - torch.min(target)
+        range_factor = torch.sigmoid(torch.log(pred_range / (target_range + 1e-8)))
+
+        # 4. 綜合計算
+        base_stability = 1.0
+        stability_factor = base_stability * error_stability * progress_factor * range_factor
+
+        # 限制範圍並確保數值穩定
+        stability_factor = torch.clamp(stability_factor, 0.1, 2.0)
+
+        return stability_factor
+
+def stable_mse_loss(model_pred: torch.Tensor, target: torch.Tensor, reduction: str = 'none') -> torch.Tensor:
+    """
+    基於 https://arxiv.org/pdf/2501.04697 的數值穩定版 MSE Loss (StableMSE)。
+
+    參考 StableMax 的概念，在 MSE 計算中引入數值穩定性改進。
+    這種方法可以防止在大預測誤差時出現的數值不穩定問題。
+
+    Args:
+        model_pred (torch.Tensor): 模型預測值，shape 為 (batch_size, ...)
+        target (torch.Tensor): 目標值，shape 與 model_pred 相同
+        reduction (str): 損失縮減方式，'none' | 'mean' | 'sum'
+
+    Returns:
+        torch.Tensor: 穩定化的 MSE 損失
+
+    數學原理:
+        傳統 MSE: L = (pred - target)²
+        穩定 MSE: L = (stable_pred - target)²
+        其中 stable_pred = pred - pred.detach() + pred.detach().clamp(-clip_value, clip_value)
+    """
+
+    # 1. 計算原始誤差
+    raw_diff = model_pred - target
+
+    # 2. 應用 StableMax 概念：創建穩定化的預測值
+    # 使用 detach 避免梯度傳播到穩定化項
+    pred_detached = model_pred.detach()
+
+    # 3. 設定穩定化的裁剪範圍（可調整）
+    # 根據輸入數值範圍自適應調整裁剪值
+    with torch.no_grad():
+        pred_std = torch.std(pred_detached)
+        clip_value = 3.0 * pred_std + 1e-8  # 3-sigma 規則
+
+    # 4. 創建穩定化的預測值
+    # 保持梯度流動但限制數值範圍
+    stable_pred_detached = torch.clamp(pred_detached, -clip_value, clip_value)
+    stable_pred = model_pred - pred_detached + stable_pred_detached
+
+    # 5. 計算穩定化的誤差
+    stable_diff = stable_pred - target
+
+    # 6. 計算平方誤差（MSE 的核心）
+    squared_error = stable_diff.pow(2)
+
+    # 7. 應用額外的數值穩定性檢查
+    # 防止極端值影響訓練
+    squared_error = torch.where(
+        torch.isfinite(squared_error),
+        squared_error,
+        torch.zeros_like(squared_error)
+    )
+
+    # 8. 應用 reduction 策略
+    if reduction == 'mean':
+        return squared_error.mean()
+    elif reduction == 'sum':
+        return squared_error.sum()
+    else:
+        return squared_error
+
+def stable_cross_entropy_loss(model_pred: torch.Tensor, target: torch.Tensor,
+                             reduction: str = 'none', eps: float = 1e-8) -> torch.Tensor:
+    """
+    基於 https://arxiv.org/pdf/2501.04697 的數值穩定版交叉熵損失函數。
+
+    Args:
+        model_pred: 模型預測值 (logits)，shape: [batch_size, num_classes] 或 [batch_size, ...]
+        target: 目標值，shape 與 model_pred 相同或 [batch_size] (class indices)
+        reduction: 'mean', 'sum', 或 'none'
+        eps: 數值穩定性的小常數
+
+    Returns:
+        loss: 與 mse_loss 相同結構的損失值
+    """
+    # 保存原始形狀
+    original_pred_shape = model_pred.shape
+    original_target_shape = target.shape
+
+    # 強制展平到2D
+    batch_size = model_pred.size(0)
+    num_classes = model_pred.size(1) if model_pred.dim() > 1 else 1
+
+    # 展平 model_pred 到 [N, C]
+    if model_pred.dim() > 2:
+        model_pred_2d = model_pred.view(batch_size, num_classes, -1)
+        model_pred_2d = model_pred_2d.permute(0, 2, 1).contiguous()
+        model_pred_2d = model_pred_2d.view(-1, num_classes)
+    else:
+        model_pred_2d = model_pred.view(-1, num_classes)
+
+    # 展平 target
+    if target.dim() > 1:
+        if target.shape == original_pred_shape:
+            # target 是 one-hot 格式
+            target_2d = target.view(batch_size, num_classes, -1)
+            target_2d = target_2d.permute(0, 2, 1).contiguous()
+            target_2d = target_2d.view(-1, num_classes)
+        else:
+            # target 是索引格式
+            target_2d = target.view(-1)
+    else:
+        target_2d = target
+
+    # 轉換為概率分佈
+    if target_2d.dim() == 1:
+        target_probs = torch.nn.functional.one_hot(target_2d.long(), num_classes=num_classes).float()
+    else:
+        target_probs = target_2d
+
+    # 確保 target_probs 為正值且歸一化
+    target_probs = torch.clamp(target_probs, min=0.0)
+    target_probs = target_probs / (target_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # StableMax 計算
+    max_vals = model_pred_2d.max(dim=-1, keepdim=True)[0].detach()
+    stable_logits = model_pred_2d - max_vals
+    exp_logits = torch.exp(stable_logits)
+    probs = exp_logits / (exp_logits.sum(dim=-1, keepdim=True) + 1e-8)
+    # 確保概率在有效範圍內
+    probs = torch.clamp(probs, min=1e-8, max=1.0 - 1e-8)
+    # 計算對數概率
+    log_probs = torch.log(probs + 1e-8)
+    # 計算交叉熵
+    cross_entropy = -torch.sum(target_probs * log_probs, dim=-1)
+    # 簡單地對所有元素求平均，避免維度問題
+    loss = cross_entropy.mean()
+
+    # 根據當前維度進行填充
+    batch_size = original_pred_shape[0]
+    if loss.dim() == 0:  # 標量
+        # 擴展為 [B, 1, 1, 1]
+        loss = loss.expand(batch_size, 1, 1, 1)
+
+    elif loss.dim() == 1:  # [N]
+        if loss.size(0) == batch_size:
+            # [B] -> [B, 1, 1, 1]
+            loss = loss.view(batch_size, 1, 1, 1)
+        else:
+            # [N] -> [B, 1, 1, N//B] 或類似的重塑
+            elements_per_batch = loss.size(0) // batch_size
+            if elements_per_batch * batch_size == loss.size(0):
+                loss = loss.view(batch_size, 1, 1, elements_per_batch)
+            else:
+                # 填充到最接近的大小
+                target_size = batch_size
+                if loss.size(0) > target_size:
+                    loss = loss[:target_size]
+                else:
+                    padding_size = target_size - loss.size(0)
+                    padding = loss[-1].expand(padding_size)
+                    loss = torch.cat([loss, padding])
+                loss = loss.view(batch_size, 1, 1, 1)
+
+    elif loss.dim() == 2:  # [B, N]
+        # [B, N] -> [B, 1, 1, N]
+        loss = loss.unsqueeze(1).unsqueeze(2)
+
+    elif loss.dim() == 3:  # [B, H, W] 或 [B, N, M]
+        # [B, H, W] -> [B, 1, H, W]
+        loss = loss.unsqueeze(1)
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
 
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, loss_type: str, reduction: str, huber_c: Optional[torch.Tensor] = None
+    model_pred: torch.Tensor, target: torch.Tensor, loss_type: str, reduction: str, huber_c: Optional[torch.Tensor] = None, current_step: int = 0, total_steps: int = 1000
 ):
     """
     NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
@@ -6064,6 +6479,47 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
+    elif loss_type == "stable_mse":
+        """
+        進階版穩定 MSE Loss，具有自適應穩定性控制。
+        """
+
+        # 計算標準 MSE
+        standard_mse = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+
+        # 計算穩定化 MSE
+        stable_mse = stable_mse_loss(model_pred, target, reduction=reduction)
+
+        # 自適應混合兩種損失
+        # 當誤差較大時，更多使用穩定化版本
+        stability_factor = compute_adaptive_stability_factor(model_pred, target, current_step, total_steps)
+        with torch.no_grad():
+            error_magnitude = torch.abs(model_pred - target)
+            error_std = torch.std(error_magnitude)
+            adaptive_weight = torch.sigmoid((error_magnitude - error_std) / (error_std + 1e-8))
+            adaptive_weight = adaptive_weight * stability_factor
+
+        # 混合損失
+        loss = (1 - adaptive_weight) * standard_mse + adaptive_weight * stable_mse
+
+        # 應用 reduction 方式
+        if reduction == 'mean':
+            loss = loss.mean()
+        elif reduction == 'sum':
+            loss = loss.sum()
+    elif loss_type == "stable_max":
+        # 處理單一值的情況（如 scalar tensor）
+        if model_pred.dim() == 0:
+            model_pred = model_pred.unsqueeze(0)
+        if target.dim() == 0:
+            target = target.unsqueeze(0)
+
+        # 如果只有一個類別，退化為MSE
+        if model_pred.size(-1) == 1:
+            loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+        else:
+            # 應用 StableMax 交叉熵
+            loss = stable_cross_entropy_loss(model_pred, target, reduction=reduction)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     return loss
@@ -6504,7 +6960,6 @@ def init_trackers(accelerator: Accelerator, args: argparse.Namespace, default_tr
 
         if "wandb" in [tracker.name for tracker in accelerator.trackers]:
             import wandb
-
             wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
 
             # Define specific metrics to handle validation and epochs "steps"
