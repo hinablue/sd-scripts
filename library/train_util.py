@@ -35,6 +35,7 @@ from library.automagic_adams import Automagic_AdamS
 from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
 from library.custom_hina_adaptive_adamw_memory_optimized import MemoryOptimizedAdaptiveHinaAdamW
+from library.hina_adaptive import HinaAdaptive
 from library.automagic_sinkgd import Automagic_Sinkgd
 from library.automagic_splus import Automagic_Splus
 
@@ -4846,6 +4847,18 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         logger.info(f"use Automagic_AdamS optimizer | {optimizer_kwargs}")
         optimizer_class = Automagic_AdamS
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "HinaAdaptive".lower():
+        logger.info(f"use Hina Adaptive optimizer | {optimizer_kwargs}")
+        optimizer_class = HinaAdaptive
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        # ログ出力追加の最適化情報
+        if hasattr(optimizer, 'get_optimization_info'):
+            opt_info = optimizer.get_optimization_info()
+            logger.info(f"Features: {opt_info['features']}")
+            logger.info(f"Adaptation: {opt_info['adaptation_config']}")
+            logger.info(f"Memory Optimization: {opt_info['memory_optimization']}")
 
     elif optimizer_type.endswith("8bit".lower()):
         try:
