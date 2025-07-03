@@ -333,6 +333,20 @@ class HinaAdaptive(torch.optim.Optimizer):
         max_buffer_memory_mb: int = 500,
         **kwargs
     ):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad,
+            optim_bits=optim_bits,
+            args=args,
+            percentile_clipping=percentile_clipping,
+            block_wise=block_wise,
+            is_paged=is_paged
+        )
+
+        super().__init__(params, defaults)
 
         # 原有功能開關
         self.use_spd = use_spd
