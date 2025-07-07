@@ -337,13 +337,15 @@ class HinaAdaptive(torch.optim.Optimizer):
         emergency_simplify: bool = True,
         max_buffer_memory_mb: int = 500,
         # 邊緣和背景過擬合控制參數
-        edge_suppression: bool = True,
+        edge_suppression: bool = False,
         edge_penalty: float = 0.1,
         background_regularization: bool = True,
-        spatial_awareness: bool = True,
+        # 空間感知
+        spatial_awareness: bool = False,
         frequency_penalty: float = 0.05,
         detail_preservation: float = 0.8,
         edge_threshold: float = 0.6,
+        # LoRA 低秩正則化
         lora_rank_penalty: bool = True,
         rank_penalty_strength: float = 0.01,
         low_rank_emphasis: float = 1.2,
@@ -1234,41 +1236,42 @@ class HinaAdaptive(torch.optim.Optimizer):
                 if self.use_agr:
                     grad = HinaAdaptive._apply_agr_regularization_optimized(grad)
 
-                # === 邊緣和背景過擬合控制 ===
-                # 邊緣感知的梯度正則化
-                if self.edge_suppression and len(grad.shape) >= 2:
-                    cache_key = f"edge_p_{param_id}_{state['step']}"
-                    edge_penalty = self._compute_edge_penalty_optimized(
-                        grad, self.edge_threshold, cache_key
-                    )
+                # === 邊緣和背景過擬合控制 ==
+                if len(grad.shape) >= 2:
+                    # 邊緣感知的梯度正則化
+                    if self.edge_suppression:
+                        cache_key = f"edge_p_{param_id}_{state['step']}"
+                        edge_penalty = self._compute_edge_penalty_optimized(
+                            grad, self.edge_threshold, cache_key
+                        )
 
-                    # 應用邊緣懲罰
-                    if edge_penalty.numel() > 0:
-                        edge_factor = 1.0 + self.edge_penalty * edge_penalty
-                        grad = grad * (1.0 / edge_factor)
+                        # 應用邊緣懲罰
+                        if edge_penalty.numel() > 0:
+                            edge_factor = 1.0 + self.edge_penalty * edge_penalty
+                            grad = grad * (1.0 / edge_factor)
 
-                        # 更新邊緣歷史
-                        if compact_state is not None:
-                            edge_history = compact_state.get_tensor('edge_history', target_device=grad.device)
-                            if edge_history is not None:
-                                edge_history = 0.9 * edge_history + 0.1 * edge_penalty
-                                compact_state.set_tensor('edge_history', edge_history)
-                                compact_state.set_scalar('edge_strength', torch.mean(edge_penalty).item())
+                            # 更新邊緣歷史
+                            if compact_state is not None:
+                                edge_history = compact_state.get_tensor('edge_history', target_device=grad.device)
+                                if edge_history is not None:
+                                    edge_history = 0.9 * edge_history + 0.1 * edge_penalty
+                                    compact_state.set_tensor('edge_history', edge_history)
+                                    compact_state.set_scalar('edge_strength', torch.mean(edge_penalty).item())
 
-                # 頻率感知的梯度調整
-                if self.spatial_awareness and len(grad.shape) >= 2:
-                    freq_penalty = self._compute_frequency_penalty_simplified(grad)
-                    if freq_penalty.numel() > 0:
-                        grad = grad - self.frequency_penalty * freq_penalty
+                    # 頻率感知的梯度調整
+                    if self.spatial_awareness:
+                        freq_penalty = self._compute_frequency_penalty_simplified(grad)
+                        if freq_penalty.numel() > 0:
+                            grad = grad - self.frequency_penalty * freq_penalty
 
-                        # 更新空間活動度
-                        if compact_state is not None:
-                            spatial_activity = torch.mean(torch.abs(freq_penalty)).item()
-                            compact_state.set_scalar('spatial_activity', spatial_activity)
+                            # 更新空間活動度
+                            if compact_state is not None:
+                                spatial_activity = torch.mean(torch.abs(freq_penalty)).item()
+                                compact_state.set_scalar('spatial_activity', spatial_activity)
 
-                # 應用空間感知正則化
-                if self.spatial_awareness and len(grad.shape) >= 2:
-                    grad = self._apply_spatial_awareness_regularization(grad, state)
+                    # 應用空間感知正則化
+                    if self.spatial_awareness:
+                        grad = self._apply_spatial_awareness_regularization(grad, state)
 
                 # LoRA 低秩正則化
                 if self.lora_rank_penalty and len(param.shape) == 2:
