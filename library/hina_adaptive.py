@@ -281,6 +281,11 @@ class HinaAdaptive(torch.optim.Optimizer):
     3. 壓縮狀態存儲：減少 Python 對象開銷
     4. 異步計算：非關鍵計算異步執行
     5. 自適應記憶體管理：根據記憶體壓力調整策略
+    6. 邊緣和背景過擬合控制：
+       - 邊緣抑制：檢測並抑制邊緣梯度，防止邊緣過擬合
+       - 頻率感知：控制高頻噪聲，保持訓練穩定性
+       - 空間感知：基於空間變異數進行正則化
+       - LoRA 低秩正則化：針對 LoRA 層的秩懲罰機制
     """
 
     def __init__(
@@ -331,6 +336,17 @@ class HinaAdaptive(torch.optim.Optimizer):
         adaptive_features: bool = True,
         emergency_simplify: bool = True,
         max_buffer_memory_mb: int = 500,
+        # 邊緣和背景過擬合控制參數
+        edge_suppression: bool = True,
+        edge_penalty: float = 0.1,
+        background_regularization: bool = True,
+        spatial_awareness: bool = True,
+        frequency_penalty: float = 0.05,
+        detail_preservation: float = 0.8,
+        edge_threshold: float = 0.6,
+        lora_rank_penalty: bool = True,
+        rank_penalty_strength: float = 0.01,
+        low_rank_emphasis: float = 1.2,
         **kwargs
     ):
         defaults = dict(
@@ -387,10 +403,26 @@ class HinaAdaptive(torch.optim.Optimizer):
         self.adaptive_features = adaptive_features
         self.emergency_simplify = emergency_simplify
 
+        # 邊緣和背景過擬合控制配置
+        self.edge_suppression = edge_suppression
+        self.edge_penalty = edge_penalty
+        self.background_regularization = background_regularization
+        self.spatial_awareness = spatial_awareness
+        self.frequency_penalty = frequency_penalty
+        self.detail_preservation = detail_preservation
+        self.edge_threshold = edge_threshold
+        self.lora_rank_penalty = lora_rank_penalty
+        self.rank_penalty_strength = rank_penalty_strength
+        self.low_rank_emphasis = low_rank_emphasis
+
         # 初始化記憶體管理組件
         self.memory_monitor = MemoryMonitor(vram_budget_gb)
         self.buffer_pool = EnhancedBufferPool(max_buffer_memory_mb)
         self.async_manager = AsyncComputeManager()
+
+        # 初始化邊緣和背景過擬合控制組件
+        if self.edge_suppression:
+            self.edge_cache = {}  # 邊緣計算緩存
 
         # 壓縮狀態存儲
         self.compressed_relationships = CompressedRelationships()
@@ -450,6 +482,33 @@ class HinaAdaptive(torch.optim.Optimizer):
                     compact_state.set_scalar('lr_max', self.defaults['lr'])
                     compact_state.set_scalar('avg_lr', self.defaults['lr'])
                     compact_state.set_scalar('warmup_complete', 0.0)  # 0.0 = False, 1.0 = True
+
+                # 邊緣和背景過擬合控制狀態初始化
+                if self.edge_suppression:
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+                    shape = param.shape
+
+                    # 邊緣歷史追蹤
+                    compact_state.set_tensor('edge_history', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_tensor('edge_momentum', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_scalar('edge_strength', 0.0)
+
+                if self.spatial_awareness:
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+                    shape = param.shape
+
+                    # 空間感知狀態
+                    compact_state.set_tensor('spatial_variance', torch.ones(shape, device=device, dtype=torch.float32))
+                    compact_state.set_tensor('detail_tracker', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_scalar('spatial_activity', 0.0)
+
+                if self.lora_rank_penalty and len(param.shape) == 2:
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+                    min_dim = min(param.shape)
+
+                    # LoRA 低秩追蹤
+                    compact_state.set_tensor('rank_tracker', torch.zeros(min_dim, device=device, dtype=torch.float32))
+                    compact_state.set_scalar('rank_penalty_history', 0.0)
 
                 self.param_groups_metadata[group_idx]['compact_states'][param_id] = compact_state
 
@@ -903,6 +962,194 @@ class HinaAdaptive(torch.optim.Optimizer):
         damping_factor = (1 + state['momentum_alignment']) / 2
         return damping_factor
 
+    def _compute_edge_penalty_optimized(self, grad: torch.Tensor, threshold: float = 0.6,
+                                      cache_key: Optional[str] = None) -> torch.Tensor:
+        """
+        優化版邊緣懲罰計算，用於控制邊緣過擬合
+
+        Args:
+            grad: 梯度張量
+            threshold: 邊緣檢測閾值
+            cache_key: 緩存鍵值（可選）
+
+        Returns:
+            邊緣懲罰張量
+        """
+        if len(grad.shape) < 2:
+            return torch.zeros_like(grad)
+
+        # 檢查緩存（如果啟用）
+        if cache_key and hasattr(self, 'edge_cache'):
+            cached = self.edge_cache.get(cache_key)
+            if cached is not None and cached.shape == grad.shape:
+                return cached
+
+        with torch.no_grad():
+            # 使用緩衝區池獲取張量
+            laplacian = self.buffer_pool.get_buffer_with_priority(
+                grad.shape, grad.dtype, grad.device, priority='normal'
+            )
+
+            # 簡化的邊緣檢測：計算拉普拉斯算子
+            if len(grad.shape) == 2 and grad.shape[0] > 2 and grad.shape[1] > 2:
+                # 水平方向二階導數
+                laplacian[1:-1, :] = grad[2:, :] - 2 * grad[1:-1, :] + grad[:-2, :]
+                # 垂直方向二階導數
+                laplacian[:, 1:-1] += grad[:, 2:] - 2 * grad[:, 1:-1] + grad[:, :-2]
+
+            # 計算邊緣強度
+            edge_strength = torch.abs(laplacian)
+            edge_mask = (edge_strength > threshold).float()
+            result = edge_mask * edge_strength
+
+            # 緩存結果
+            if cache_key and hasattr(self, 'edge_cache'):
+                self.edge_cache[cache_key] = result.clone()
+
+            # 歸還緩衝區
+            self.buffer_pool.return_buffer(laplacian)
+
+            return result
+
+    def _compute_frequency_penalty_simplified(self, grad: torch.Tensor) -> torch.Tensor:
+        """
+        簡化版頻率懲罰計算，用於控制高頻噪聲
+
+        Args:
+            grad: 梯度張量
+
+        Returns:
+            頻率懲罰張量
+        """
+        if len(grad.shape) < 2:
+            return torch.zeros_like(grad)
+
+        with torch.no_grad():
+            # 使用簡化的高頻檢測：計算相鄰元素差異
+            if len(grad.shape) == 2:
+                h, w = grad.shape
+                if h > 1 and w > 1:
+                    # 獲取緩衝區
+                    result = self.buffer_pool.get_buffer_with_priority(
+                        grad.shape, grad.dtype, grad.device, priority='normal'
+                    )
+
+                    # 計算水平和垂直差異
+                    h_diff = torch.abs(grad[:, 1:] - grad[:, :-1])
+                    v_diff = torch.abs(grad[1:, :] - grad[:-1, :])
+
+                    # 組合差異信息
+                    result[:, 1:] = h_diff
+                    result[1:, :] += v_diff
+
+                    return result
+
+            return torch.zeros_like(grad)
+
+    def _lora_rank_regularization_fast(self, param: torch.Tensor, rank_strength: float = 0.01,
+                                     use_approx: bool = True) -> torch.Tensor:
+        """
+        快速 LoRA 低秩正則化，用於控制 LoRA 層過擬合
+
+        Args:
+            param: 參數張量
+            rank_strength: 秩正則化強度
+            use_approx: 是否使用近似方法
+
+        Returns:
+            低秩正則化懲罰張量
+        """
+        if len(param.shape) != 2:
+            return torch.zeros_like(param)
+
+        with torch.no_grad():
+            if use_approx:
+                # 使用近似方法：只考慮最大的幾個奇異值
+                # 計算協方差矩陣
+                if param.shape[0] <= param.shape[1]:
+                    cov = torch.mm(param, param.t())
+                else:
+                    cov = torch.mm(param.t(), param)
+
+                # 計算特徵值（只取前幾個）
+                try:
+                    eigenvals, _ = torch.linalg.eigh(cov)
+                    # 懲罰較大的特徵值（促進低秩）
+                    large_eigenvals = eigenvals[eigenvals.argsort(descending=True)[:10]]
+                    rank_penalty_scalar = torch.sum(large_eigenvals) * rank_strength
+
+                    # 創建梯度近似
+                    return param * rank_penalty_scalar
+                except Exception as e:
+                    logger.debug(f"LoRA 秩正則化計算失敗: {e}")
+                    return torch.zeros_like(param)
+            else:
+                # 完整 SVD（如果需要）
+                try:
+                    U, S, Vh = torch.linalg.svd(param, full_matrices=False)
+                    # 懲罰較大的奇異值
+                    large_s = S[S.argsort(descending=True)[:10]]
+                    rank_penalty = torch.sum(large_s) * rank_strength
+                    penalty_grad = U @ torch.diag(S * rank_penalty / torch.sum(S)) @ Vh
+                    return penalty_grad
+                except Exception as e:
+                    logger.debug(f"完整 SVD 秩正則化計算失敗: {e}")
+                    return torch.zeros_like(param)
+
+    def _apply_spatial_awareness_regularization(self, grad: torch.Tensor, state: dict) -> torch.Tensor:
+        """
+        應用空間感知正則化，用於控制空間過擬合
+
+        Args:
+            grad: 梯度張量
+            state: 參數狀態
+
+        Returns:
+            正則化後的梯度
+        """
+        if len(grad.shape) < 2:
+            return grad
+
+        with torch.no_grad():
+            # 初始化空間變異數追蹤
+            if 'spatial_variance' not in state:
+                state['spatial_variance'] = torch.ones_like(grad)
+
+            if 'detail_tracker' not in state:
+                state['detail_tracker'] = torch.zeros_like(grad)
+
+            # 計算局部變異數
+            local_variance = torch.zeros_like(grad)
+            if len(grad.shape) == 2 and grad.shape[0] > 2 and grad.shape[1] > 2:
+                # 計算3x3鄰域的變異數
+                for i in range(-1, 2):
+                    for j in range(-1, 2):
+                        if i == 0 and j == 0:
+                            continue
+
+                        # 計算偏移後的差異
+                        if i == 0:
+                            if j == 1:
+                                local_variance[:, :-1] += torch.pow(grad[:, 1:] - grad[:, :-1], 2)
+                            elif j == -1:
+                                local_variance[:, 1:] += torch.pow(grad[:, :-1] - grad[:, 1:], 2)
+                        elif j == 0:
+                            if i == 1:
+                                local_variance[:-1, :] += torch.pow(grad[1:, :] - grad[:-1, :], 2)
+                            elif i == -1:
+                                local_variance[1:, :] += torch.pow(grad[:-1, :] - grad[1:, :], 2)
+
+            # 更新空間變異數追蹤
+            state['spatial_variance'] = (
+                0.9 * state['spatial_variance'] +
+                0.1 * local_variance
+            )
+
+            # 基於空間變異數調整梯度
+            regularization_factor = 1.0 / (1.0 + state['spatial_variance'] * self.detail_preservation)
+
+            return grad * regularization_factor
+
     @torch.no_grad()
     def step(self, closure=None):
         """執行優化步驟 - 記憶體優化版本"""
@@ -986,6 +1233,55 @@ class HinaAdaptive(torch.optim.Optimizer):
                 # AGR 正則化
                 if self.use_agr:
                     grad = HinaAdaptive._apply_agr_regularization_optimized(grad)
+
+                # === 邊緣和背景過擬合控制 ===
+                # 邊緣感知的梯度正則化
+                if self.edge_suppression and len(grad.shape) >= 2:
+                    cache_key = f"edge_p_{param_id}_{state['step']}"
+                    edge_penalty = self._compute_edge_penalty_optimized(
+                        grad, self.edge_threshold, cache_key
+                    )
+
+                    # 應用邊緣懲罰
+                    if edge_penalty.numel() > 0:
+                        edge_factor = 1.0 + self.edge_penalty * edge_penalty
+                        grad = grad * (1.0 / edge_factor)
+
+                        # 更新邊緣歷史
+                        if compact_state is not None:
+                            edge_history = compact_state.get_tensor('edge_history', target_device=grad.device)
+                            if edge_history is not None:
+                                edge_history = 0.9 * edge_history + 0.1 * edge_penalty
+                                compact_state.set_tensor('edge_history', edge_history)
+                                compact_state.set_scalar('edge_strength', torch.mean(edge_penalty).item())
+
+                # 頻率感知的梯度調整
+                if self.spatial_awareness and len(grad.shape) >= 2:
+                    freq_penalty = self._compute_frequency_penalty_simplified(grad)
+                    if freq_penalty.numel() > 0:
+                        grad = grad - self.frequency_penalty * freq_penalty
+
+                        # 更新空間活動度
+                        if compact_state is not None:
+                            spatial_activity = torch.mean(torch.abs(freq_penalty)).item()
+                            compact_state.set_scalar('spatial_activity', spatial_activity)
+
+                # 應用空間感知正則化
+                if self.spatial_awareness and len(grad.shape) >= 2:
+                    grad = self._apply_spatial_awareness_regularization(grad, state)
+
+                # LoRA 低秩正則化
+                if self.lora_rank_penalty and len(param.shape) == 2:
+                    rank_penalty = self._lora_rank_regularization_fast(
+                        param, self.rank_penalty_strength, use_approx=True
+                    )
+                    if rank_penalty.numel() > 0:
+                        grad = grad + rank_penalty
+
+                        # 更新秩追蹤
+                        if compact_state is not None:
+                            rank_penalty_magnitude = torch.mean(torch.abs(rank_penalty)).item()
+                            compact_state.set_scalar('rank_penalty_history', rank_penalty_magnitude)
 
                 # 正交梯度投影
                 if self.use_orthogonal_grad:
@@ -1120,7 +1416,11 @@ class HinaAdaptive(torch.optim.Optimizer):
                 'tam': self.use_tam,
                 'dynamic_adaptation': self.use_dynamic_adaptation,
                 'lr_mask': self.use_lr_mask,
-                'dynamic_weight_decay': self.dynamic_weight_decay
+                'dynamic_weight_decay': self.dynamic_weight_decay,
+                'edge_suppression': self.edge_suppression,
+                'spatial_awareness': self.spatial_awareness,
+                'lora_rank_penalty': self.lora_rank_penalty,
+                'background_regularization': self.background_regularization
             },
             'adaptation_config': {
                 'adaptation_strength': self.adaptation_strength,
@@ -1135,6 +1435,14 @@ class HinaAdaptive(torch.optim.Optimizer):
                 'reduce_precision': self.reduce_precision,
                 'adaptive_features': self.adaptive_features,
                 'emergency_simplify': self.emergency_simplify
+            },
+            'edge_overfitting_control': {
+                'edge_penalty': self.edge_penalty,
+                'edge_threshold': self.edge_threshold,
+                'frequency_penalty': self.frequency_penalty,
+                'detail_preservation': self.detail_preservation,
+                'rank_penalty_strength': self.rank_penalty_strength,
+                'low_rank_emphasis': self.low_rank_emphasis
             },
             'current_memory_pressure': self.memory_monitor.check_memory_pressure()
         }
@@ -1228,6 +1536,10 @@ class HinaAdaptive(torch.optim.Optimizer):
 
         # 清理量化重要性分數
         self.quantized_importance_scores.clear()
+
+        # 清理邊緣緩存
+        if hasattr(self, 'edge_cache'):
+            self.edge_cache.clear()
 
         # 強制垃圾回收
         torch.cuda.empty_cache()
