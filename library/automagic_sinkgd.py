@@ -31,17 +31,17 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 1e-5,
-        min_lr: float = 1e-6,
-        max_lr: float = 1e-2,
-        lr_bump: float = 1e-5,
+        lr: float = 1e-6,
+        min_lr: float = 1e-7,
+        max_lr: float = 1e-3,
+        lr_bump: float = 3e-6,
         eta: float = 2,
         beta1: float = 0.9,
         d_coef: float = 2,
         weight_decay: float = 5e-4,
         weight_decay2: float = 1.0,
-        sinkgd_iters: int = 3,
-        warmup_steps: int = 500,
+        sinkgd_iters: int = 4,
+        warmup_steps: int = 250,
         full_finetune: bool = False,
         orthograd: bool = False,
         stats_update_freq: int = 5  # 新增：統計更新頻率
@@ -85,11 +85,8 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         state.setdefault("avg_lr", self.lr)
         state.setdefault("avg_lr_max", self.lr)
         state.setdefault("lr_max", self.lr)
-
-        state.setdefault("exp_avg", torch.zeros_like(p))
-        # lr_mask - 保持為 tensor 避免同步
-        state.setdefault('last_polarity', torch.zeros(shape, dtype=torch.bool, device=device))
         state.setdefault("lr_mask", torch.ones(shape, device=device, dtype=torch.float16) * self.lr)
+        state.setdefault('last_polarity', torch.zeros(shape, dtype=torch.bool, device=device))
 
         if group['full_finetune'] == False:
             state.setdefault("pre", None)
@@ -104,53 +101,15 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
 
     @staticmethod
     @torch.jit.script
-    def normalize_iteration(X, sqrt_n: float, sqrt_m: float, eps: float):
-        row_norm = torch.linalg.vector_norm(X, dim=1, keepdim=True) + eps
-        X = X * (sqrt_n / row_norm)
-        col_norm = torch.linalg.vector_norm(X, dim=0, keepdim=True) + eps
-        X = X * (sqrt_m / col_norm)
-        return X
-
-    @staticmethod
-    @torch.jit.script
     def _ratio(delta_new, delta_p):
         curr_norm, prev_norm = torch.norm(delta_new), torch.norm(delta_p)
         ratio = (curr_norm - prev_norm) / (curr_norm + 1e-8)
         return torch.nn.functional.hardtanh(ratio, 0.0, 1.0)
 
-    # Implementation from: https://github.com/LucasPrietoAl/grokking-at-the-edge-of-numerical-stability/blob/main/orthograd.py
-    @staticmethod
-    @torch.jit.script
-    def orthograd_(param: torch.Tensor,
-                      grad: torch.Tensor,
-                      eps: float = 1e-30) -> torch.Tensor:
-        """
-        JIT 版 Orthogonal Gradient 修正
-        Args:
-            param: 權重張量 (與 grad 同形狀)
-            grad : 梯度張量
-            eps  : 穩定常數
-        Returns:
-            與 grad 同形狀的修正梯度
-        """
-        # 扁平化計算投影
-        w = param.view(-1)
-        g = grad.view(-1)
-        g_norm = torch.norm(g, 2)
-
-        proj = torch.dot(w, g) / (torch.dot(w, w) + eps)
-        g_orth = g - proj * w
-
-        scale = g_norm / (torch.norm(g_orth, 2) + eps)
-        g_orth_scaled = g_orth * scale
-
-        return g_orth_scaled.view_as(grad)
-
     @staticmethod
     @torch.jit.script
     def fused_gradient_transform_2d(
         param: torch.Tensor,
-        exp_avg: torch.Tensor,
         grad: torch.Tensor,
         use_orthograd: bool,
         num_sinkgd_iter: int,
@@ -159,8 +118,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         """
         融合的 2D 張量梯度變換，合併 Grams + Orthograd + SinkGD
         """
-        # Grams: Gradient Descent with Adaptive Momentum Scaling
-        update = exp_avg + grad
+        update = grad.clone()
 
         # Orthograd: 正交梯度修正
         if use_orthograd:
@@ -229,23 +187,22 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            warmup_steps = group['warmup_steps']
-            # 預計算階段標記，減少分支 (優化建議 3)
-            is_early_warmup = self._step < warmup_steps / 2
-            is_post_warmup = self._step > warmup_steps
-            use_weight_decay = is_early_warmup and self.weight_decay > 0
-
-            if use_weight_decay:
-                grads_this_group = []
-                for p in group["params"]:
-                    if p.grad is not None:
-                        grads_this_group.append(p.grad.view(-1))
-                if len(grads_this_group) == 0:
-                    continue
-                # 批次化統計更新 (優化建議 2)
-                self._update_cached_stats(grads_this_group, self._step, group)
-                mean_norm = self._cached_stats['mean_norm']
-                std_norm = self._cached_stats['std_norm']
+            is_early_warmup = self._step <= self.warmup_steps
+            use_warmup, use_weight_decay = False, False
+            if self._step % 1000 <= self.warmup_steps:
+                use_warmup = True
+                if self.weight_decay > 0 and is_early_warmup:
+                    use_weight_decay = True
+                    grads_this_group = []
+                    for p in group["params"]:
+                        if p.grad is not None:
+                            grads_this_group.append(p.grad.view(-1))
+                    if len(grads_this_group) == 0:
+                        continue
+                    # 批次化統計更新 (優化建議 2)
+                    self._update_cached_stats(grads_this_group, self._step, group)
+                    mean_norm = self._cached_stats['mean_norm']
+                    std_norm = self._cached_stats['std_norm']
 
             for p in group['params']:
                 if p.grad is None:
@@ -258,86 +215,61 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 step = state['step']
                 self._step = state["step"] + 1
                 grad = p.grad.data
-                beta1 = group['beta1']
-                exp_avg = state['exp_avg']
-
-                if state['step'] == 1:
-                    # === ADOPT ===
-                    #ADOPT: Modified Adam Can Converge with Any β_2 with the Optimal Rate
-                    #https://arxiv.org/abs/2411.02853
-                    #https://github.com/iShohei220/adopt
-                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                    state['last_polarity'] = grad > 0
-                    continue
 
                 # 使用融合的 JIT 函數進行梯度變換 (優化建議 1)
                 if grad.ndim == 2:
-                    use_orthograd = group["orthograd"] and is_post_warmup
+                    use_orthograd = group["orthograd"] and not is_early_warmup
                     update = self.fused_gradient_transform_2d(
                         p.data,
-                        exp_avg,
                         grad,
                         use_orthograd,
                         self.sinkgd_iters
                     )
                 else:
-                    update = self.fused_gradient_transform_1d(exp_avg, grad)
-
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    update = grad.clone()
 
                 condition = 0.0
-                if group['d_coef'] != 1 and is_early_warmup:
-                    delta_p = p - state["pre"] if state["pre"] is not None else p
+                if use_warmup:
+                    if 'pre' not in state:
+                        state.setdefault("pre", None)
+                    delta_p = p - state["pre"] if state["pre"] else p
+                    pre = state["pre"] if state["pre"] else torch.zeros_like(p)
                     condition = -torch.sum(p.grad * delta_p)
-                else:
-                    if 'pre' in state:
-                        del state["pre"]
 
-                allora = state.get("row_scaling", torch.tensor(1.0))
-                lr_decay = 1.0
-                if is_early_warmup:
+                # ==== Automagic lrmask ====
+                # https://github.com/ostris/ai-toolkit/blob/main/toolkit/optimizers/automagic.py
+                lr_decay = 1
+                if state["step"] > group["warmup_steps"]:
+                    if group["lr"] > state["lr_max"]:
+                        state["lr_max"] = group["lr"]
+                    elif group["lr"] < state["lr_max"]:
+                        lr_decay = group["lr"] / state["lr_max"]
+
+                if use_warmup:
+                    if 'last_polarity' not in state:
+                        state.setdefault('last_polarity', torch.zeros(shape, dtype=torch.bool, device=device))
                     last_polarity = state['last_polarity']
                     lr_mask = state['lr_mask']
                     lr_bump, d_coef= self.lr_bump, group["d_coef"]
-
+                    lr_bump = lr_bump * min(state["step"] / 200, 1)
+                    #Prodigy: An Expeditiously Adaptive Parameter-Free Learner
+                    #https://arxiv.org/pdf/2306.06101
+                    #https://github.com/konstmish/prodigy
                     current_polarity = grad > 0
                     same = (last_polarity == current_polarity).to(torch.float16)
                     state['last_polarity'] = current_polarity
-                    if is_early_warmup:
-                        if condition >= 0.0:
-                            lr_adjustment = (d_coef * same - (1 - same)) * lr_bump
-                        elif condition < 0.0:
-                            lr_adjustment = (same - d_coef * (1 - same)) * lr_bump
+                    if condition > 0.0:
+                        lr_adjustment = (d_coef * same - (1 - same)) * lr_bump
+                    elif condition < 0.0:
+                        lr_adjustment = (same - d_coef * (1 - same)) * lr_bump
                     else:
                         lr_adjustment = (same * 2 - 1) * lr_bump
                     lr_mask.add_(lr_adjustment).clamp_(min=self.min_lr, max=self.max_lr)
                     state['avg_lr'] = state['lr_mask'].mean().item()
-                    if self._step % 25 == 0:
+
+                    if state['step'] % 25 == 0:
                         lr_mask_f = lr_mask.float()
-                        lr_medians = torch.quantile(
-                            lr_mask_f, torch.tensor([0.9, 0.7, 0.5, 0.3, 0.1], device=lr_mask.device)
-                        )
-                        diff = torch.stack([torch.abs(lr_mask_f - m) for m in lr_medians], dim=-1)
-                        nearest_idx = torch.argmin(diff, dim=-1)
-                        lr_mask_flat = lr_mask.flatten()
-                        nearest_idx_flat = nearest_idx.flatten()
-                        lr_mask_flat = lr_medians[nearest_idx_flat]
-                        state['lr_mask'] = lr_mask_flat.view_as(lr_mask).to(torch.float16)
-                        state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
-                    new_lr = state['lr_mask']
-                    new_lr = new_lr * allora
-                else:
-                    if group["lr"] > state["lr_max"]:
-                        state["lr_max"] = group["lr"]
-                    lr_decay = max(group["lr"] / state["lr_max"], 0.1)
-                    if "last_polarity" in state:
-                        del state['last_polarity']
-                        lr_mask = state['lr_mask']
-                        lr_mask.mul_(allora)
-                        lr_mask_f = lr_mask.float()
-                        lr_medians = torch.quantile(
-                            lr_mask_f, torch.tensor([0.9, 0.7, 0.5, 0.3, 0.1], device=lr_mask.device)
-                        )
+                        lr_medians = torch.quantile(lr_mask_f, torch.tensor([0.9,0.7, 0.5, 0.3, 0.1], device=lr_mask.device))
                         diff = torch.stack([torch.abs(lr_mask_f - m) for m in lr_medians], dim=-1)
                         nearest_idx = torch.argmin(diff, dim=-1)
                         lr_mask_flat = lr_mask.flatten()
@@ -345,23 +277,32 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                         lr_mask_flat = lr_medians[nearest_idx_flat]
                         state['lr_mask'] = lr_mask_flat.view_as(lr_mask).to(torch.float16)
                         state['avg_lr'] = state['lr_mask'].mean().item()
-                        state['avg_lr_max'] = max(state['avg_lr'], state['avg_lr_max'])
-                    new_lr = state['lr_mask'] * lr_decay
-                # ==== VRAdam ====
-                vr = 1 / (1 + min(3 * (exp_avg ** 2).sum(), 10))
-                update = update.mul_(new_lr * vr)
-                p.add_(-update)
 
-                # 權重衰減處理
-                if use_weight_decay:
-                    param_abs_grad = torch.abs(p.grad).mean()
-                    norm_grad = (param_abs_grad - mean_norm) / std_norm
-                    ada_alpha = 4
-                    theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
-                    if condition < 0.0:
-                        weight_decay = state['avg_lr'] * allora.mean().item() * vr * group["weight_decay2"] * theta
+                allora = state.get("row_scaling", torch.tensor(1.0))
+                new_lr = state['lr_mask']
+
+                lr_tweak = lr_decay * allora
+                new_lr = new_lr * lr_tweak
+                update.mul_(new_lr)
+
+                if is_early_warmup:
+                    if condition < 0.0 and group["weight_decay2"] > 0:
+                        new_p = p - update
+                        delta_n = new_p - pre if state["pre"] else new_p
+                        ratio = self._ratio(delta_n, delta_p)
+                        new_p = new_p - group["weight_decay2"] * ratio * delta_n
+                        p.copy_(new_p)
+                    elif use_weight_decay:
+                        param_abs_grad = torch.abs(p.grad).mean()
+                        norm_grad = (param_abs_grad - mean_norm) / std_norm
+                        ada_alpha = 4
+                        theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
+                        weight_decay = state['avg_lr'] * allora.mean().item() * group["weight_decay"] * theta
+                        p.data.mul_(1 - weight_decay)
+                        p.add_(-update)
                     else:
-                        weight_decay = state['avg_lr'] * allora.mean().item() * vr * group["weight_decay"] * theta
-                    p.data.mul_(1 - weight_decay)
+                        p.add_(-update)
+                else:
+                    p.add_(-update)
 
         return loss
