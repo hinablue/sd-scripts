@@ -346,9 +346,19 @@ class HinaAdaptive(torch.optim.Optimizer):
         detail_preservation: float = 0.8,
         edge_threshold: float = 0.6,
         # LoRA 低秩正則化
-        lora_rank_penalty: bool = True,
+        lora_rank_penalty: bool = False,
         rank_penalty_strength: float = 0.01,
         low_rank_emphasis: float = 1.2,
+        # === 新增：傅立葉特徵損失超解析度優化參數 ===
+        fourier_feature_loss: bool = False,
+        super_resolution_mode: bool = False,
+        fourier_high_freq_preservation: float = 0.3,
+        fourier_detail_enhancement: float = 0.2,
+        fourier_blur_suppression: float = 0.15,
+        super_resolution_scale: int = 4,  # 2x, 4x, 8x 等
+        adaptive_frequency_weighting: bool = True,
+        texture_coherence_penalty: float = 0.1,
+        frequency_domain_lr_scaling: bool = True,
         **kwargs
     ):
         defaults = dict(
@@ -417,6 +427,17 @@ class HinaAdaptive(torch.optim.Optimizer):
         self.rank_penalty_strength = rank_penalty_strength
         self.low_rank_emphasis = low_rank_emphasis
 
+        # === 新增：傅立葉特徵損失超解析度優化參數 ===
+        self.fourier_feature_loss = fourier_feature_loss
+        self.super_resolution_mode = super_resolution_mode
+        self.fourier_high_freq_preservation = fourier_high_freq_preservation
+        self.fourier_detail_enhancement = fourier_detail_enhancement
+        self.fourier_blur_suppression = fourier_blur_suppression
+        self.super_resolution_scale = super_resolution_scale
+        self.adaptive_frequency_weighting = adaptive_frequency_weighting
+        self.texture_coherence_penalty = texture_coherence_penalty
+        self.frequency_domain_lr_scaling = frequency_domain_lr_scaling
+
         # 初始化記憶體管理組件
         self.memory_monitor = MemoryMonitor(vram_budget_gb)
         self.buffer_pool = EnhancedBufferPool(max_buffer_memory_mb)
@@ -425,6 +446,13 @@ class HinaAdaptive(torch.optim.Optimizer):
         # 初始化邊緣和背景過擬合控制組件
         if self.edge_suppression:
             self.edge_cache = {}  # 邊緣計算緩存
+
+        # === 新增：初始化傅立葉特徵損失組件 ===
+        if self.fourier_feature_loss:
+            self.fourier_cache = {}  # 傅立葉計算緩存
+            self.frequency_weights = {}  # 自適應頻率權重
+            self.texture_history = {}  # 紋理一致性歷史
+            logger.info(f"傅立葉特徵損失已啟用，超解析度模式：{self.super_resolution_mode}，放大倍數：{self.super_resolution_scale}x")
 
         # 壓縮狀態存儲
         self.compressed_relationships = CompressedRelationships()
@@ -511,6 +539,31 @@ class HinaAdaptive(torch.optim.Optimizer):
                     # LoRA 低秩追蹤
                     compact_state.set_tensor('rank_tracker', torch.zeros(min_dim, device=device, dtype=torch.float32))
                     compact_state.set_scalar('rank_penalty_history', 0.0)
+
+                # === 新增：傅立葉特徵損失狀態初始化 ===
+                if self.fourier_feature_loss:
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+                    shape = param.shape
+
+                    # 傅立葉域特徵追蹤
+                    compact_state.set_tensor('fourier_high_freq_tracker', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_tensor('fourier_detail_momentum', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_scalar('texture_coherence_score', 1.0)
+                    compact_state.set_scalar('frequency_domain_lr_scale', 1.0)
+                    compact_state.set_scalar('blur_suppression_strength', self.fourier_blur_suppression)
+
+                    # 自適應頻率權重狀態
+                    if self.adaptive_frequency_weighting:
+                        compact_state.set_scalar('adaptive_low_freq_weight', 1.0)
+                        compact_state.set_scalar('adaptive_mid_freq_weight', 1.0)
+                        compact_state.set_scalar('adaptive_high_freq_weight', 1.0)
+                        compact_state.set_scalar('freq_weight_adaptation_rate', 0.01)
+                        compact_state.set_scalar('freq_weight_momentum', 0.9)
+
+                    # 超解析度特定狀態
+                    if self.super_resolution_mode and len(shape) >= 2:
+                        compact_state.set_tensor('sr_frequency_mask', torch.ones(shape, device=device, dtype=torch.float32))
+                        compact_state.set_scalar('sr_detail_preservation_factor', 1.0)
 
                 self.param_groups_metadata[group_idx]['compact_states'][param_id] = compact_state
 
@@ -1152,6 +1205,473 @@ class HinaAdaptive(torch.optim.Optimizer):
 
             return grad * regularization_factor
 
+    # === 新增：傅立葉特徵損失超解析度優化方法 ===
+
+    def _compute_fourier_feature_loss_optimized(self, grad: torch.Tensor, param: torch.Tensor,
+                                              compact_state, param_id: int) -> torch.Tensor:
+        """
+        計算傅立葉特徵損失，針對超解析度優化
+
+        Args:
+            grad: 梯度張量
+            param: 參數張量
+            compact_state: 緊湊狀態
+            param_id: 參數ID
+
+        Returns:
+            傅立葉特徵調整後的梯度
+        """
+        if len(grad.shape) < 2:
+            return grad
+
+        with torch.no_grad():
+            cache_key = f"fourier_p_{param_id}"
+
+            # 檢查緩存
+            if hasattr(self, 'fourier_cache') and cache_key in self.fourier_cache:
+                cached_data = self.fourier_cache[cache_key]
+                if cached_data['shape'] == grad.shape:
+                    fourier_features = cached_data['features']
+                else:
+                    fourier_features = self._compute_fourier_features(grad, cache_key, compact_state)
+            else:
+                fourier_features = self._compute_fourier_features(grad, cache_key, compact_state)
+
+            # 應用傅立葉特徵調整
+            adjusted_grad = self._apply_fourier_adjustments(
+                grad, fourier_features, compact_state, param_id
+            )
+
+            return adjusted_grad
+
+    def _compute_fourier_features(self, grad: torch.Tensor, cache_key: str, compact_state=None) -> Dict[str, torch.Tensor]:
+        """
+        計算傅立葉域特徵分析
+
+        Args:
+            grad: 梯度張量
+            cache_key: 緩存鍵值
+            compact_state: 緊湊狀態（用於自適應頻率權重）
+
+        Returns:
+            傅立葉特徵字典
+        """
+        # 2D FFT 分析
+        grad_fft = torch.fft.fft2(grad)
+        magnitude = torch.abs(grad_fft)
+        phase = torch.angle(grad_fft)
+
+        h, w = grad.shape[-2:]
+        center_h, center_w = h // 2, w // 2
+
+        # 創建頻率座標
+        freq_y = torch.fft.fftfreq(h, device=grad.device).unsqueeze(1)
+        freq_x = torch.fft.fftfreq(w, device=grad.device).unsqueeze(0)
+        freq_radius = torch.sqrt(freq_y**2 + freq_x**2)
+
+        # 定義頻率段
+        low_freq_mask = freq_radius <= 0.1
+        mid_freq_mask = (freq_radius > 0.1) & (freq_radius <= 0.3)
+        high_freq_mask = freq_radius > 0.3
+
+        # 超解析度特定的頻率分析
+        if self.super_resolution_mode:
+            # 針對不同放大倍數調整頻率範圍
+            scale_factor = 1.0 / self.super_resolution_scale
+            high_freq_threshold = 0.5 - scale_factor * 0.1
+            high_freq_mask = freq_radius > high_freq_threshold
+
+        # 計算不同頻段的能量
+        low_freq_energy = torch.sum(magnitude * low_freq_mask.float())
+        mid_freq_energy = torch.sum(magnitude * mid_freq_mask.float())
+        high_freq_energy = torch.sum(magnitude * high_freq_mask.float())
+
+        # 計算紋理一致性指標
+        texture_coherence = self._compute_texture_coherence(magnitude, freq_radius)
+
+        # 計算模糊指標
+        blur_indicator = low_freq_energy / (high_freq_energy + 1e-8)
+
+        # === 自適應頻率權重計算 ===
+        adaptive_weights = {'low': 1.0, 'mid': 1.0, 'high': 1.0}
+        if self.adaptive_frequency_weighting and compact_state is not None:
+            adaptive_weights = self._compute_adaptive_frequency_weights(
+                low_freq_energy, mid_freq_energy, high_freq_energy, compact_state
+            )
+
+        fourier_features = {
+            'magnitude': magnitude,
+            'phase': phase,
+            'freq_radius': freq_radius,
+            'low_freq_mask': low_freq_mask,
+            'mid_freq_mask': mid_freq_mask,
+            'high_freq_mask': high_freq_mask,
+            'low_freq_energy': low_freq_energy,
+            'mid_freq_energy': mid_freq_energy,
+            'high_freq_energy': high_freq_energy,
+            'texture_coherence': texture_coherence,
+            'blur_indicator': blur_indicator,
+            'adaptive_weights': adaptive_weights
+        }
+
+        # 緩存結果
+        if hasattr(self, 'fourier_cache'):
+            self.fourier_cache[cache_key] = {
+                'features': fourier_features,
+                'shape': grad.shape
+            }
+
+        return fourier_features
+
+    def _compute_adaptive_frequency_weights(self, low_freq_energy: torch.Tensor, mid_freq_energy: torch.Tensor,
+                                          high_freq_energy: torch.Tensor, compact_state) -> Dict[str, float]:
+        """
+        計算自適應頻率權重
+
+        Args:
+            low_freq_energy: 低頻能量
+            mid_freq_energy: 中頻能量
+            high_freq_energy: 高頻能量
+            compact_state: 緊湊狀態
+
+        Returns:
+            自適應頻率權重字典
+        """
+        # 獲取當前權重
+        current_low_weight = compact_state.get_scalar('adaptive_low_freq_weight', 1.0)
+        current_mid_weight = compact_state.get_scalar('adaptive_mid_freq_weight', 1.0)
+        current_high_weight = compact_state.get_scalar('adaptive_high_freq_weight', 1.0)
+
+        adaptation_rate = compact_state.get_scalar('freq_weight_adaptation_rate', 0.01)
+        momentum = compact_state.get_scalar('freq_weight_momentum', 0.9)
+
+        # 計算總能量和比例
+        total_energy = low_freq_energy + mid_freq_energy + high_freq_energy + 1e-8
+        low_ratio = (low_freq_energy / total_energy).item()
+        mid_ratio = (mid_freq_energy / total_energy).item()
+        high_ratio = (high_freq_energy / total_energy).item()
+
+        # 目標權重基於超解析度模式
+        if self.super_resolution_mode:
+            # 超解析度模式：強調高頻
+            target_low_weight = 0.5 + 0.3 * (1.0 - high_ratio)  # 高頻低時增強低頻權重
+            target_mid_weight = 0.8 + 0.4 * mid_ratio  # 中頻權重適中
+            target_high_weight = 1.2 + 0.8 * high_ratio  # 高頻高時進一步增強
+        else:
+            # 普通模式：平衡權重
+            target_low_weight = 1.0 - 0.2 * max(0, low_ratio - 0.6)  # 低頻過高時降權
+            target_mid_weight = 1.0 + 0.2 * mid_ratio  # 中頻略微增強
+            target_high_weight = 0.8 + 0.4 * high_ratio  # 高頻適度增強
+
+        # 使用動量更新權重
+        new_low_weight = momentum * current_low_weight + (1 - momentum) * target_low_weight
+        new_mid_weight = momentum * current_mid_weight + (1 - momentum) * target_mid_weight
+        new_high_weight = momentum * current_high_weight + (1 - momentum) * target_high_weight
+
+        # 限制權重範圍
+        new_low_weight = max(0.1, min(2.0, new_low_weight))
+        new_mid_weight = max(0.1, min(2.0, new_mid_weight))
+        new_high_weight = max(0.1, min(3.0, new_high_weight))
+
+        # 更新狀態
+        compact_state.set_scalar('adaptive_low_freq_weight', new_low_weight)
+        compact_state.set_scalar('adaptive_mid_freq_weight', new_mid_weight)
+        compact_state.set_scalar('adaptive_high_freq_weight', new_high_weight)
+
+        return {
+            'low': new_low_weight,
+            'mid': new_mid_weight,
+            'high': new_high_weight
+        }
+
+    def _compute_texture_coherence(self, magnitude: torch.Tensor, freq_radius: torch.Tensor) -> torch.Tensor:
+        """
+        計算紋理一致性指標
+
+        Args:
+            magnitude: 頻率幅度
+            freq_radius: 頻率半徑
+
+        Returns:
+            紋理一致性分數
+        """
+        # 計算方向性頻率分布
+        h, w = magnitude.shape[-2:]
+        center_h, center_w = h // 2, w // 2
+
+        # 創建角度網格
+        y_coords = torch.arange(h, device=magnitude.device, dtype=torch.float32) - center_h
+        x_coords = torch.arange(w, device=magnitude.device, dtype=torch.float32) - center_w
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        angles = torch.atan2(y_grid, x_grid)
+
+        # 計算不同方向的能量分布
+        num_sectors = 8
+        sector_energies = []
+
+        for i in range(num_sectors):
+            angle_start = -torch.pi + i * 2 * torch.pi / num_sectors
+            angle_end = -torch.pi + (i + 1) * 2 * torch.pi / num_sectors
+
+            sector_mask = ((angles >= angle_start) & (angles < angle_end)).float()
+            sector_energy = torch.sum(magnitude * sector_mask)
+            sector_energies.append(sector_energy)
+
+        sector_energies = torch.stack(sector_energies)
+
+        # 計算方向一致性（標準差越小越一致）
+        energy_std = torch.std(sector_energies)
+        energy_mean = torch.mean(sector_energies)
+        coherence = torch.exp(-energy_std / (energy_mean + 1e-8))
+
+        return coherence
+
+    def _apply_fourier_adjustments(self, grad: torch.Tensor, fourier_features: Dict[str, torch.Tensor],
+                                 compact_state, param_id: int) -> torch.Tensor:
+        """
+        基於傅立葉特徵調整梯度
+
+        Args:
+            grad: 原始梯度
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+            param_id: 參數ID
+
+        Returns:
+            調整後的梯度
+        """
+        adjusted_grad = grad.clone()
+
+        # 獲取自適應頻率權重
+        adaptive_weights = fourier_features.get('adaptive_weights', {'low': 1.0, 'mid': 1.0, 'high': 1.0})
+
+        # 1. 高頻細節保持調整
+        if self.fourier_high_freq_preservation > 0:
+            high_freq_adjustment = self._compute_high_freq_preservation(
+                grad, fourier_features, compact_state
+            )
+            # 應用自適應高頻權重
+            adaptive_high_freq_strength = self.fourier_high_freq_preservation * adaptive_weights['high']
+            adjusted_grad = adjusted_grad + adaptive_high_freq_strength * high_freq_adjustment
+
+        # 2. 模糊抑制調整
+        if self.fourier_blur_suppression > 0:
+            blur_suppression_adjustment = self._compute_blur_suppression(
+                grad, fourier_features, compact_state
+            )
+            # 模糊抑制主要影響高頻，應用高頻權重
+            adaptive_blur_strength = self.fourier_blur_suppression * adaptive_weights['high']
+            adjusted_grad = adjusted_grad + adaptive_blur_strength * blur_suppression_adjustment
+
+        # 3. 紋理一致性調整
+        if self.texture_coherence_penalty > 0:
+            texture_adjustment = self._compute_texture_coherence_penalty(
+                grad, fourier_features, compact_state
+            )
+            # 紋理一致性涉及中高頻，使用中頻和高頻權重的平均
+            adaptive_texture_strength = self.texture_coherence_penalty * (adaptive_weights['mid'] + adaptive_weights['high']) / 2.0
+            adjusted_grad = adjusted_grad - adaptive_texture_strength * texture_adjustment
+
+        # 4. 超解析度特定調整
+        if self.super_resolution_mode:
+            sr_adjustment = self._compute_super_resolution_adjustment(
+                grad, fourier_features, compact_state
+            )
+            # 超解析度主要強調高頻細節，應用高頻權重
+            adaptive_sr_strength = self.fourier_detail_enhancement * adaptive_weights['high']
+            adjusted_grad = adjusted_grad + adaptive_sr_strength * sr_adjustment
+
+        # 5. 更新狀態
+        self._update_fourier_states(fourier_features, compact_state)
+
+        return adjusted_grad
+
+    def _compute_high_freq_preservation(self, grad: torch.Tensor, fourier_features: Dict[str, torch.Tensor],
+                                      compact_state) -> torch.Tensor:
+        """
+        計算高頻細節保持調整
+
+        Args:
+            grad: 梯度張量
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+
+        Returns:
+            高頻保持調整張量
+        """
+        magnitude = fourier_features['magnitude']
+        high_freq_mask = fourier_features['high_freq_mask']
+
+        # 增強高頻成分
+        enhanced_magnitude = magnitude.clone()
+        enhanced_magnitude[high_freq_mask] *= 1.5  # 增強高頻
+
+        # 重建調整後的梯度
+        phase = fourier_features['phase']
+        enhanced_fft = enhanced_magnitude * torch.exp(1j * phase)
+        enhanced_grad = torch.real(torch.fft.ifft2(enhanced_fft))
+
+        # 計算調整量
+        adjustment = enhanced_grad - grad
+
+        # 使用動量平滑
+        fourier_momentum = compact_state.get_tensor('fourier_detail_momentum', target_device=grad.device)
+        if fourier_momentum is not None:
+            fourier_momentum = 0.9 * fourier_momentum + 0.1 * adjustment
+            compact_state.set_tensor('fourier_detail_momentum', fourier_momentum)
+            return fourier_momentum
+        else:
+            compact_state.set_tensor('fourier_detail_momentum', adjustment * 0.1)
+            return adjustment * 0.1
+
+    def _compute_blur_suppression(self, grad: torch.Tensor, fourier_features: Dict[str, torch.Tensor],
+                                compact_state) -> torch.Tensor:
+        """
+        計算模糊抑制調整
+
+        Args:
+            grad: 梯度張量
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+
+        Returns:
+            模糊抑制調整張量
+        """
+        blur_indicator = fourier_features['blur_indicator']
+
+        # 如果檢測到模糊（低頻能量過高），增強梯度
+        if blur_indicator > 2.0:  # 閾值可調
+            magnitude = fourier_features['magnitude']
+            high_freq_mask = fourier_features['high_freq_mask']
+
+            # 對高頻進行銳化
+            sharpened_magnitude = magnitude.clone()
+            sharpened_magnitude[high_freq_mask] *= (1.0 + blur_indicator * 0.1)
+
+            # 重建銳化後的梯度
+            phase = fourier_features['phase']
+            sharpened_fft = sharpened_magnitude * torch.exp(1j * phase)
+            sharpened_grad = torch.real(torch.fft.ifft2(sharpened_fft))
+
+            return sharpened_grad - grad
+        else:
+            return torch.zeros_like(grad)
+
+    def _compute_texture_coherence_penalty(self, grad: torch.Tensor, fourier_features: Dict[str, torch.Tensor],
+                                         compact_state) -> torch.Tensor:
+        """
+        計算紋理一致性懲罰
+
+        Args:
+            grad: 梯度張量
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+
+        Returns:
+            紋理一致性懲罰張量
+        """
+        texture_coherence = fourier_features['texture_coherence']
+
+        # 更新紋理一致性分數
+        old_score = compact_state.get_scalar('texture_coherence_score', 1.0)
+        new_score = 0.95 * old_score + 0.05 * texture_coherence.item()
+        compact_state.set_scalar('texture_coherence_score', new_score)
+
+        # 如果一致性太低，施加懲罰
+        if new_score < 0.7:
+            # 對不一致的方向施加懲罰
+            magnitude = fourier_features['magnitude']
+            penalty_factor = (0.7 - new_score) * 2.0  # 懲罰強度
+
+            # 在頻域中減少不一致的成分
+            penalized_magnitude = magnitude * (1.0 - penalty_factor * 0.1)
+            phase = fourier_features['phase']
+            penalized_fft = penalized_magnitude * torch.exp(1j * phase)
+            penalized_grad = torch.real(torch.fft.ifft2(penalized_fft))
+
+            return grad - penalized_grad
+        else:
+            return torch.zeros_like(grad)
+
+    def _compute_super_resolution_adjustment(self, grad: torch.Tensor, fourier_features: Dict[str, torch.Tensor],
+                                           compact_state) -> torch.Tensor:
+        """
+        計算超解析度特定調整
+
+        Args:
+            grad: 梯度張量
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+
+        Returns:
+            超解析度調整張量
+        """
+        if not self.super_resolution_mode:
+            return torch.zeros_like(grad)
+
+        scale = self.super_resolution_scale
+        magnitude = fourier_features['magnitude']
+
+        # 基於放大倍數的頻率重要性權重
+        freq_radius = fourier_features['freq_radius']
+
+        # 為不同放大倍數設計不同的頻率權重
+        if scale == 2:
+            # 2x 超解析度：保持中高頻
+            importance_weight = torch.where(freq_radius > 0.2, 1.5, 1.0)
+        elif scale == 4:
+            # 4x 超解析度：強調高頻細節
+            importance_weight = torch.where(freq_radius > 0.15, 2.0, 1.0)
+        elif scale >= 8:
+            # 8x+ 超解析度：極度強調高頻
+            importance_weight = torch.where(freq_radius > 0.1, 3.0, 1.0)
+        else:
+            importance_weight = torch.ones_like(freq_radius)
+
+        # 應用重要性權重
+        weighted_magnitude = magnitude * importance_weight
+        phase = fourier_features['phase']
+        weighted_fft = weighted_magnitude * torch.exp(1j * phase)
+        weighted_grad = torch.real(torch.fft.ifft2(weighted_fft))
+
+        # 更新超解析度頻率遮罩
+        sr_mask = compact_state.get_tensor('sr_frequency_mask', target_device=grad.device)
+        if sr_mask is not None:
+            # 自適應更新遮罩
+            mask_update = torch.abs(weighted_grad) / (torch.abs(grad) + 1e-8)
+            sr_mask = 0.95 * sr_mask + 0.05 * mask_update.clamp(0.5, 2.0)
+            compact_state.set_tensor('sr_frequency_mask', sr_mask)
+
+            return (weighted_grad - grad) * sr_mask
+        else:
+            return weighted_grad - grad
+
+    def _update_fourier_states(self, fourier_features: Dict[str, torch.Tensor], compact_state):
+        """
+        更新傅立葉相關狀態
+
+        Args:
+            fourier_features: 傅立葉特徵
+            compact_state: 緊湊狀態
+        """
+        # 更新高頻追蹤器
+        high_freq_energy = fourier_features['high_freq_energy']
+        old_tracker = compact_state.get_scalar('fourier_high_freq_tracker', 0.0)
+        new_tracker = 0.9 * old_tracker + 0.1 * high_freq_energy.item()
+        compact_state.set_scalar('fourier_high_freq_tracker', new_tracker)
+
+        # 計算頻域學習率縮放
+        if self.frequency_domain_lr_scaling:
+            total_energy = (fourier_features['low_freq_energy'] +
+                          fourier_features['mid_freq_energy'] +
+                          fourier_features['high_freq_energy'])
+
+            if total_energy > 0:
+                high_freq_ratio = fourier_features['high_freq_energy'] / total_energy
+                # 高頻比例高時增加學習率，低時減少學習率
+                lr_scale = 0.8 + 0.4 * high_freq_ratio.item()
+                compact_state.set_scalar('frequency_domain_lr_scale', lr_scale)
+
     @torch.no_grad()
     def step(self, closure=None):
         """執行優化步驟 - 記憶體優化版本"""
@@ -1273,6 +1793,19 @@ class HinaAdaptive(torch.optim.Optimizer):
                     if self.spatial_awareness:
                         grad = self._apply_spatial_awareness_regularization(grad, state)
 
+                    # === 新增：傅立葉特徵損失超解析度優化 ===
+                    if self.fourier_feature_loss and len(grad.shape) >= 2:
+                        grad = self._compute_fourier_feature_loss_optimized(grad, param, compact_state, param_id)
+
+                        # 基於傅立葉特徵調整學習率
+                        if self.frequency_domain_lr_scaling and compact_state is not None:
+                            freq_lr_scale = compact_state.get_scalar('frequency_domain_lr_scale', 1.0)
+                            if hasattr(self, '_current_step_size'):
+                                self._current_step_size = step_size * freq_lr_scale
+                            else:
+                                # 將頻域學習率縮放應用到最終更新
+                                pass  # 稍後在更新時應用
+
                 # LoRA 低秩正則化
                 if self.lora_rank_penalty and len(param.shape) == 2:
                     rank_penalty = self._lora_rank_regularization_fast(
@@ -1357,6 +1890,12 @@ class HinaAdaptive(torch.optim.Optimizer):
 
                 # 應用更新（如果還沒有應用）
                 if current_step_size != 0:
+                    # === 新增：應用頻域學習率縮放 ===
+                    if (self.fourier_feature_loss and self.frequency_domain_lr_scaling and
+                        compact_state is not None and len(param.shape) >= 2):
+                        freq_lr_scale = compact_state.get_scalar('frequency_domain_lr_scale', 1.0)
+                        current_step_size *= freq_lr_scale
+
                     param.data.add_(update, alpha=-current_step_size)
 
                 # 權重衰減
@@ -1423,7 +1962,12 @@ class HinaAdaptive(torch.optim.Optimizer):
                 'edge_suppression': self.edge_suppression,
                 'spatial_awareness': self.spatial_awareness,
                 'lora_rank_penalty': self.lora_rank_penalty,
-                'background_regularization': self.background_regularization
+                'background_regularization': self.background_regularization,
+                # === 新增：傅立葉特徵損失功能狀態 ===
+                'fourier_feature_loss': self.fourier_feature_loss,
+                'super_resolution_mode': self.super_resolution_mode,
+                'adaptive_frequency_weighting': self.adaptive_frequency_weighting,
+                'frequency_domain_lr_scaling': self.frequency_domain_lr_scaling
             },
             'adaptation_config': {
                 'adaptation_strength': self.adaptation_strength,
@@ -1446,6 +1990,14 @@ class HinaAdaptive(torch.optim.Optimizer):
                 'detail_preservation': self.detail_preservation,
                 'rank_penalty_strength': self.rank_penalty_strength,
                 'low_rank_emphasis': self.low_rank_emphasis
+            },
+            # === 新增：傅立葉特徵損失超解析度優化配置 ===
+            'fourier_super_resolution_config': {
+                'fourier_high_freq_preservation': self.fourier_high_freq_preservation,
+                'fourier_detail_enhancement': self.fourier_detail_enhancement,
+                'fourier_blur_suppression': self.fourier_blur_suppression,
+                'super_resolution_scale': self.super_resolution_scale,
+                'texture_coherence_penalty': self.texture_coherence_penalty
             },
             'current_memory_pressure': self.memory_monitor.check_memory_pressure()
         }
@@ -1543,6 +2095,14 @@ class HinaAdaptive(torch.optim.Optimizer):
         # 清理邊緣緩存
         if hasattr(self, 'edge_cache'):
             self.edge_cache.clear()
+
+        # === 新增：清理傅立葉特徵損失相關緩存 ===
+        if hasattr(self, 'fourier_cache'):
+            self.fourier_cache.clear()
+        if hasattr(self, 'frequency_weights'):
+            self.frequency_weights.clear()
+        if hasattr(self, 'texture_history'):
+            self.texture_history.clear()
 
         # 強制垃圾回收
         torch.cuda.empty_cache()
