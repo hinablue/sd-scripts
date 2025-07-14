@@ -565,6 +565,17 @@ class HinaAdaptive(torch.optim.Optimizer):
                         compact_state.set_tensor('sr_frequency_mask', torch.ones(shape, device=device, dtype=torch.float32))
                         compact_state.set_scalar('sr_detail_preservation_factor', 1.0)
 
+                # 背景正則化狀態初始化
+                if self.background_regularization and len(shape) >= 2:
+                    device = param.device if hasattr(param, 'device') else 'cpu'
+                    shape = param.shape
+
+                    # 背景檢測遮罩
+                    compact_state.set_tensor('background_mask', torch.zeros(shape, device=device, dtype=torch.float32))
+                    compact_state.set_scalar('background_intensity', 0.5)
+                    compact_state.set_scalar('background_adaptation_rate', 0.05)
+                    compact_state.set_scalar('background_stability', 1.0)
+
                 self.param_groups_metadata[group_idx]['compact_states'][param_id] = compact_state
 
     def _store_initial_parameters(self):
@@ -1202,6 +1213,110 @@ class HinaAdaptive(torch.optim.Optimizer):
 
             # 基於空間變異數調整梯度
             regularization_factor = 1.0 / (1.0 + state['spatial_variance'] * self.detail_preservation)
+
+            return grad * regularization_factor
+
+    def _apply_background_regularization(self, grad: torch.Tensor, compact_state, param_id: int) -> torch.Tensor:
+        """
+        應用背景正則化，用於控制背景區域的過擬合
+
+        Args:
+            grad: 梯度張量
+            compact_state: 緊湊狀態
+            param_id: 參數ID
+
+        Returns:
+            背景正則化後的梯度
+        """
+        if len(grad.shape) < 2:
+            return grad
+
+        with torch.no_grad():
+            # 初始化背景檢測狀態
+            background_mask = compact_state.get_tensor('background_mask', target_device=grad.device)
+            background_intensity = compact_state.get_scalar('background_intensity', 0.5)
+            adaptation_rate = 0.05
+
+            # 計算梯度活動度來識別背景區域
+            grad_magnitude = torch.abs(grad)
+
+            if len(grad.shape) == 2:
+                # 2D張量：計算局部活動度
+                h, w = grad.shape
+                activity_map = torch.zeros_like(grad)
+
+                # 計算3x3鄰域的平均活動度
+                for i in range(max(1, h-1)):
+                    for j in range(max(1, w-1)):
+                        if i < h-1 and j < w-1:
+                            local_region = grad_magnitude[i:i+3, j:j+3] if i+3 <= h and j+3 <= w else grad_magnitude[i:min(h, i+2), j:min(w, j+2)]
+                            activity_map[i+1, j+1] = torch.mean(local_region)
+
+                # 識別低活動度（背景）區域
+                activity_threshold = torch.quantile(activity_map.flatten(), 0.3)  # 底部30%為背景
+                current_background_mask = (activity_map < activity_threshold).float()
+
+            elif len(grad.shape) > 2:
+                # 多維張量：在最後兩個維度上計算
+                *batch_dims, h, w = grad.shape
+                grad_2d = grad.view(-1, h, w)
+                batch_size = grad_2d.shape[0]
+
+                background_masks = []
+                for b in range(batch_size):
+                    slice_grad = grad_2d[b]
+                    slice_magnitude = torch.abs(slice_grad)
+
+                    # 計算活動度
+                    activity_map = torch.zeros_like(slice_grad)
+                    for i in range(max(1, h-1)):
+                        for j in range(max(1, w-1)):
+                            if i < h-1 and j < w-1:
+                                local_region = slice_magnitude[i:i+3, j:j+3] if i+3 <= h and j+3 <= w else slice_magnitude[i:min(h, i+2), j:min(w, j+2)]
+                                activity_map[i+1, j+1] = torch.mean(local_region)
+
+                    activity_threshold = torch.quantile(activity_map.flatten(), 0.3)
+                    slice_background_mask = (activity_map < activity_threshold).float()
+                    background_masks.append(slice_background_mask)
+
+                current_background_mask = torch.stack(background_masks, dim=0).view(grad.shape)
+            else:
+                # 1D或其他情況：使用簡單的低活動度檢測
+                activity_threshold = torch.quantile(grad_magnitude.flatten(), 0.3)
+                current_background_mask = (grad_magnitude < activity_threshold).float()
+
+            # 更新背景遮罩（使用指數移動平均）
+            if background_mask is not None and background_mask.shape == current_background_mask.shape:
+                # 平滑更新背景遮罩
+                background_mask = 0.9 * background_mask + 0.1 * current_background_mask
+            else:
+                background_mask = current_background_mask.clone()
+
+            # 保存更新的背景遮罩
+            compact_state.set_tensor('background_mask', background_mask)
+
+            # 計算背景強度（背景區域的比例）
+            current_background_ratio = torch.mean(background_mask).item()
+            background_intensity = 0.95 * background_intensity + 0.05 * current_background_ratio
+            compact_state.set_scalar('background_intensity', background_intensity)
+
+            # 應用背景正則化
+            # 在背景區域減少梯度更新，在前景區域保持正常更新
+            background_penalty = 0.3  # 背景區域梯度衰減因子
+            foreground_enhancement = 1.1  # 前景區域輕微增強
+
+            regularization_factor = (
+                background_mask * background_penalty +  # 背景區域使用較小的因子
+                (1.0 - background_mask) * foreground_enhancement  # 前景區域使用較大的因子
+            )
+
+            # 自適應調整正則化強度
+            if background_intensity > 0.7:
+                # 如果背景區域太多，增強正則化
+                regularization_factor = background_mask * 0.2 + (1.0 - background_mask) * 1.2
+            elif background_intensity < 0.2:
+                # 如果背景區域太少，減弱正則化
+                regularization_factor = background_mask * 0.5 + (1.0 - background_mask) * 1.05
 
             return grad * regularization_factor
 
@@ -1994,6 +2109,10 @@ class HinaAdaptive(torch.optim.Optimizer):
                             else:
                                 # 將頻域學習率縮放應用到最終更新
                                 pass  # 稍後在更新時應用
+
+                    # === 新增：背景正則化 ===
+                    if self.background_regularization and len(grad.shape) >= 2 and compact_state is not None:
+                        grad = self._apply_background_regularization(grad, compact_state, param_id)
 
                 # LoRA 低秩正則化
                 if self.lora_rank_penalty and len(param.shape) == 2:
