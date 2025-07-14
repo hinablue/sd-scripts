@@ -345,7 +345,23 @@ optimizer.adaptive_frequency_weighting = True
 optimizer.frequency_domain_lr_scaling = True
 ```
 
-### Q4: 生成過度銳化的偽影
+### Q4: IndexError: 張量維度不匹配錯誤
+
+**錯誤訊息**: `IndexError: The shape of the mask [3, 3] at index 0 does not match the shape of the indexed tensor [40, 40, 3, 3]`
+
+**原因**: 早期版本在處理4D卷積權重張量時存在維度處理錯誤
+
+**解決方案**: ✅ **已修復** (v1.0+)
+```python
+# 現在支援所有類型的張量：
+# ✅ 2D: 全連接層權重 [128, 256]
+# ✅ 3D: 一維卷積權重 [64, 32, 5]
+# ✅ 4D: 二維卷積權重 [64, 32, 3, 3]
+# ⚠️  小張量 (<8x8) 會被自動跳過
+# ❌ 1D: 偏置項會被跳過
+```
+
+### Q5: 生成過度銳化的偽影
 
 **原因**: 高頻增強過度
 

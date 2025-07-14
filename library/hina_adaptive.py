@@ -1221,7 +1221,25 @@ class HinaAdaptive(torch.optim.Optimizer):
         Returns:
             傅立葉特徵調整後的梯度
         """
+        # 檢查張量維度是否適合傅立葉分析
         if len(grad.shape) < 2:
+            return grad
+
+        # 只對2D張量或最後兩個維度足夠大的張量應用傅立葉特徵損失
+        if len(grad.shape) == 2:
+            # 2D張量：直接處理
+            min_size = min(grad.shape[-2:])
+        elif len(grad.shape) > 2:
+            # 多維張量：檢查最後兩個維度
+            min_size = min(grad.shape[-2:])
+            # 如果是4D卷積權重等，且最後兩個維度太小，跳過處理
+            if len(grad.shape) == 4 and min_size < 8:
+                return grad
+        else:
+            return grad
+
+        # 最後兩個維度必須至少為8x8才進行傅立葉分析
+        if min_size < 8:
             return grad
 
         with torch.no_grad():
@@ -1256,18 +1274,43 @@ class HinaAdaptive(torch.optim.Optimizer):
         Returns:
             傅立葉特徵字典
         """
-        # 2D FFT 分析
-        grad_fft = torch.fft.fft2(grad)
+        # 處理多維張量 - 只在最後兩個維度上進行2D FFT分析
+        original_shape = grad.shape
+        h, w = grad.shape[-2:]
+
+        # 如果是多維張量，重新整形為2D進行FFT分析
+        if len(grad.shape) > 2:
+            # 將前面的維度展平，保留最後兩個維度
+            batch_size = grad.numel() // (h * w)
+            grad_2d = grad.view(batch_size, h, w)
+        else:
+            grad_2d = grad.unsqueeze(0) if len(grad.shape) == 2 else grad
+            batch_size = grad_2d.shape[0]
+
+        # 對每個2D片段進行FFT分析
+        fft_results = []
+        for i in range(batch_size):
+            slice_2d = grad_2d[i] if batch_size > 1 else grad_2d[0]
+            slice_fft = torch.fft.fft2(slice_2d)
+            fft_results.append(slice_fft)
+
+        # 組合結果
+        if batch_size > 1:
+            grad_fft = torch.stack(fft_results, dim=0)
+        else:
+            grad_fft = fft_results[0].unsqueeze(0)
+
         magnitude = torch.abs(grad_fft)
         phase = torch.angle(grad_fft)
 
-        h, w = grad.shape[-2:]
-        center_h, center_w = h // 2, w // 2
-
-        # 創建頻率座標
+        # 創建頻率座標（只基於最後兩個維度）
         freq_y = torch.fft.fftfreq(h, device=grad.device).unsqueeze(1)
         freq_x = torch.fft.fftfreq(w, device=grad.device).unsqueeze(0)
         freq_radius = torch.sqrt(freq_y**2 + freq_x**2)
+
+        # 為批次維度擴展頻率掩膜
+        if batch_size > 1:
+            freq_radius = freq_radius.unsqueeze(0).expand(batch_size, -1, -1)
 
         # 定義頻率段
         low_freq_mask = freq_radius <= 0.1
@@ -1286,8 +1329,15 @@ class HinaAdaptive(torch.optim.Optimizer):
         mid_freq_energy = torch.sum(magnitude * mid_freq_mask.float())
         high_freq_energy = torch.sum(magnitude * high_freq_mask.float())
 
-        # 計算紋理一致性指標
-        texture_coherence = self._compute_texture_coherence(magnitude, freq_radius)
+        # 計算紋理一致性指標（使用第一個片段進行分析）
+        if batch_size > 1:
+            # 對多維張量，使用平均的magnitude和freq_radius
+            avg_magnitude = torch.mean(magnitude, dim=0)
+            avg_freq_radius = freq_radius[0] if len(freq_radius.shape) > 2 else freq_radius
+        else:
+            avg_magnitude = magnitude[0]
+            avg_freq_radius = freq_radius
+        texture_coherence = self._compute_texture_coherence(avg_magnitude, avg_freq_radius)
 
         # 計算模糊指標
         blur_indicator = low_freq_energy / (high_freq_energy + 1e-8)
@@ -1311,7 +1361,10 @@ class HinaAdaptive(torch.optim.Optimizer):
             'high_freq_energy': high_freq_energy,
             'texture_coherence': texture_coherence,
             'blur_indicator': blur_indicator,
-            'adaptive_weights': adaptive_weights
+            'adaptive_weights': adaptive_weights,
+            'original_shape': original_shape,
+            'batch_size': batch_size,
+            'is_multidim': len(original_shape) > 2
         }
 
         # 緩存結果
@@ -1501,6 +1554,9 @@ class HinaAdaptive(torch.optim.Optimizer):
         """
         magnitude = fourier_features['magnitude']
         high_freq_mask = fourier_features['high_freq_mask']
+        original_shape = fourier_features['original_shape']
+        batch_size = fourier_features['batch_size']
+        is_multidim = fourier_features['is_multidim']
 
         # 增強高頻成分
         enhanced_magnitude = magnitude.clone()
@@ -1509,7 +1565,26 @@ class HinaAdaptive(torch.optim.Optimizer):
         # 重建調整後的梯度
         phase = fourier_features['phase']
         enhanced_fft = enhanced_magnitude * torch.exp(1j * phase)
-        enhanced_grad = torch.real(torch.fft.ifft2(enhanced_fft))
+
+        # 對每個批次分別進行IFFT
+        enhanced_grads = []
+        for i in range(batch_size):
+            if batch_size > 1:
+                slice_fft = enhanced_fft[i]
+            else:
+                slice_fft = enhanced_fft[0]
+            slice_enhanced = torch.real(torch.fft.ifft2(slice_fft))
+            enhanced_grads.append(slice_enhanced)
+
+        # 組合結果並重塑回原始形狀
+        if batch_size > 1:
+            enhanced_grad = torch.stack(enhanced_grads, dim=0)
+            if is_multidim:
+                enhanced_grad = enhanced_grad.view(original_shape)
+        else:
+            enhanced_grad = enhanced_grads[0]
+            if is_multidim:
+                enhanced_grad = enhanced_grad.view(original_shape)
 
         # 計算調整量
         adjustment = enhanced_grad - grad
@@ -1543,6 +1618,9 @@ class HinaAdaptive(torch.optim.Optimizer):
         if blur_indicator > 2.0:  # 閾值可調
             magnitude = fourier_features['magnitude']
             high_freq_mask = fourier_features['high_freq_mask']
+            original_shape = fourier_features['original_shape']
+            batch_size = fourier_features['batch_size']
+            is_multidim = fourier_features['is_multidim']
 
             # 對高頻進行銳化
             sharpened_magnitude = magnitude.clone()
@@ -1551,7 +1629,26 @@ class HinaAdaptive(torch.optim.Optimizer):
             # 重建銳化後的梯度
             phase = fourier_features['phase']
             sharpened_fft = sharpened_magnitude * torch.exp(1j * phase)
-            sharpened_grad = torch.real(torch.fft.ifft2(sharpened_fft))
+
+            # 對每個批次分別進行IFFT
+            sharpened_grads = []
+            for i in range(batch_size):
+                if batch_size > 1:
+                    slice_fft = sharpened_fft[i]
+                else:
+                    slice_fft = sharpened_fft[0]
+                slice_sharpened = torch.real(torch.fft.ifft2(slice_fft))
+                sharpened_grads.append(slice_sharpened)
+
+            # 組合結果並重塑回原始形狀
+            if batch_size > 1:
+                sharpened_grad = torch.stack(sharpened_grads, dim=0)
+                if is_multidim:
+                    sharpened_grad = sharpened_grad.view(original_shape)
+            else:
+                sharpened_grad = sharpened_grads[0]
+                if is_multidim:
+                    sharpened_grad = sharpened_grad.view(original_shape)
 
             return sharpened_grad - grad
         else:
@@ -1582,12 +1679,34 @@ class HinaAdaptive(torch.optim.Optimizer):
             # 對不一致的方向施加懲罰
             magnitude = fourier_features['magnitude']
             penalty_factor = (0.7 - new_score) * 2.0  # 懲罰強度
+            original_shape = fourier_features['original_shape']
+            batch_size = fourier_features['batch_size']
+            is_multidim = fourier_features['is_multidim']
 
             # 在頻域中減少不一致的成分
             penalized_magnitude = magnitude * (1.0 - penalty_factor * 0.1)
             phase = fourier_features['phase']
             penalized_fft = penalized_magnitude * torch.exp(1j * phase)
-            penalized_grad = torch.real(torch.fft.ifft2(penalized_fft))
+
+            # 對每個批次分別進行IFFT
+            penalized_grads = []
+            for i in range(batch_size):
+                if batch_size > 1:
+                    slice_fft = penalized_fft[i]
+                else:
+                    slice_fft = penalized_fft[0]
+                slice_penalized = torch.real(torch.fft.ifft2(slice_fft))
+                penalized_grads.append(slice_penalized)
+
+            # 組合結果並重塑回原始形狀
+            if batch_size > 1:
+                penalized_grad = torch.stack(penalized_grads, dim=0)
+                if is_multidim:
+                    penalized_grad = penalized_grad.view(original_shape)
+            else:
+                penalized_grad = penalized_grads[0]
+                if is_multidim:
+                    penalized_grad = penalized_grad.view(original_shape)
 
             return grad - penalized_grad
         else:
@@ -1632,7 +1751,31 @@ class HinaAdaptive(torch.optim.Optimizer):
         weighted_magnitude = magnitude * importance_weight
         phase = fourier_features['phase']
         weighted_fft = weighted_magnitude * torch.exp(1j * phase)
-        weighted_grad = torch.real(torch.fft.ifft2(weighted_fft))
+
+        # 獲取形狀信息
+        original_shape = fourier_features['original_shape']
+        batch_size = fourier_features['batch_size']
+        is_multidim = fourier_features['is_multidim']
+
+        # 對每個批次分別進行IFFT
+        weighted_grads = []
+        for i in range(batch_size):
+            if batch_size > 1:
+                slice_fft = weighted_fft[i]
+            else:
+                slice_fft = weighted_fft[0]
+            slice_weighted = torch.real(torch.fft.ifft2(slice_fft))
+            weighted_grads.append(slice_weighted)
+
+        # 組合結果並重塑回原始形狀
+        if batch_size > 1:
+            weighted_grad = torch.stack(weighted_grads, dim=0)
+            if is_multidim:
+                weighted_grad = weighted_grad.view(original_shape)
+        else:
+            weighted_grad = weighted_grads[0]
+            if is_multidim:
+                weighted_grad = weighted_grad.view(original_shape)
 
         # 更新超解析度頻率遮罩
         sr_mask = compact_state.get_tensor('sr_frequency_mask', target_device=grad.device)
