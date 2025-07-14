@@ -1308,8 +1308,10 @@ class HinaAdaptive(torch.optim.Optimizer):
         freq_x = torch.fft.fftfreq(w, device=grad.device).unsqueeze(0)
         freq_radius = torch.sqrt(freq_y**2 + freq_x**2)
 
-        # 為批次維度擴展頻率掩膜
-        if batch_size > 1:
+        # 為批次維度擴展頻率掩膜（統一處理）
+        # 無論batch_size是否大於1，都確保頻率掩膜具有正確的維度
+        if len(freq_radius.shape) == 2:
+            # freq_radius是[h, w]，需要擴展到[batch_size, h, w]
             freq_radius = freq_radius.unsqueeze(0).expand(batch_size, -1, -1)
 
         # 定義頻率段
@@ -1560,7 +1562,24 @@ class HinaAdaptive(torch.optim.Optimizer):
 
         # 增強高頻成分
         enhanced_magnitude = magnitude.clone()
-        enhanced_magnitude[high_freq_mask] *= 1.5  # 增強高頻
+
+        # 確保掩膜維度與magnitude維度匹配
+        if len(enhanced_magnitude.shape) == 3 and len(high_freq_mask.shape) == 2:
+            # magnitude是[batch_size, h, w]，但掩膜是[h, w]，需要擴展掩膜
+            high_freq_mask_expanded = high_freq_mask.unsqueeze(0).expand(batch_size, -1, -1)
+            enhanced_magnitude[high_freq_mask_expanded] *= 1.5  # 增強高頻
+        elif len(enhanced_magnitude.shape) == len(high_freq_mask.shape):
+            # 維度已經匹配
+            enhanced_magnitude[high_freq_mask] *= 1.5  # 增強高頻
+        else:
+            # 其他情況，使用廣播乘法
+            high_freq_enhancement = torch.where(high_freq_mask, 1.5, 1.0)
+            if len(enhanced_magnitude.shape) > len(high_freq_enhancement.shape):
+                # 擴展enhancement維度以匹配magnitude
+                for _ in range(len(enhanced_magnitude.shape) - len(high_freq_enhancement.shape)):
+                    high_freq_enhancement = high_freq_enhancement.unsqueeze(0)
+                high_freq_enhancement = high_freq_enhancement.expand_as(enhanced_magnitude)
+            enhanced_magnitude = enhanced_magnitude * high_freq_enhancement
 
         # 重建調整後的梯度
         phase = fourier_features['phase']
@@ -1624,7 +1643,24 @@ class HinaAdaptive(torch.optim.Optimizer):
 
             # 對高頻進行銳化
             sharpened_magnitude = magnitude.clone()
-            sharpened_magnitude[high_freq_mask] *= (1.0 + blur_indicator * 0.1)
+
+            # 確保掩膜維度與magnitude維度匹配
+            if len(sharpened_magnitude.shape) == 3 and len(high_freq_mask.shape) == 2:
+                # magnitude是[batch_size, h, w]，但掩膜是[h, w]，需要擴展掩膜
+                high_freq_mask_expanded = high_freq_mask.unsqueeze(0).expand(batch_size, -1, -1)
+                sharpened_magnitude[high_freq_mask_expanded] *= (1.0 + blur_indicator * 0.1)
+            elif len(sharpened_magnitude.shape) == len(high_freq_mask.shape):
+                # 維度已經匹配
+                sharpened_magnitude[high_freq_mask] *= (1.0 + blur_indicator * 0.1)
+            else:
+                # 其他情況，使用廣播乘法
+                sharpening_factor = torch.where(high_freq_mask, 1.0 + blur_indicator * 0.1, 1.0)
+                if len(sharpened_magnitude.shape) > len(sharpening_factor.shape):
+                    # 擴展sharpening_factor維度以匹配magnitude
+                    for _ in range(len(sharpened_magnitude.shape) - len(sharpening_factor.shape)):
+                        sharpening_factor = sharpening_factor.unsqueeze(0)
+                    sharpening_factor = sharpening_factor.expand_as(sharpened_magnitude)
+                sharpened_magnitude = sharpened_magnitude * sharpening_factor
 
             # 重建銳化後的梯度
             phase = fourier_features['phase']
@@ -1748,6 +1784,16 @@ class HinaAdaptive(torch.optim.Optimizer):
             importance_weight = torch.ones_like(freq_radius)
 
         # 應用重要性權重
+        # 確保importance_weight維度與magnitude維度匹配
+        if len(magnitude.shape) == 3 and len(importance_weight.shape) == 2:
+            # magnitude是[batch_size, h, w]，但importance_weight是[h, w]，需要擴展權重
+            importance_weight = importance_weight.unsqueeze(0).expand(magnitude.shape[0], -1, -1)
+        elif len(magnitude.shape) > len(importance_weight.shape):
+            # 需要擴展importance_weight的維度
+            for _ in range(len(magnitude.shape) - len(importance_weight.shape)):
+                importance_weight = importance_weight.unsqueeze(0)
+            importance_weight = importance_weight.expand_as(magnitude)
+
         weighted_magnitude = magnitude * importance_weight
         phase = fourier_features['phase']
         weighted_fft = weighted_magnitude * torch.exp(1j * phase)
