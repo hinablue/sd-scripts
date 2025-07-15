@@ -7246,6 +7246,9 @@ def create_frequency_weight_mask(height: int, width: int, high_freq_weight: floa
     Returns:
         頻率權重遮罩張量
     """
+    # 限制權重範圍，防止過度放大
+    high_freq_weight = max(1.0, min(high_freq_weight, 3.0))
+
     # 創建頻率座標
     freq_h = torch.fft.fftfreq(height, device=device, dtype=dtype)
     freq_w = torch.fft.fftfreq(width, device=device, dtype=dtype)
@@ -7256,17 +7259,26 @@ def create_frequency_weight_mask(height: int, width: int, high_freq_weight: floa
     # 計算頻率幅度
     freq_magnitude = torch.sqrt(freq_h_grid**2 + freq_w_grid**2)
 
-    # 正規化到 [0, 1] 範圍
-    freq_magnitude = freq_magnitude / freq_magnitude.max()
+    # 正規化到 [0, 1] 範圍，添加平滑化
+    max_freq = freq_magnitude.max()
+    if max_freq > 0:
+        freq_magnitude = freq_magnitude / max_freq
+    else:
+        freq_magnitude = torch.zeros_like(freq_magnitude)
 
-    # 創建權重：低頻為 1.0，高頻為 high_freq_weight
-    weight_mask = 1.0 + (high_freq_weight - 1.0) * freq_magnitude
+    # 使用更平滑的權重分配 (sigmoid 函數而非線性)
+    # 這可以減少極端權重值
+    sigmoid_factor = 4.0  # 控制過渡的陡峭程度
+    freq_sigmoid = torch.sigmoid(sigmoid_factor * (freq_magnitude - 0.5))
+
+    # 創建權重：低頻為 1.0，高頻逐漸增加到 high_freq_weight
+    weight_mask = 1.0 + (high_freq_weight - 1.0) * freq_sigmoid
 
     return weight_mask
 
 
 def compute_fourier_magnitude_spectrum(tensor: torch.Tensor, dims: tuple = (-2, -1),
-                                     eps: float = 1e-8) -> torch.Tensor:
+                                     eps: float = 1e-8, normalize: bool = True) -> torch.Tensor:
     """
     計算張量的傅立葉幅度譜
 
@@ -7274,6 +7286,7 @@ def compute_fourier_magnitude_spectrum(tensor: torch.Tensor, dims: tuple = (-2, 
         tensor: 輸入張量
         dims: 進行 FFT 的維度
         eps: 數值穩定性常數
+        normalize: 是否對幅度譜進行正規化
 
     Returns:
         傅立葉幅度譜
@@ -7283,6 +7296,19 @@ def compute_fourier_magnitude_spectrum(tensor: torch.Tensor, dims: tuple = (-2, 
 
     # 計算幅度譜並添加數值穩定性
     magnitude = torch.abs(fft_result) + eps
+
+    if normalize:
+        # 正規化：除以張量大小的平方根和最大值
+        tensor_numel = 1
+        for dim in dims:
+            tensor_numel *= tensor.shape[dim]
+
+        # 按張量大小正規化（類似於 FFTW 的正規化）
+        magnitude = magnitude / (tensor_numel ** 0.5)
+
+        # 進一步按輸入張量的數值範圍正規化
+        input_scale = torch.std(tensor) + eps
+        magnitude = magnitude / input_scale
 
     return magnitude
 
@@ -7303,9 +7329,9 @@ def fourier_latent_loss_basic(model_pred: torch.Tensor, target: torch.Tensor,
     Returns:
         傅立葉特徵損失
     """
-    # 計算傅立葉幅度譜
-    mag_pred = compute_fourier_magnitude_spectrum(model_pred, dims, eps)
-    mag_target = compute_fourier_magnitude_spectrum(target, dims, eps)
+    # 計算傅立葉幅度譜 (已正規化)
+    mag_pred = compute_fourier_magnitude_spectrum(model_pred, dims, eps, normalize=True)
+    mag_target = compute_fourier_magnitude_spectrum(target, dims, eps, normalize=True)
 
     # 計算損失
     if norm_type == "l1":
@@ -7314,6 +7340,9 @@ def fourier_latent_loss_basic(model_pred: torch.Tensor, target: torch.Tensor,
         loss = torch.mean((mag_target - mag_pred) ** 2)
     else:
         raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+    # 進一步約束損失範圍，防止異常值
+    loss = torch.clamp(loss, max=10.0)
 
     return loss
 
@@ -7335,9 +7364,12 @@ def fourier_latent_loss_weighted(model_pred: torch.Tensor, target: torch.Tensor,
     Returns:
         加權傅立葉特徵損失
     """
-    # 計算傅立葉幅度譜
-    mag_pred = compute_fourier_magnitude_spectrum(model_pred, dims, eps)
-    mag_target = compute_fourier_magnitude_spectrum(target, dims, eps)
+    # 限制高頻權重範圍，防止過度放大
+    high_freq_weight = torch.clamp(torch.tensor(high_freq_weight), min=1.0, max=3.0).item()
+
+    # 計算傅立葉幅度譜 (已正規化)
+    mag_pred = compute_fourier_magnitude_spectrum(model_pred, dims, eps, normalize=True)
+    mag_target = compute_fourier_magnitude_spectrum(target, dims, eps, normalize=True)
 
     # 創建頻率權重遮罩
     height, width = model_pred.shape[dims[0]], model_pred.shape[dims[1]]
@@ -7359,7 +7391,13 @@ def fourier_latent_loss_weighted(model_pred: torch.Tensor, target: torch.Tensor,
     else:
         raise ValueError(f"Unsupported norm_type: {norm_type}")
 
-    return torch.mean(weighted_diff)
+    # 計算加權平均損失
+    loss = torch.mean(weighted_diff)
+
+    # 進一步約束損失範圍，防止異常值
+    loss = torch.clamp(loss, max=10.0)
+
+    return loss
 
 
 def fourier_latent_loss_multiscale(model_pred: torch.Tensor, target: torch.Tensor,
@@ -7395,9 +7433,15 @@ def fourier_latent_loss_multiscale(model_pred: torch.Tensor, target: torch.Tenso
             pred_scaled = model_pred
             target_scaled = target
         else:
-            # 使用平均池化進行下採樣
-            pred_scaled = torch.nn.functional.avg_pool2d(model_pred, scale)
-            target_scaled = torch.nn.functional.avg_pool2d(target, scale)
+            # 檢查張量維度是否足夠進行池化
+            if (model_pred.dim() >= 4 and
+                model_pred.shape[-1] >= scale and model_pred.shape[-2] >= scale):
+                # 使用平均池化進行下採樣
+                pred_scaled = torch.nn.functional.avg_pool2d(model_pred, scale)
+                target_scaled = torch.nn.functional.avg_pool2d(target, scale)
+            else:
+                # 跳過無效尺度
+                continue
 
         # 計算該尺度的傅立葉損失
         scale_loss = fourier_latent_loss_basic(pred_scaled, target_scaled, norm_type, dims, eps)
@@ -7405,7 +7449,15 @@ def fourier_latent_loss_multiscale(model_pred: torch.Tensor, target: torch.Tenso
         total_loss += weight * scale_loss
         total_weight += weight
 
-    return total_loss / total_weight
+    # 防止除零錯誤
+    if total_weight == 0:
+        return torch.tensor(0.0, device=model_pred.device, dtype=model_pred.dtype)
+
+    # 約束最終損失值
+    final_loss = total_loss / total_weight
+    final_loss = torch.clamp(final_loss, max=10.0)
+
+    return final_loss
 
 
 def fourier_latent_loss_adaptive(model_pred: torch.Tensor, target: torch.Tensor,
@@ -7430,6 +7482,10 @@ def fourier_latent_loss_adaptive(model_pred: torch.Tensor, target: torch.Tensor,
     Returns:
         自適應傅立葉特徵損失
     """
+    # 限制權重範圍
+    max_weight = max(1.0, min(max_weight, 3.0))
+    min_weight = max(0.5, min(min_weight, max_weight))
+
     # 計算訓練進度 (0.0 到 1.0)
     progress = min(current_step / max(total_steps, 1), 1.0)
 
@@ -7552,8 +7608,20 @@ def conditional_loss_with_fourier(
         else:
             raise ValueError(f"Unsupported fourier_mode: {fourier_mode}")
 
+        # 動態調整傅立葉損失權重，避免與基礎損失差距過大
+        base_loss_magnitude = base_loss.detach()
+        fourier_loss_magnitude = fourier_loss.detach()
+
+        # 計算適應性權重，確保傅立葉損失不會壓倒基礎損失
+        adaptive_weight = fourier_weight
+        if fourier_loss_magnitude > 0 and base_loss_magnitude > 0:
+            ratio = fourier_loss_magnitude / base_loss_magnitude
+            if ratio > 10.0:  # 如果傅立葉損失過大，降低權重
+                adaptive_weight = fourier_weight / (ratio / 10.0)
+                adaptive_weight = max(adaptive_weight, fourier_weight * 0.1)
+
         # 組合基礎損失和傅立葉損失
-        total_loss = base_loss + fourier_weight * fourier_loss
+        total_loss = base_loss + adaptive_weight * fourier_loss
 
         return total_loss
 
@@ -7644,4 +7712,95 @@ def apply_fourier_loss_to_args(args, mode: str = "balanced"):
         setattr(args, key, value)
 
     return args
+
+
+# 測試和驗證函數
+def test_fourier_loss_ranges():
+    """
+    測試傅立葉損失函數的數值範圍，確保修復有效
+    """
+    import torch
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # 創建測試張量（模擬訓練中的 latent 張量）
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 測試不同的張量大小和數值範圍
+    test_cases = [
+        {"shape": (2, 4, 64, 64), "range": (-5, 5), "name": "Normal latents"},
+        {"shape": (1, 8, 32, 32), "range": (-10, 10), "name": "Large range latents"},
+        {"shape": (4, 4, 128, 128), "range": (-1, 1), "name": "Small range latents"},
+    ]
+
+    for case in test_cases:
+        print(f"\n測試案例: {case['name']}")
+        print(f"張量形狀: {case['shape']}")
+        print(f"數值範圍: {case['range']}")
+
+        # 生成測試張量
+        low, high = case['range']
+        model_pred = torch.rand(case['shape'], device=device) * (high - low) + low
+        target = torch.rand(case['shape'], device=device) * (high - low) + low
+
+        # 測試所有傅立葉損失函數
+        try:
+            # 基礎傅立葉損失
+            basic_loss = fourier_latent_loss_basic(model_pred, target)
+            print(f"  基礎傅立葉損失: {basic_loss.item():.6f}")
+
+            # 加權傅立葉損失
+            weighted_loss = fourier_latent_loss_weighted(model_pred, target, high_freq_weight=2.0)
+            print(f"  加權傅立葉損失: {weighted_loss.item():.6f}")
+
+            # 多尺度傅立葉損失
+            multiscale_loss = fourier_latent_loss_multiscale(model_pred, target, scales=[1, 2])
+            print(f"  多尺度傅立葉損失: {multiscale_loss.item():.6f}")
+
+            # 自適應傅立葉損失
+            adaptive_loss = fourier_latent_loss_adaptive(model_pred, target, 500, 1000)
+            print(f"  自適應傅立葉損失: {adaptive_loss.item():.6f}")
+
+            # 檢查損失值是否在合理範圍內
+            all_losses = [basic_loss.item(), weighted_loss.item(), multiscale_loss.item(), adaptive_loss.item()]
+            max_loss = max(all_losses)
+
+            if max_loss > 15.0:
+                print(f"  ⚠️  警告: 最大損失值 {max_loss:.6f} 仍然過大")
+            elif max_loss < 0.001:
+                print(f"  ⚠️  警告: 最大損失值 {max_loss:.6f} 可能過小")
+            else:
+                print(f"  ✅ 損失值範圍正常 (最大: {max_loss:.6f})")
+
+        except Exception as e:
+            print(f"  ❌ 測試失敗: {e}")
+
+    print("\n測試完成!")
+
+
+def debug_fourier_magnitude_spectrum(tensor: torch.Tensor, normalize: bool = True):
+    """
+    調試傅立葉幅度譜計算，顯示詳細統計信息
+    """
+    print(f"輸入張量形狀: {tensor.shape}")
+    print(f"輸入張量範圍: [{tensor.min().item():.4f}, {tensor.max().item():.4f}]")
+    print(f"輸入張量標準差: {tensor.std().item():.4f}")
+
+    # 計算 FFT
+    fft_result = torch.fft.fftn(tensor, dim=(-2, -1))
+    raw_magnitude = torch.abs(fft_result)
+
+    print(f"原始FFT幅度範圍: [{raw_magnitude.min().item():.4f}, {raw_magnitude.max().item():.4f}]")
+    print(f"原始FFT幅度平均: {raw_magnitude.mean().item():.4f}")
+
+    if normalize:
+        # 應用正規化
+        magnitude = compute_fourier_magnitude_spectrum(tensor, normalize=True)
+        print(f"正規化後幅度範圍: [{magnitude.min().item():.4f}, {magnitude.max().item():.4f}]")
+        print(f"正規化後幅度平均: {magnitude.mean().item():.4f}")
+    else:
+        magnitude = raw_magnitude
+
+    return magnitude
 
