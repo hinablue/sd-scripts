@@ -139,7 +139,7 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
     parser.add_argument(
         "--fourier_mode",
         type=str,
-        default="weighted",
+        default="weighted", # "basic", "weighted", "multiscale", "adaptive"
         help="mode for fourier loss / 傅立葉特徵損失のモード",
     )
     parser.add_argument(

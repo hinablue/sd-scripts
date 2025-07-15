@@ -340,7 +340,7 @@ class HinaAdaptive(torch.optim.Optimizer):
         # 邊緣和背景過擬合控制參數
         edge_suppression: bool = False,
         edge_penalty: float = 0.1,
-        background_regularization: bool = True,
+        background_regularization: bool = False,
         background_regularization_mode: str = "simple",  # "fast", "simple"
         # 空間感知
         spatial_awareness: bool = False,
