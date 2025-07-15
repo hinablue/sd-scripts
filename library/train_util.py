@@ -7460,7 +7460,7 @@ def conditional_loss_with_fourier(
     fourier_adaptive_max_weight: float = 2.0,
     fourier_adaptive_min_weight: float = 0.5,
     fourier_eps: float = 1e-8,
-    fourier_warmup_steps: int = 300
+    fourier_warmup_steps: int = 200
 ) -> torch.Tensor:
     """
     增強版 conditional_loss，支援傅立葉特徵損失

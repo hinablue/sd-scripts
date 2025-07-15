@@ -167,6 +167,18 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="scales for fourier loss / 傅立葉特徵損失のスケール",
     )
     parser.add_argument(
+        "--fourier_scale_weights",
+        type=list,
+        default=None,
+        help="scale weights for fourier loss / 傅立葉特徵損失のスケールの重み",
+    )
+    parser.add_argument(
+        "--fourier_adaptive_max_weight",
+        type=float,
+        default=2.0,
+        help="max weight for adaptive fourier loss / 傅立葉特徵損失の最大重み",
+    )
+    parser.add_argument(
         "--fourier_adaptive_min_weight",
         type=float,
         default=0.5,
@@ -181,7 +193,7 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
     parser.add_argument(
         "--fourier_warmup_steps",
         type=int,
-        default=300,
+        default=200,
         help="warmup steps for fourier loss / 傅立葉特徵損失の暖機ステップ",
     )
     parser.add_argument(
