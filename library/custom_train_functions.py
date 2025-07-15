@@ -126,6 +126,11 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Set % of total train steps for Debiased estimation loss / Debiased estimation lossを組み合わせる",
     )
     parser.add_argument(
+        "--fourier_loss",
+        action="store_true",
+        help="Enable fourier loss / 傅立葉特徵損失を有効にする",
+    )
+    parser.add_argument(
         "--fourier_weight",
         type=float,
         default=0.0,
