@@ -473,7 +473,23 @@ class NetworkTrainer:
         )
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step)
+
+        if args.fourier_loss:
+            loss = train_util.conditional_loss_with_fourier(
+                noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step,
+                fourier_weight=args.fourier_weight,
+                fourier_norm=args.fourier_norm,
+                fourier_dims=args.fourier_dims,
+                fourier_high_freq_weight=args.fourier_high_freq_weight,
+                fourier_scales=args.fourier_scales,
+                fourier_scale_weights=args.fourier_scale_weights,
+                fourier_adaptive_max_weight=args.fourier_adaptive_max_weight,
+                fourier_adaptive_min_weight=args.fourier_adaptive_min_weight,
+                fourier_eps=args.fourier_eps,
+                fourier_warmup_steps=args.fourier_warmup_steps)
+        else:
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step)
+
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):

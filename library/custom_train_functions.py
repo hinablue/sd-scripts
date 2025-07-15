@@ -126,6 +126,60 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Set % of total train steps for Debiased estimation loss / Debiased estimation lossを組み合わせる",
     )
     parser.add_argument(
+        "--fourier_weight",
+        type=float,
+        default=0.0,
+        help="weight for fourier loss / 傅立葉特徵損失の重み",
+    )
+    parser.add_argument(
+        "--fourier_mode",
+        type=str,
+        default="weighted",
+        help="mode for fourier loss / 傅立葉特徵損失のモード",
+    )
+    parser.add_argument(
+        "--fourier_norm",
+        type=str,
+        default="l2",
+        help="norm type for fourier loss / 傅立葉特徵損失のノルムタイプ",
+    )
+    parser.add_argument(
+        "--fourier_dims",
+        type=tuple,
+        default=(-2, -1),
+        help="dims for fourier loss / 傅立葉特徵損失の次元",
+    )
+    parser.add_argument(
+        "--fourier_high_freq_weight",
+        type=float,
+        default=2.0,
+        help="weight for high frequency in fourier loss / 傅立葉特徵損失の高周波数の重み",
+    )
+    parser.add_argument(
+        "--fourier_scales",
+        type=list,
+        default=None,
+        help="scales for fourier loss / 傅立葉特徵損失のスケール",
+    )
+    parser.add_argument(
+        "--fourier_adaptive_min_weight",
+        type=float,
+        default=0.5,
+        help="min weight for adaptive fourier loss / 傅立葉特徵損失の最小重み",
+    )
+    parser.add_argument(
+        "--fourier_eps",
+        type=float,
+        default=1e-8,
+        help="eps for fourier loss / 傅立葉特徵損失のeps",
+    )
+    parser.add_argument(
+        "--fourier_warmup_steps",
+        type=int,
+        default=300,
+        help="warmup steps for fourier loss / 傅立葉特徵損失の暖機ステップ",
+    )
+    parser.add_argument(
         "--use_log_norm_timesteps",
         action="store_true",
         help="Using logNorm 0.65 for timesteps / timestepsをlogNorm 0.65で使用する",
