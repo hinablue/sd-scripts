@@ -6715,47 +6715,6 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
-    elif loss_type == "stable_mse":
-        """
-        進階版穩定 MSE Loss，具有自適應穩定性控制。
-        """
-
-        # 計算標準 MSE
-        standard_mse = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
-
-        # 計算穩定化 MSE
-        stable_mse = stable_mse_loss(model_pred, target, reduction=reduction)
-
-        # 自適應混合兩種損失
-        # 當誤差較大時，更多使用穩定化版本
-        stability_factor = compute_adaptive_stability_factor(model_pred, target, current_step, total_steps)
-        with torch.no_grad():
-            error_magnitude = torch.abs(model_pred - target)
-            error_std = torch.std(error_magnitude)
-            adaptive_weight = torch.sigmoid((error_magnitude - error_std) / (error_std + 1e-8))
-            adaptive_weight = adaptive_weight * stability_factor
-
-        # 混合損失
-        loss = (1 - adaptive_weight) * standard_mse + adaptive_weight * stable_mse
-
-        # 應用 reduction 方式
-        if reduction == 'mean':
-            loss = loss.mean()
-        elif reduction == 'sum':
-            loss = loss.sum()
-    elif loss_type == "stable_max":
-        # 處理單一值的情況（如 scalar tensor）
-        if model_pred.dim() == 0:
-            model_pred = model_pred.unsqueeze(0)
-        if target.dim() == 0:
-            target = target.unsqueeze(0)
-
-        # 如果只有一個類別，退化為MSE
-        if model_pred.size(-1) == 1:
-            loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
-        else:
-            # 應用 StableMax 交叉熵
-            loss = stable_cross_entropy_loss(model_pred, target, reduction=reduction)
     else:
         raise NotImplementedError(f"Unsupported Loss Type: {loss_type}")
     return loss

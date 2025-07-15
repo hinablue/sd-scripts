@@ -12,9 +12,8 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         lr: float = 2e-4,
         allora: bool = True,
         eta: float = 2,
-        orthograd: bool = True,
-        sinkgd_iters: int = 2,
-        mars: bool = True
+        orthograd: bool = False,
+        sinkgd_iters: int = 2
     ):
         self.lr = lr
         self.sinkgd_iters = sinkgd_iters
@@ -22,21 +21,19 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
             lr=lr,
             allora=allora,
             eta=eta,
-            orthograd=orthograd,
-            mars=mars
+            orthograd=orthograd
         )
         super().__init__(params, defaults)
 
     def _init_state(self, p, group=None):
         state = self.state[p]
-        state.setdefault("step", 0)
         # ==== ALLoRA ====
         #ALLoRA: Adaptive Learning Rate Mitigates LoRA Fatal Flaws
         #https://arxiv.org/abs/2410.09692
         if group['allora']:
             if len(p.shape) == 2:
                 row_norm = p.norm(dim=1, keepdim=True)
-                state["row_scaling"] = (1.0 / torch.sqrt(row_norm + 1.0 / (group['eta']**2))).mean().item()
+                state["row_scaling"] = 1.0 / torch.sqrt(row_norm + 1.0 / (group['eta']**2))
 
     # === Orthograd ===
     #Grokking at the Edge of Numerical Stability
@@ -64,7 +61,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
     @torch.jit.script
     def SinkGD(
         update: torch.Tensor,
-        num_sinkgd_iter: int = 1,
+        num_sinkgd_iter: int,
         eps: float = 1e-30
     ) -> torch.Tensor:
         if num_sinkgd_iter > 0:
@@ -93,14 +90,14 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     self._init_state(p, group)
-                state['step'] += 1
                 grad = p.grad.data
-                update = grad
                 if grad.ndim == 2:
-                    update = self.SinkGD(update)
-                    if group["orthograd"] and state['step'] > 100:
-                        update = self.Orthograd(p, update)
-                    update = self.SinkGD(update, self.sinkgd_iters - 1)
+                    if group["orthograd"]:
+                        update = self.Orthograd(p, grad)
+                    if self.sinkgd_iters > 0:
+                        update = self.SinkGD(update, self.sinkgd_iters)
+                else:
+                    update = grad
 
                 allora = state.get("row_scaling", 1.0)
                 p.add_(-update.mul(group["lr"] * allora))

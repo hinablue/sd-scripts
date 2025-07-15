@@ -9,6 +9,8 @@
 > **⚠️ 重要提醒**：
 > - **權重衰減限制**：需要修改 kohya sd-scripts 與 LyCORIS 的 `kohya.py` 程式碼才能使用權重衰減功能
 > - **維護狀態**：此版本將不再更新，未來發展將以 **AdaptiveHinaAdamW** 版本為主
+> - **Latent Space 相容性**：傅立葉特徵損失超解析度優化預設禁用，因 SD-Scripts 全部使用 latent space 訓練
+>   📖 [詳細說明](./FOURIER_LATENT_SPACE_GUIDE.md) | 🧪 [測試腳本](./test_latent_space_detection.py)
 
 #### AdaptiveHinaAdamW (最新自適應版本) 🆕
 - **動態參數重要性評估**：基於梯度一致性、參數變化率和內在特性的多維度評估
@@ -46,8 +48,12 @@
 #### 專門技術
 - **[TAM 優化](./TAM_Optimize.md)** - Torque-Aware Momentum 技術
 - **[重構說明](./README_refactored.md)** - 代碼重構和架構改進
+- **[Latent Space 相容性指南](./FOURIER_LATENT_SPACE_GUIDE.md)** 🔴 - SD-Scripts latent space 訓練架構分析
 
 ### 💻 程式碼範例
+
+#### 檢測與測試
+- **[Latent Space 檢測測試](./test_latent_space_detection.py)** - 驗證 latent space 自動檢測功能
 
 #### 測試腳本
 - **[LoRA 優化測試](./test_lora_optimization.py)** - LoRA 特定優化的測試

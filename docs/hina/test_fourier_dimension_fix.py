@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-傅立葉特徵處理維度修復測試
+HinaAdaptive 正則化技術維度處理測試
 
-測試不同形狀的張量是否能正確處理傅立葉特徵，確保沒有維度不匹配錯誤。
+測試不同形狀的張量是否能正確處理各種正則化技術，確保沒有維度不匹配錯誤。
+
+注意：傅立葉特徵損失功能已被移除，因為它不適用於 SD-Scripts
+的 latent space 訓練環境。
 """
 
 import torch
@@ -15,20 +18,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from library.hina_adaptive import HinaAdaptive
 
-def test_fourier_feature_dimensions():
-    """測試傅立葉特徵處理的維度匹配"""
+def test_regularization_dimensions():
+    """測試正則化技術的維度處理"""
     print("=" * 60)
-    print("測試傅立葉特徵處理維度修復")
+    print("測試正則化技術維度處理")
     print("=" * 60)
 
     # 創建各種形狀的測試張量
     test_shapes = [
         (8, 8),           # 2D: 全連接層權重
         (1, 8, 8),        # 3D: 單通道卷積
-        (64, 32, 3, 3),   # 4D: 2D卷積權重（原錯誤來源）
+        (64, 32, 3, 3),   # 4D: 2D卷積權重
         (128, 64, 5, 5),  # 4D: 較大的卷積核
         (256, 128, 7, 7), # 4D: 更大的卷積核
         (16, 32, 1, 1),   # 4D: 1x1卷積
+        (32, 16, 3, 3, 3), # 5D: 3D卷積權重
     ]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -44,206 +48,410 @@ def test_fourier_feature_dimensions():
             # 創建測試參數
             param = torch.randn(shape, device=device, requires_grad=True)
 
-            # 創建優化器，啟用傅立葉特徵損失
+            # 創建優化器，啟用各種正則化技術
             optimizer = HinaAdaptive(
                 [param],
                 lr=1e-3,
-                fourier_feature_loss=True,
-                super_resolution_mode=True,
-                super_resolution_scale=4,
-                adaptive_frequency_weighting=True,
-                fourier_high_freq_preservation=0.3,
-                fourier_detail_enhancement=0.2,
-                fourier_blur_suppression=0.15,
-                texture_coherence_penalty=0.1,
-                frequency_domain_lr_scaling=True
+                # 各種正則化技術
+                edge_suppression=True,
+                edge_penalty=0.1,
+                spatial_awareness=True,
+                frequency_penalty=0.05,
+                background_regularization=True,
+                lora_rank_penalty=True,
+                rank_penalty_strength=0.01,
+                # 記憶體優化
+                memory_efficient=True,
+                vram_budget_gb=8.0
             )
 
-            # 創建模擬損失和梯度
-            dummy_output = torch.sum(param ** 2)
-            dummy_output.backward()
+            # 創建對應的目標張量
+            target = torch.randn_like(param)
 
-            print(f"  ✓ 參數形狀: {param.shape}")
-            print(f"  ✓ 梯度形狀: {param.grad.shape}")
-            print(f"  ✓ 梯度範數: {torch.norm(param.grad).item():.6f}")
+            # 模擬前向傳播
+            output = param * 2.0  # 簡單操作
+            loss = torch.nn.functional.mse_loss(output, target)
 
-            # 執行優化步驟（這裡會觸發傅立葉特徵處理）
+            # 測試反向傳播
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
 
-            print(f"  ✓ 優化步驟成功完成")
-            print(f"  ✓ 更新後參數範數: {torch.norm(param).item():.6f}")
+            print(f"✅ 形狀 {shape} 處理成功")
+            print(f"   - 參數元素數量: {param.numel()}")
+            print(f"   - 梯度範數: {torch.norm(param.grad).item():.6f}")
+            print(f"   - 損失值: {loss.item():.6f}")
 
-            # 檢查參數是否有效更新
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                print(f"  ✗ 警告：參數包含 NaN 或 Inf 值")
-                all_tests_passed = False
-            else:
-                print(f"  ✓ 參數值正常")
-
-            # 清理梯度
-            optimizer.zero_grad()
+            # 驗證優化器狀態
+            info = optimizer.get_optimization_info()
+            print(f"   - 啟用的正則化技術: {sum(info['features'].values())}")
 
         except Exception as e:
-            print(f"  ✗ 測試失敗: {e}")
-            print(f"     錯誤類型: {type(e).__name__}")
+            print(f"❌ 形狀 {shape} 處理失敗: {e}")
             all_tests_passed = False
-
-            # 打印詳細的錯誤堆棧
-            import traceback
-            print("     詳細錯誤信息:")
-            traceback.print_exc()
-
-    print("\n" + "=" * 60)
-    if all_tests_passed:
-        print("🎉 所有測試通過！傅立葉特徵處理維度修復成功！")
-    else:
-        print("❌ 部分測試失敗，請檢查修復是否完整。")
-    print("=" * 60)
 
     return all_tests_passed
 
-def test_frequency_mask_consistency():
-    """測試頻率掩膜的一致性"""
+def test_edge_suppression_dimensions():
+    """測試邊緣感知正則化的維度處理"""
     print("\n" + "=" * 60)
-    print("測試頻率掩膜一致性")
+    print("測試邊緣感知正則化維度處理")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 創建一個4D卷積權重（之前出錯的情況）
-    param = torch.randn(64, 32, 8, 8, device=device, requires_grad=True)
+    # 測試不同維度的卷積層
+    test_cases = [
+        ("2D卷積", nn.Conv2d(3, 16, 3, padding=1)),
+        ("大卷積核", nn.Conv2d(16, 32, 7, padding=3)),
+        ("1x1卷積", nn.Conv2d(32, 64, 1)),
+        ("深度卷積", nn.Conv2d(64, 128, 5, padding=2)),
+    ]
 
-    # 創建優化器實例
-    optimizer = HinaAdaptive(
-        [param],
-        lr=1e-3,
-        fourier_feature_loss=True,
-        super_resolution_mode=True,
-    )
+    all_tests_passed = True
 
-    # 獲取參數ID和緊湊狀態
-    param_id = id(param)
-    group_metadata = optimizer.param_groups_metadata[0]
-    compact_state = group_metadata['compact_states'][param_id]
+    for name, layer in test_cases:
+        print(f"\n測試 {name}:")
+        print("-" * 30)
 
-    try:
-        # 模擬梯度
-        dummy_loss = torch.sum(param ** 2)
-        dummy_loss.backward()
+        try:
+            layer = layer.to(device)
 
-        grad = param.grad
-        print(f"原始梯度形狀: {grad.shape}")
+            # 創建邊緣感知優化器
+            optimizer = HinaAdaptive(
+                layer.parameters(),
+                lr=1e-3,
+                edge_suppression=True,
+                edge_penalty=0.1,
+                edge_threshold=0.6,
+                memory_efficient=True
+            )
 
-        # 直接調用傅立葉特徵計算方法
-        fourier_features = optimizer._compute_fourier_features(grad, f"test_{param_id}", compact_state)
+            # 創建測試數據
+            if isinstance(layer, nn.Conv2d):
+                x = torch.randn(2, layer.in_channels, 32, 32, device=device)
+            else:
+                x = torch.randn(2, layer.in_channels, 32, 32, device=device)
 
-        print(f"傅立葉特徵檢查:")
-        print(f"  - magnitude 形狀: {fourier_features['magnitude'].shape}")
-        print(f"  - 頻率掩膜形狀:")
-        print(f"    - low_freq_mask: {fourier_features['low_freq_mask'].shape}")
-        print(f"    - mid_freq_mask: {fourier_features['mid_freq_mask'].shape}")
-        print(f"    - high_freq_mask: {fourier_features['high_freq_mask'].shape}")
-        print(f"  - 批次大小: {fourier_features['batch_size']}")
-        print(f"  - 是否多維: {fourier_features['is_multidim']}")
-        print(f"  - 原始形狀: {fourier_features['original_shape']}")
+            # 前向傳播
+            output = layer(x)
+            loss = torch.mean(output ** 2)
 
-        # 測試各種傅立葉調整
-        print(f"\n測試傅立葉調整方法:")
+            # 反向傳播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        # 高頻保持
-        high_freq_adj = optimizer._compute_high_freq_preservation(grad, fourier_features, compact_state)
-        print(f"  ✓ 高頻保持調整形狀: {high_freq_adj.shape}")
+            print(f"✅ {name} 處理成功")
+            print(f"   - 權重形狀: {layer.weight.shape}")
+            print(f"   - 梯度範數: {torch.norm(layer.weight.grad).item():.6f}")
 
-        # 模糊抑制
-        blur_adj = optimizer._compute_blur_suppression(grad, fourier_features, compact_state)
-        print(f"  ✓ 模糊抑制調整形狀: {blur_adj.shape}")
+        except Exception as e:
+            print(f"❌ {name} 處理失敗: {e}")
+            all_tests_passed = False
 
-        # 紋理一致性懲罰
-        texture_penalty = optimizer._compute_texture_coherence_penalty(grad, fourier_features, compact_state)
-        print(f"  ✓ 紋理一致性懲罰形狀: {texture_penalty.shape}")
+    return all_tests_passed
 
-        # 超解析度調整
-        sr_adj = optimizer._compute_super_resolution_adjustment(grad, fourier_features, compact_state)
-        print(f"  ✓ 超解析度調整形狀: {sr_adj.shape}")
-
-        # 檢查所有調整是否與原始梯度形狀匹配
-        adjustments = [high_freq_adj, blur_adj, texture_penalty, sr_adj]
-        for i, adj in enumerate(adjustments):
-            if adj.shape != grad.shape:
-                print(f"  ✗ 調整 {i} 形狀不匹配: {adj.shape} vs {grad.shape}")
-                return False
-
-        print(f"  ✓ 所有調整形狀都與原始梯度匹配")
-
-        return True
-
-    except Exception as e:
-        print(f"✗ 頻率掩膜一致性測試失敗: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def test_specific_error_case():
-    """測試具體的錯誤案例：[8, 8] mask vs [1, 8, 8] tensor"""
+def test_spatial_awareness_dimensions():
+    """測試空間感知正則化的維度處理"""
     print("\n" + "=" * 60)
-    print("測試具體錯誤案例修復")
+    print("測試空間感知正則化維度處理")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 重現原始錯誤的確切條件
-    param = torch.randn(1, 8, 8, device=device, requires_grad=True)
+    # 測試不同大小的特徵圖
+    test_sizes = [
+        (8, 8),     # 小特徵圖
+        (32, 32),   # 中等特徵圖
+        (64, 64),   # 大特徵圖
+        (128, 128), # 很大特徵圖
+    ]
 
-    print(f"測試參數形狀: {param.shape}")
+    all_tests_passed = True
+
+    for size in test_sizes:
+        print(f"\n測試特徵圖大小 {size}:")
+        print("-" * 30)
+
+        try:
+            # 創建對應大小的卷積層
+            layer = nn.Conv2d(3, 16, 3, padding=1).to(device)
+
+            # 創建空間感知優化器
+            optimizer = HinaAdaptive(
+                layer.parameters(),
+                lr=1e-3,
+                spatial_awareness=True,
+                frequency_penalty=0.05,
+                detail_preservation=0.8,
+                memory_efficient=True
+            )
+
+            # 創建測試數據
+            x = torch.randn(1, 3, size[0], size[1], device=device)
+
+            # 前向傳播
+            output = layer(x)
+            loss = torch.mean(output ** 2)
+
+            # 反向傳播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            print(f"✅ 特徵圖大小 {size} 處理成功")
+            print(f"   - 輸入形狀: {x.shape}")
+            print(f"   - 輸出形狀: {output.shape}")
+            print(f"   - 損失值: {loss.item():.6f}")
+
+        except Exception as e:
+            print(f"❌ 特徵圖大小 {size} 處理失敗: {e}")
+            all_tests_passed = False
+
+    return all_tests_passed
+
+def test_lora_regularization_dimensions():
+    """測試 LoRA 低秩正則化的維度處理"""
+    print("\n" + "=" * 60)
+    print("測試 LoRA 低秩正則化維度處理")
+    print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 測試不同大小的矩陣
+    test_matrices = [
+        (64, 32),    # 小矩陣
+        (128, 64),   # 中等矩陣
+        (256, 128),  # 大矩陣
+        (512, 256),  # 很大矩陣
+        (32, 128),   # 寬矩陣
+        (128, 32),   # 窄矩陣
+    ]
+
+    all_tests_passed = True
+
+    for rows, cols in test_matrices:
+        print(f"\n測試矩陣大小 {rows}x{cols}:")
+        print("-" * 30)
+
+        try:
+            # 創建線性層
+            layer = nn.Linear(cols, rows).to(device)
+
+            # 創建 LoRA 低秩正則化優化器
+            optimizer = HinaAdaptive(
+                layer.parameters(),
+                lr=1e-3,
+                lora_rank_penalty=True,
+                rank_penalty_strength=0.01,
+                low_rank_emphasis=1.2,
+                memory_efficient=True
+            )
+
+            # 創建測試數據
+            x = torch.randn(8, cols, device=device)
+
+            # 前向傳播
+            output = layer(x)
+            loss = torch.mean(output ** 2)
+
+            # 反向傳播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            print(f"✅ 矩陣大小 {rows}x{cols} 處理成功")
+            print(f"   - 權重形狀: {layer.weight.shape}")
+            print(f"   - 權重秩估計: {torch.linalg.matrix_rank(layer.weight.data).item()}")
+            print(f"   - 損失值: {loss.item():.6f}")
+
+        except Exception as e:
+            print(f"❌ 矩陣大小 {rows}x{cols} 處理失敗: {e}")
+            all_tests_passed = False
+
+    return all_tests_passed
+
+def test_background_regularization_dimensions():
+    """測試背景正則化的維度處理"""
+    print("\n" + "=" * 60)
+    print("測試背景正則化維度處理")
+    print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 測試不同形狀的張量
+    test_shapes = [
+        (1, 16, 16),      # 3D張量
+        (3, 32, 32),      # RGB圖像
+        (64, 64, 64),     # 體積數據
+        (16, 128, 128),   # 高解析度
+    ]
+
+    all_tests_passed = True
+
+    for shape in test_shapes:
+        print(f"\n測試張量形狀 {shape}:")
+        print("-" * 30)
+
+        try:
+            # 創建卷積層
+            if len(shape) == 3:
+                layer = nn.Conv2d(shape[0], 16, 3, padding=1).to(device)
+            else:
+                layer = nn.Conv2d(shape[0], 16, 3, padding=1).to(device)
+
+            # 創建背景正則化優化器
+            optimizer = HinaAdaptive(
+                layer.parameters(),
+                lr=1e-3,
+                background_regularization=True,
+                memory_efficient=True
+            )
+
+            # 創建測試數據
+            x = torch.randn(1, *shape, device=device)
+
+            # 前向傳播
+            output = layer(x)
+            loss = torch.mean(output ** 2)
+
+            # 反向傳播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            print(f"✅ 張量形狀 {shape} 處理成功")
+            print(f"   - 輸入形狀: {x.shape}")
+            print(f"   - 輸出形狀: {output.shape}")
+            print(f"   - 損失值: {loss.item():.6f}")
+
+        except Exception as e:
+            print(f"❌ 張量形狀 {shape} 處理失敗: {e}")
+            all_tests_passed = False
+
+    return all_tests_passed
+
+def test_combined_regularization_dimensions():
+    """測試組合正則化技術的維度處理"""
+    print("\n" + "=" * 60)
+    print("測試組合正則化技術維度處理")
+    print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 創建複雜的模型
+    class TestModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+            self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+            self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+            self.linear1 = nn.Linear(128 * 8 * 8, 256)
+            self.linear2 = nn.Linear(256, 10)
+
+        def forward(self, x):
+            x = torch.relu(self.conv1(x))
+            x = torch.relu(self.conv2(x))
+            x = torch.relu(self.conv3(x))
+            x = torch.adaptive_avg_pool2d(x, (8, 8))
+            x = x.view(x.size(0), -1)
+            x = torch.relu(self.linear1(x))
+            x = self.linear2(x)
+            return x
 
     try:
-        # 創建優化器
+        model = TestModel().to(device)
+
+        # 創建組合正則化優化器
         optimizer = HinaAdaptive(
-            [param],
+            model.parameters(),
             lr=1e-3,
-            fourier_feature_loss=True,
-            super_resolution_mode=True,
-            fourier_high_freq_preservation=0.3,
+            # 組合所有正則化技術
+            edge_suppression=True,
+            edge_penalty=0.1,
+            spatial_awareness=True,
+            frequency_penalty=0.05,
+            background_regularization=True,
+            lora_rank_penalty=True,
+            rank_penalty_strength=0.01,
+            # 其他功能
+            use_dynamic_adaptation=True,
+            memory_efficient=True,
+            vram_budget_gb=8.0
         )
 
-        # 創建梯度
-        loss = torch.sum(param ** 2)
-        loss.backward()
+        # 創建測試數據
+        x = torch.randn(4, 3, 32, 32, device=device)
+        y = torch.randn(4, 10, device=device)
 
-        print(f"梯度形狀: {param.grad.shape}")
+        # 訓練幾步
+        for step in range(5):
+            optimizer.zero_grad()
+            output = model(x)
+            loss = torch.nn.functional.mse_loss(output, y)
+            loss.backward()
+            optimizer.step()
 
-        # 這應該不會再產生 IndexError
-        optimizer.step()
+            print(f"步驟 {step+1}: 損失 = {loss.item():.6f}")
 
-        print("✓ 具體錯誤案例修復成功！")
+        print("✅ 組合正則化技術維度處理成功")
         return True
 
-    except IndexError as e:
-        print(f"✗ IndexError 仍然存在: {e}")
-        return False
     except Exception as e:
-        print(f"✗ 其他錯誤: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ 組合正則化技術維度處理失敗: {e}")
         return False
+
+def main():
+    """主函數"""
+    print("🔍 HinaAdaptive 正則化技術維度處理測試")
+    print("=" * 60)
+
+    tests = [
+        ("基本正則化維度處理", test_regularization_dimensions),
+        ("邊緣感知正則化維度處理", test_edge_suppression_dimensions),
+        ("空間感知正則化維度處理", test_spatial_awareness_dimensions),
+        ("LoRA 低秩正則化維度處理", test_lora_regularization_dimensions),
+        ("背景正則化維度處理", test_background_regularization_dimensions),
+        ("組合正則化維度處理", test_combined_regularization_dimensions),
+    ]
+
+    passed = 0
+    total = len(tests)
+
+    for test_name, test_func in tests:
+        print(f"\n🧪 執行 {test_name}...")
+        try:
+            if test_func():
+                print(f"✅ {test_name} 通過")
+                passed += 1
+            else:
+                print(f"❌ {test_name} 失敗")
+        except Exception as e:
+            print(f"❌ {test_name} 異常: {e}")
+
+    # 總結結果
+    print("\n" + "=" * 60)
+    print(f"📊 測試結果: {passed}/{total} 通過")
+
+    if passed == total:
+        print("🎉 所有維度處理測試通過！")
+        print("✅ 各種正則化技術都能正確處理不同形狀的張量")
+    else:
+        print(f"⚠️  {total - passed} 個測試失敗")
+        print("❌ 某些正則化技術可能存在維度處理問題")
+
+    return passed == total
 
 if __name__ == "__main__":
-    print("傅立葉特徵處理維度修復測試開始...")
-
-    test1_passed = test_fourier_feature_dimensions()
-    test2_passed = test_frequency_mask_consistency()
-    test3_passed = test_specific_error_case()
-
-    print("\n" + "=" * 80)
-    print("最終測試結果匯總:")
-    print("=" * 80)
-    print(f"基本傅立葉特徵處理: {'✓ 通過' if test1_passed else '✗ 失敗'}")
-    print(f"頻率掩膜一致性測試: {'✓ 通過' if test2_passed else '✗ 失敗'}")
-    print(f"具體錯誤案例修復: {'✓ 通過' if test3_passed else '✗ 失敗'}")
-
-    if test1_passed and test2_passed and test3_passed:
-        print("\n🎉 所有測試都通過！維度不匹配問題已完全修復！")
-        exit(0)
-    else:
-        print("\n❌ 部分測試失敗，需要進一步調試。")
-        exit(1)
+    try:
+        success = main()
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        print("\n⚠️  測試被用戶中斷")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ 測試執行失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
