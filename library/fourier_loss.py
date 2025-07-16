@@ -836,15 +836,17 @@ def get_fourier_loss_config(mode: str = "balanced") -> Dict[str, Any]:
 
 
 # 為訓練腳本提供的便利函數
-def apply_fourier_loss_to_args(args, mode: str = "balanced"):
+def apply_fourier_loss_to_args(args, quick_mode: str = "balanced"):
     """
     將傅立葉損失設定應用到訓練參數
 
     Args:
         args: 訓練參數對象
-        mode: 設定模式
+        quick_mode: 設定模式
     """
-    config = get_fourier_loss_config(mode)
+    quick_mode = quick_mode if quick_mode in ["conservative", "balanced", "aggressive", "super_resolution", "fine_detail", "unified_balanced", "unified_detail", "unified_adaptive", "unified_custom"] else "balanced"
+
+    config = get_fourier_loss_config(quick_mode)
 
     # 設置損失類型為 fourier
     args.loss_type = "fourier"

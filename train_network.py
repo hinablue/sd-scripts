@@ -476,7 +476,10 @@ class NetworkTrainer:
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
 
         if args.fourier_loss:
-            args = fourier_loss.apply_fourier_loss_to_args(args)
+            args = fourier_loss.apply_fourier_loss_to_args(
+                args,
+                quick_mode=args.fourier_quick_mode if hasattr(args, "fourier_quick_mode") else "balanced"
+            )
             loss = fourier_loss.conditional_loss_with_fourier(
                 noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step,
                 fourier_weight=args.fourier_weight,

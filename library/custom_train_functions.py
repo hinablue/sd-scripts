@@ -131,6 +131,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Enable fourier loss / 傅立葉特徵損失を有効にする",
     )
     parser.add_argument(
+        "--fourier_quick_mode",
+        type=str,
+        default="balanced",
+        help="quick mode for fourier loss / 傅立葉特徵損失の簡易モード",
+    )
+    parser.add_argument(
         "--fourier_weight",
         type=float,
         default=0.0,
