@@ -518,6 +518,31 @@ def apply_fourier_loss_to_args(args, mode: str = "balanced"):
     for key, value in config.items():
         setattr(args, key, value)
 
+    # 如果參數不存在，則設置為預設值
+    if hasattr(args, "fourier_weight") is False:
+        args.fourier_weight = 0.05
+    if hasattr(args, "fourier_mode") is False:
+        args.fourier_mode = "weighted"
+    if hasattr(args, "fourier_norm") is False:
+        args.fourier_norm = "l2"
+    if hasattr(args, "fourier_dims") is False:
+        args.fourier_mode = "weighted"
+        args.fourier_dims = (-2, -1)
+    if hasattr(args, "fourier_high_freq_weight") is False:
+        args.fourier_high_freq_weight = 2.0
+    if hasattr(args, "fourier_scales") is False:
+        args.fourier_scales = None
+    if hasattr(args, "fourier_scale_weights") is False:
+        args.fourier_scale_weights = None
+    if hasattr(args, "fourier_adaptive_max_weight") is False:
+        args.fourier_adaptive_max_weight = 2.0
+    if hasattr(args, "fourier_adaptive_min_weight") is False:
+        args.fourier_adaptive_min_weight = 0.5
+    if hasattr(args, "fourier_eps") is False:
+        args.fourier_eps = 1e-8
+    if hasattr(args, "fourier_warmup_steps") is False:
+        args.fourier_warmup_steps = 300
+
     return args
 
 
@@ -551,7 +576,7 @@ def validate_fourier_config(config: Dict[str, Any]) -> bool:
 
 def print_fourier_config(config: Dict[str, Any]):
     """
-    印出傅立葉損失設定信息
+    印出傅立葉損失設定訊息
 
     Args:
         config: 設定字典
