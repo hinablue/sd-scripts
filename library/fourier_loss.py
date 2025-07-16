@@ -313,7 +313,7 @@ def conditional_loss_with_fourier(
     Args:
         model_pred: 模型預測張量
         target: 目標張量
-        loss_type: 基礎損失類型 ("l1", "l2", "huber", "smooth_l1", "fourier")
+        loss_type: 基礎損失類型 ("fourier")
         reduction: 損失約簡方式 ("mean", "sum", "none")
         huber_c: Huber 損失參數
         current_step: 當前訓練步數
@@ -335,21 +335,20 @@ def conditional_loss_with_fourier(
     Returns:
         組合損失值
     """
-    # 延遲載入以避免循環載入
-    from .train_util import conditional_loss
 
-    # 如果是 fourier 損失類型，使用組合損失，否則計算基礎損失
-    if loss_type == "fourier":
-        # 使用 l2 作為基礎損失
-        base_loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+    # 計算基礎損失
+    if fourier_norm == "l1":
+        base_loss = torch.nn.functional.l1_loss(model_pred, target, reduction=reduction)
     else:
-        # 計算原有的基礎損失
-        base_loss = conditional_loss(
-            model_pred, target, loss_type, reduction, huber_c, current_step, total_steps
-        )
-        # 如果不是 fourier 類型且權重為 0，直接返回基礎損失
-        if fourier_weight <= 0.0:
-            return base_loss
+        base_loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+
+    # 如果不是 fourier 損失或權重為 0，直接返回基礎損失
+    if loss_type != "fourier" or fourier_weight <= 0.0:
+        return base_loss
+
+    # 如果權重為 0，直接返回基礎損失
+    if fourier_weight <= 0.0:
+        return base_loss
 
     # 如果在預熱期內，直接返回基礎損失
     if current_step < fourier_warmup_steps:
