@@ -395,6 +395,40 @@ def conditional_loss_with_fourier(
                 fourier_adaptive_max_weight, fourier_adaptive_min_weight,
                 fourier_dims, fourier_norm, fourier_eps
             )
+        elif fourier_mode == "unified":
+            # 使用整合模式，支持額外參數
+            unified_kwargs = {}
+            if fourier_scales is not None:
+                unified_kwargs['scales'] = fourier_scales
+            if fourier_scale_weights is not None:
+                unified_kwargs['scale_weights'] = fourier_scale_weights
+
+            fourier_loss = fourier_latent_loss_unified(
+                model_pred, target,
+                dims=fourier_dims,
+                norm_type=fourier_norm,
+                eps=fourier_eps,
+                high_freq_weight=fourier_high_freq_weight,
+                current_step=current_step,
+                total_steps=total_steps,
+                max_weight=fourier_adaptive_max_weight,
+                min_weight=fourier_adaptive_min_weight,
+                **unified_kwargs
+            )
+        elif fourier_mode in ["unified_basic", "unified_balanced", "unified_detail", "unified_adaptive"]:
+            # 使用簡化版整合模式
+            mode_map = {
+                "unified_basic": "basic",
+                "unified_balanced": "balanced",
+                "unified_detail": "detail",
+                "unified_adaptive": "adaptive"
+            }
+            fourier_loss = fourier_latent_loss_unified_simple(
+                model_pred, target,
+                mode=mode_map[fourier_mode],
+                current_step=current_step,
+                total_steps=total_steps
+            )
         else:
             raise ValueError(f"Unsupported fourier_mode: {fourier_mode}")
 
@@ -437,6 +471,279 @@ def conditional_loss_with_fourier(
         logger = logging.getLogger(__name__)
         logger.warning(f"傅立葉損失計算失敗: {e}，回退到基礎損失")
         return base_loss
+
+
+def fourier_latent_loss_unified(
+    model_pred: torch.Tensor,
+    target: torch.Tensor,
+    # 基本參數
+    dims: tuple = (-2, -1),
+    norm_type: str = "l2",
+    eps: float = 1e-8,
+    # 多尺度參數
+    scales: List[int] = None,
+    scale_weights: List[float] = None,
+    enable_multiscale: bool = True,
+    # 頻率加權參數
+    enable_frequency_weighting: bool = True,
+    high_freq_weight: float = 2.0,
+    freq_weight_per_scale: List[float] = None,  # 每個尺度的頻率權重
+    # 自適應參數
+    enable_adaptive: bool = True,
+    current_step: int = 0,
+    total_steps: int = 1000,
+    adaptive_mode: str = "linear",  # "linear", "cosine", "exponential"
+    max_weight: float = 2.5,
+    min_weight: float = 0.8,
+    # 整合策略參數
+    multiscale_weight: float = 0.6,  # 多尺度損失權重
+    weighted_weight: float = 0.4,   # 加權損失權重
+    adaptive_scaling: bool = True,   # 是否對權重進行自適應縮放
+) -> torch.Tensor:
+    """
+    整合型傅立葉潛在損失計算
+
+    結合了多尺度、頻率加權和自適應三種策略的統一實現
+
+    Args:
+        model_pred: 模型預測張量
+        target: 目標張量
+        dims: FFT 計算維度
+        norm_type: 損失範數類型
+        eps: 數值穩定性常數
+
+        # 多尺度參數
+        scales: 多尺度列表
+        scale_weights: 各尺度權重
+        enable_multiscale: 是否啟用多尺度
+
+        # 頻率加權參數
+        enable_frequency_weighting: 是否啟用頻率加權
+        high_freq_weight: 基礎高頻權重
+        freq_weight_per_scale: 每個尺度的頻率權重覆寫
+
+        # 自適應參數
+        enable_adaptive: 是否啟用自適應
+        current_step: 當前步數
+        total_steps: 總步數
+        adaptive_mode: 自適應模式
+        max_weight: 最大權重
+        min_weight: 最小權重
+
+        # 整合策略參數
+        multiscale_weight: 多尺度分量權重
+        weighted_weight: 加權分量權重
+        adaptive_scaling: 是否自適應縮放組合權重
+
+    Returns:
+        整合的傅立葉損失
+    """
+
+    # 參數驗證和預設值設定
+    if scales is None:
+        scales = [1, 2, 4] if enable_multiscale else [1]
+
+    if scale_weights is None:
+        # 動態計算尺度權重，大尺度給予更小權重
+        scale_weights = [1.0 / (scale ** 0.5) for scale in scales]
+        # 正規化權重
+        total_scale_weight = sum(scale_weights)
+        scale_weights = [w / total_scale_weight for w in scale_weights]
+
+    if freq_weight_per_scale is None:
+        freq_weight_per_scale = [high_freq_weight] * len(scales)
+    elif len(freq_weight_per_scale) != len(scales):
+        # 擴展或截斷到正確長度
+        freq_weight_per_scale = (freq_weight_per_scale + [high_freq_weight] * len(scales))[:len(scales)]
+
+    # 計算自適應權重因子
+    adaptive_factor = 1.0
+    if enable_adaptive:
+        # 計算訓練進度
+        progress = min(current_step / max(total_steps, 1), 1.0)
+
+        # 根據不同模式計算自適應因子
+        if adaptive_mode == "linear":
+            # 線性衰減：從 max_weight 到 min_weight
+            adaptive_factor = max_weight - (max_weight - min_weight) * progress
+        elif adaptive_mode == "cosine":
+            # 餘弦衰減：更平滑的過渡
+            import math
+            adaptive_factor = min_weight + (max_weight - min_weight) * 0.5 * (1 + math.cos(math.pi * progress))
+        elif adaptive_mode == "exponential":
+            # 指數衰減：早期快速下降，後期緩慢
+            import math
+            adaptive_factor = min_weight + (max_weight - min_weight) * math.exp(-5 * progress)
+        else:
+            raise ValueError(f"Unsupported adaptive_mode: {adaptive_mode}")
+
+    # 計算多尺度損失分量
+    multiscale_loss = 0.0
+    if enable_multiscale and len(scales) > 1:
+        total_loss = 0.0
+        total_weight = 0.0
+
+        for i, (scale, scale_weight) in enumerate(zip(scales, scale_weights)):
+            # 獲取該尺度的張量
+            if scale == 1:
+                pred_scaled = model_pred
+                target_scaled = target
+            else:
+                # 檢查張量維度
+                if (model_pred.dim() >= 4 and
+                    model_pred.shape[-1] >= scale and model_pred.shape[-2] >= scale):
+                    pred_scaled = torch.nn.functional.avg_pool2d(model_pred, scale)
+                    target_scaled = torch.nn.functional.avg_pool2d(target, scale)
+                else:
+                    continue
+
+            # 計算該尺度的頻率加權損失
+            if enable_frequency_weighting:
+                current_freq_weight = freq_weight_per_scale[i] * adaptive_factor
+                scale_loss = fourier_latent_loss_weighted(
+                    pred_scaled, target_scaled, current_freq_weight, dims, norm_type, eps
+                )
+            else:
+                scale_loss = fourier_latent_loss_basic(
+                    pred_scaled, target_scaled, norm_type, dims, eps
+                )
+
+            total_loss += scale_weight * scale_loss
+            total_weight += scale_weight
+
+        if total_weight > 0:
+            multiscale_loss = total_loss / total_weight
+
+    # 計算單一尺度的加權損失分量（基準尺度）
+    weighted_loss = 0.0
+    if enable_frequency_weighting:
+        current_freq_weight = high_freq_weight * adaptive_factor
+        weighted_loss = fourier_latent_loss_weighted(
+            model_pred, target, current_freq_weight, dims, norm_type, eps
+        )
+    else:
+        weighted_loss = fourier_latent_loss_basic(
+            model_pred, target, norm_type, dims, eps
+        )
+
+    # 組合損失
+    if enable_multiscale and len(scales) > 1:
+        # 自適應調整組合權重
+        if adaptive_scaling:
+            # 根據訓練進度調整多尺度和加權損失的比例
+            progress = min(current_step / max(total_steps, 1), 1.0)
+            # 早期更重視多尺度，後期更重視細節
+            current_multiscale_weight = multiscale_weight * (1.0 + 0.5 * (1.0 - progress))
+            current_weighted_weight = weighted_weight * (1.0 + 0.5 * progress)
+
+            # 正規化權重
+            total_weight = current_multiscale_weight + current_weighted_weight
+            current_multiscale_weight /= total_weight
+            current_weighted_weight /= total_weight
+        else:
+            current_multiscale_weight = multiscale_weight
+            current_weighted_weight = weighted_weight
+
+        final_loss = (current_multiscale_weight * multiscale_loss +
+                     current_weighted_weight * weighted_loss)
+    else:
+        # 如果沒有多尺度，只使用加權損失
+        final_loss = weighted_loss
+
+    # 最終約束
+    final_loss = torch.clamp(final_loss, max=10.0)
+
+    return final_loss
+
+
+def fourier_latent_loss_unified_simple(
+    model_pred: torch.Tensor,
+    target: torch.Tensor,
+    mode: str = "balanced",
+    current_step: int = 0,
+    total_steps: int = 1000,
+    **kwargs
+) -> torch.Tensor:
+    """
+    簡化版整合傅立葉損失，提供預設配置
+
+    Args:
+        model_pred: 模型預測張量
+        target: 目標張量
+        mode: 預設模式
+            - "basic": 基礎模式，主要使用單尺度加權
+            - "balanced": 平衡模式，結合多尺度和加權
+            - "detail": 細節模式，重視高頻和多尺度
+            - "adaptive": 自適應模式，強調動態調整
+        current_step: 當前步數
+        total_steps: 總步數
+        **kwargs: 其他參數覆寫
+
+    Returns:
+        傅立葉損失
+    """
+
+    # 預設配置
+    configs = {
+        "basic": {
+            "enable_multiscale": False,
+            "enable_frequency_weighting": True,
+            "enable_adaptive": True,
+            "high_freq_weight": 1.5,
+            "adaptive_mode": "linear",
+            "max_weight": 2.0,
+            "min_weight": 1.0,
+        },
+        "balanced": {
+            "enable_multiscale": True,
+            "enable_frequency_weighting": True,
+            "enable_adaptive": True,
+            "scales": [1, 2],
+            "high_freq_weight": 2.0,
+            "adaptive_mode": "linear",
+            "max_weight": 2.5,
+            "min_weight": 0.8,
+            "multiscale_weight": 0.6,
+            "weighted_weight": 0.4,
+        },
+        "detail": {
+            "enable_multiscale": True,
+            "enable_frequency_weighting": True,
+            "enable_adaptive": True,
+            "scales": [1, 2, 4],
+            "high_freq_weight": 2.5,
+            "freq_weight_per_scale": [2.0, 2.5, 3.0],
+            "adaptive_mode": "cosine",
+            "max_weight": 3.0,
+            "min_weight": 1.0,
+            "multiscale_weight": 0.7,
+            "weighted_weight": 0.3,
+        },
+        "adaptive": {
+            "enable_multiscale": True,
+            "enable_frequency_weighting": True,
+            "enable_adaptive": True,
+            "scales": [1, 2],
+            "adaptive_mode": "exponential",
+            "max_weight": 2.8,
+            "min_weight": 0.5,
+            "adaptive_scaling": True,
+        }
+    }
+
+    if mode not in configs:
+        raise ValueError(f"Unknown mode: {mode}. Available: {list(configs.keys())}")
+
+    # 合併配置和用戶參數
+    config = configs[mode].copy()
+    config.update(kwargs)
+
+    return fourier_latent_loss_unified(
+        model_pred, target,
+        current_step=current_step,
+        total_steps=total_steps,
+        **config
+    )
 
 
 # 便利函數：預設設定
@@ -491,6 +798,34 @@ def get_fourier_loss_config(mode: str = "balanced") -> Dict[str, Any]:
             "fourier_norm": "l1",
             "fourier_high_freq_weight": 2.5,
             "fourier_warmup_steps": 100
+        },
+        "unified_balanced": {
+            "fourier_weight": 0.06,
+            "fourier_mode": "unified_balanced",
+            "fourier_norm": "l2",
+            "fourier_warmup_steps": 250
+        },
+        "unified_detail": {
+            "fourier_weight": 0.08,
+            "fourier_mode": "unified_detail",
+            "fourier_norm": "l2",
+            "fourier_warmup_steps": 200
+        },
+        "unified_adaptive": {
+            "fourier_weight": 0.07,
+            "fourier_mode": "unified_adaptive",
+            "fourier_norm": "l2",
+            "fourier_warmup_steps": 300
+        },
+        "unified_custom": {
+            "fourier_weight": 0.05,
+            "fourier_mode": "unified",
+            "fourier_norm": "l2",
+            "fourier_high_freq_weight": 2.0,
+            "fourier_scales": [1, 2, 4],
+            "fourier_adaptive_max_weight": 2.5,
+            "fourier_adaptive_min_weight": 0.8,
+            "fourier_warmup_steps": 250
         }
     }
 
