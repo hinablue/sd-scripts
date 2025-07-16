@@ -7,7 +7,7 @@ Practical Example Configurations for Fourier Loss
 This file contains Fourier Loss configuration examples for various application scenarios
 """
 
-from library.train_util import apply_fourier_loss_to_args, get_fourier_loss_config
+from library.fourier_loss import apply_fourier_loss_to_args, get_fourier_loss_config
 
 
 # =============================================================================

@@ -91,13 +91,13 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 if len(state) == 0:
                     self._init_state(p, group)
                 grad = p.grad.data
+
+                update = grad
                 if grad.ndim == 2:
                     if group["orthograd"]:
                         update = self.Orthograd(p, grad)
                     if self.sinkgd_iters > 0:
                         update = self.SinkGD(update, self.sinkgd_iters)
-                else:
-                    update = grad
 
                 allora = state.get("row_scaling", 1.0)
                 p.add_(-update.mul(group["lr"] * allora))

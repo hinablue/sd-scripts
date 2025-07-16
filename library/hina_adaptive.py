@@ -282,7 +282,7 @@ class HinaAdaptive(torch.optim.Optimizer):
     3. 壓縮狀態存儲：減少 Python 對象開銷
     4. 異步計算：非關鍵計算異步執行
     5. 自適應記憶體管理：根據記憶體壓力調整策略
-    6. 邊緣和背景過擬合控制：
+    6. 邊緣過擬合控制：
        - 邊緣抑制：檢測並抑制邊緣梯度，防止邊緣過擬合
        - 頻率感知：控制高頻噪聲，保持訓練穩定性
        - 空間感知：基於空間變異數進行正則化
@@ -337,11 +337,9 @@ class HinaAdaptive(torch.optim.Optimizer):
         adaptive_features: bool = True,
         emergency_simplify: bool = True,
         max_buffer_memory_mb: int = 500,
-        # 邊緣和背景過擬合控制參數
+        # 邊緣過擬合控制參數
         edge_suppression: bool = False,
         edge_penalty: float = 0.1,
-        background_regularization: bool = False,
-        background_regularization_mode: str = "simple",  # "fast", "simple"
         # 空間感知
         spatial_awareness: bool = False,
         frequency_penalty: float = 0.05,
@@ -407,11 +405,9 @@ class HinaAdaptive(torch.optim.Optimizer):
         self.adaptive_features = adaptive_features
         self.emergency_simplify = emergency_simplify
 
-        # 邊緣和背景過擬合控制配置
+        # 邊緣過擬合控制配置
         self.edge_suppression = edge_suppression
         self.edge_penalty = edge_penalty
-        self.background_regularization = background_regularization
-        self.background_regularization_mode = background_regularization_mode
         self.spatial_awareness = spatial_awareness
         self.frequency_penalty = frequency_penalty
         self.detail_preservation = detail_preservation
@@ -425,7 +421,7 @@ class HinaAdaptive(torch.optim.Optimizer):
         self.buffer_pool = EnhancedBufferPool(max_buffer_memory_mb)
         self.async_manager = AsyncComputeManager()
 
-        # 初始化邊緣和背景過擬合控制組件
+        # 初始化邊緣過擬合控制組件
         if self.edge_suppression:
             self.edge_cache = {}  # 邊緣計算緩存
 
@@ -446,9 +442,7 @@ class HinaAdaptive(torch.optim.Optimizer):
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.enabled = True
 
-
-
-        logger.info(f"HinaAdaptive 初始化完成，記憶體預算：{vram_budget_gb}GB，背景正則化模式：{background_regularization_mode}（默認：simple）")
+        logger.info(f"HinaAdaptive 初始化完成，記憶體預算：{vram_budget_gb}GB")
 
     def _initialize_adaptive_metadata(self):
         """初始化自適應版本的元數據結構（記憶體優化版本）"""
@@ -490,7 +484,7 @@ class HinaAdaptive(torch.optim.Optimizer):
                     compact_state.set_scalar('avg_lr', self.defaults['lr'])
                     compact_state.set_scalar('warmup_complete', 0.0)  # 0.0 = False, 1.0 = True
 
-                # 邊緣和背景過擬合控制狀態初始化
+                # 邊緣過擬合控制狀態初始化
                 if self.edge_suppression:
                     device = param.device if hasattr(param, 'device') else 'cuda'
                     shape = param.shape
@@ -516,17 +510,6 @@ class HinaAdaptive(torch.optim.Optimizer):
                     # LoRA 低秩追蹤
                     compact_state.set_tensor('rank_tracker', torch.zeros(min_dim, device=device, dtype=torch.float32))
                     compact_state.set_scalar('rank_penalty_history', 0.0)
-
-                # 背景正則化狀態初始化
-                if self.background_regularization and len(param.shape) >= 2:
-                    device = param.device if hasattr(param, 'device') else 'cuda'
-                    shape = param.shape
-
-                    # 背景檢測遮罩
-                    compact_state.set_tensor('background_mask', torch.zeros(shape, device=device, dtype=torch.float32))
-                    compact_state.set_scalar('background_intensity', 0.5)
-                    compact_state.set_scalar('background_adaptation_rate', 0.05)
-                    compact_state.set_scalar('background_stability', 1.0)
 
                 self.param_groups_metadata[group_idx]['compact_states'][param_id] = compact_state
 
@@ -1168,186 +1151,11 @@ class HinaAdaptive(torch.optim.Optimizer):
 
             return grad * regularization_factor
 
-    def _apply_background_regularization_fast(self, grad: torch.Tensor, compact_state, param_id: int) -> torch.Tensor:
-        """
-        高性能版本的背景正則化，用於控制背景區域的過擬合
-        使用張量化操作消除嵌套循環
 
-        Args:
-            grad: 梯度張量
-            compact_state: 緊湊狀態
-            param_id: 參數ID
 
-        Returns:
-            背景正則化後的梯度
-        """
-        if len(grad.shape) < 2:
-            return grad
 
-        with torch.no_grad():
-            # 初始化背景檢測狀態
-            background_mask = compact_state.get_tensor('background_mask', target_device=grad.device)
-            background_intensity = compact_state.get_scalar('background_intensity', 0.5)
 
-            # 計算梯度活動度來識別背景區域
-            grad_magnitude = torch.abs(grad)
 
-            if len(grad.shape) == 2:
-                # 2D張量：使用卷積操作計算局部活動度
-                h, w = grad.shape
-                if h > 2 and w > 2:
-                    # 使用平均池化計算3x3鄰域的平均活動度
-                    # 擴展維度以適應池化操作 [1, 1, H, W]
-                    grad_4d = grad_magnitude.unsqueeze(0).unsqueeze(0)
-                    # 使用平均池化，kernel_size=3, stride=1, padding=1
-                    activity_map = torch.nn.functional.avg_pool2d(
-                        grad_4d, kernel_size=3, stride=1, padding=1
-                    ).squeeze(0).squeeze(0)
-                else:
-                    activity_map = grad_magnitude
-
-                # 使用快速分位數近似（避免排序）
-                activity_flat = activity_map.flatten()
-                sorted_indices = torch.argsort(activity_flat)
-                threshold_idx = int(0.3 * len(activity_flat))
-                activity_threshold = activity_flat[sorted_indices[threshold_idx]]
-
-                current_background_mask = (activity_map < activity_threshold).float()
-
-            elif len(grad.shape) > 2:
-                # 多維張量：批量處理所有切片
-                *batch_dims, h, w = grad.shape
-
-                if h > 2 and w > 2:
-                    # 重塑為 [B, 1, H, W] 格式
-                    grad_reshaped = grad_magnitude.view(-1, 1, h, w)
-
-                    # 批量計算所有切片的活動度
-                    activity_maps = torch.nn.functional.avg_pool2d(
-                        grad_reshaped, kernel_size=3, stride=1, padding=1
-                    )  # [B, 1, H, W]
-
-                    # 重塑回原始形狀
-                    activity_maps = activity_maps.view(grad.shape)
-
-                    # 批量計算閾值（使用全局統計）
-                    activity_flat = activity_maps.flatten()
-                    sorted_indices = torch.argsort(activity_flat)
-                    threshold_idx = int(0.3 * len(activity_flat))
-                    activity_threshold = activity_flat[sorted_indices[threshold_idx]]
-
-                    current_background_mask = (activity_maps < activity_threshold).float()
-                else:
-                    # 小張量直接使用簡單方法
-                    activity_threshold = torch.quantile(grad_magnitude.flatten(), 0.3)
-                    current_background_mask = (grad_magnitude < activity_threshold).float()
-            else:
-                # 1D或其他情況：使用簡單的低活動度檢測
-                activity_threshold = torch.quantile(grad_magnitude.flatten(), 0.3)
-                current_background_mask = (grad_magnitude < activity_threshold).float()
-
-            # 更新背景遮罩（使用指數移動平均）
-            if background_mask is not None and background_mask.shape == current_background_mask.shape:
-                # 平滑更新背景遮罩
-                background_mask = 0.9 * background_mask + 0.1 * current_background_mask
-            else:
-                background_mask = current_background_mask.clone()
-
-            # 保存更新的背景遮罩
-            compact_state.set_tensor('background_mask', background_mask)
-
-            # 計算背景強度（背景區域的比例）
-            current_background_ratio = torch.mean(background_mask).item()
-            background_intensity = 0.95 * background_intensity + 0.05 * current_background_ratio
-            compact_state.set_scalar('background_intensity', background_intensity)
-
-            # 應用背景正則化
-            # 在背景區域減少梯度更新，在前景區域保持正常更新
-            background_penalty = 0.3  # 背景區域梯度衰減因子
-            foreground_enhancement = 1.1  # 前景區域輕微增強
-
-            regularization_factor = (
-                background_mask * background_penalty +  # 背景區域使用較小的因子
-                (1.0 - background_mask) * foreground_enhancement  # 前景區域使用較大的因子
-            )
-
-            # 自適應調整正則化強度
-            if background_intensity > 0.7:
-                # 如果背景區域太多，增強正則化
-                regularization_factor = background_mask * 0.2 + (1.0 - background_mask) * 1.2
-            elif background_intensity < 0.2:
-                # 如果背景區域太少，減弱正則化
-                regularization_factor = background_mask * 0.5 + (1.0 - background_mask) * 1.05
-
-            return grad * regularization_factor
-
-    def _apply_background_regularization_simple(self, grad: torch.Tensor, compact_state, param_id: int) -> torch.Tensor:
-        """
-        超簡化版本的背景正則化，最小化計算開銷
-        僅使用全局統計，避免空間計算
-
-        Args:
-            grad: 梯度張量
-            compact_state: 緊湊狀態
-            param_id: 參數ID
-
-        Returns:
-            背景正則化後的梯度
-        """
-        if len(grad.shape) < 2:
-            return grad
-
-        with torch.no_grad():
-            # 初始化背景檢測狀態
-            background_mask = compact_state.get_tensor('background_mask', target_device=grad.device)
-            background_intensity = compact_state.get_scalar('background_intensity', 0.5)
-
-            # 使用全局梯度統計來識別背景區域（快速近似）
-            grad_magnitude = torch.abs(grad)
-
-            # 使用簡單的全局閾值（避免排序）
-            grad_mean = torch.mean(grad_magnitude)
-            grad_std = torch.std(grad_magnitude)
-            activity_threshold = grad_mean - 0.5 * grad_std  # 低於平均值0.5個標準差的區域
-
-            current_background_mask = (grad_magnitude < activity_threshold).float()
-
-            # 更新背景遮罩（使用更快的EMA）
-            if background_mask is not None and background_mask.shape == current_background_mask.shape:
-                background_mask = 0.95 * background_mask + 0.05 * current_background_mask  # 更慢的適應
-            else:
-                background_mask = current_background_mask.clone()
-
-            # 保存更新的背景遮罩
-            compact_state.set_tensor('background_mask', background_mask)
-
-            # 計算背景強度（背景區域的比例）
-            current_background_ratio = torch.mean(background_mask).item()
-            background_intensity = 0.98 * background_intensity + 0.02 * current_background_ratio
-            compact_state.set_scalar('background_intensity', background_intensity)
-
-            # 簡化的背景正則化（固定參數）
-            background_penalty = 0.5  # 背景區域梯度衰減因子
-            regularization_factor = background_mask * background_penalty + (1.0 - background_mask)
-
-            return grad * regularization_factor
-
-    def _apply_background_regularization_dispatcher(self, grad: torch.Tensor, compact_state, param_id: int) -> torch.Tensor:
-        """
-        背景正則化調度器，根據模式選擇實現
-
-        Args:
-            grad: 梯度張量
-            compact_state: 緊湊狀態
-            param_id: 參數ID
-
-        Returns:
-            背景正則化後的梯度
-        """
-        if self.background_regularization_mode == "fast":
-            return self._apply_background_regularization_fast(grad, compact_state, param_id)
-        else:  # "simple" (default)
-            return self._apply_background_regularization_simple(grad, compact_state, param_id)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1433,7 +1241,7 @@ class HinaAdaptive(torch.optim.Optimizer):
                 if self.use_agr:
                     grad = HinaAdaptive._apply_agr_regularization_optimized(grad)
 
-                # === 邊緣和背景過擬合控制 ==
+                # === 邊緣過擬合控制 ===
                 if len(grad.shape) >= 2:
                     # 邊緣感知的梯度正則化
                     if self.edge_suppression:
@@ -1470,9 +1278,7 @@ class HinaAdaptive(torch.optim.Optimizer):
                     if self.spatial_awareness:
                         grad = self._apply_spatial_awareness_regularization(grad, state)
 
-                    # === 新增：背景正則化 ===
-                    if self.background_regularization and len(grad.shape) >= 2 and compact_state is not None:
-                        grad = self._apply_background_regularization_dispatcher(grad, compact_state, param_id)
+
 
                 # LoRA 低秩正則化
                 if self.lora_rank_penalty and len(param.shape) == 2:
@@ -1624,7 +1430,7 @@ class HinaAdaptive(torch.optim.Optimizer):
                 'edge_suppression': self.edge_suppression,
                 'spatial_awareness': self.spatial_awareness,
                 'lora_rank_penalty': self.lora_rank_penalty,
-                'background_regularization': self.background_regularization,
+
             },
             'adaptation_config': {
                 'adaptation_strength': self.adaptation_strength,

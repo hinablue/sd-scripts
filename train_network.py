@@ -27,6 +27,7 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, strategy_base, strategy_sd
 
 import library.train_util as train_util
+import library.fourier_loss as fourier_loss
 from library.train_util import DreamBoothDataset
 import library.config_util as config_util
 from library.config_util import (
@@ -475,8 +476,8 @@ class NetworkTrainer:
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
 
         if args.fourier_loss:
-            args = train_util.apply_fourier_loss_to_args(args)
-            loss = train_util.conditional_loss_with_fourier(
+            args = fourier_loss.apply_fourier_loss_to_args(args)
+            loss = fourier_loss.conditional_loss_with_fourier(
                 noise_pred.float(), target.float(), args.loss_type, "none", huber_c, step, global_step,
                 fourier_weight=args.fourier_weight,
                 fourier_norm=args.fourier_norm,

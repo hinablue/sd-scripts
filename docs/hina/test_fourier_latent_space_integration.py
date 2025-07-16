@@ -20,12 +20,12 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 try:
-    from library.train_util import (
+    from library.fourier_loss import (
         conditional_loss_with_fourier,
         get_fourier_loss_config,
-        apply_fourier_loss_to_args,
-        conditional_loss
+        apply_fourier_loss_to_args
     )
+    from library.train_util import conditional_loss
     print("✅ 成功導入傅立葉損失函數")
 except ImportError as e:
     print(f"❌ 導入失敗: {e}")
