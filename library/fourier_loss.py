@@ -15,7 +15,7 @@
 import torch
 import logging
 from typing import Optional, List, Dict, Any, Tuple
-
+import json
 
 def create_frequency_weight_mask(height: int, width: int, high_freq_weight: float = 2.0,
                                 device: str = None, dtype: torch.dtype = None) -> torch.Tensor:
@@ -654,34 +654,10 @@ def fourier_latent_loss_unified(
 
     return final_loss
 
-
-def fourier_latent_loss_unified_simple(
-    model_pred: torch.Tensor,
-    target: torch.Tensor,
-    mode: str = "balanced",
-    current_step: int = 0,
-    total_steps: int = 1000,
-    **kwargs
-) -> torch.Tensor:
+def get_fourier_loss_unified_config(mode: str = "balanced") -> Dict[str, Any]:
     """
-    簡化版整合傅立葉損失，提供預設配置
-
-    Args:
-        model_pred: 模型預測張量
-        target: 目標張量
-        mode: 預設模式
-            - "basic": 基礎模式，主要使用單尺度加權
-            - "balanced": 平衡模式，結合多尺度和加權
-            - "detail": 細節模式，重視高頻和多尺度
-            - "adaptive": 自適應模式，強調動態調整
-        current_step: 當前步數
-        total_steps: 總步數
-        **kwargs: 其他參數覆寫
-
-    Returns:
-        傅立葉損失
+    獲取預設的整合傅立葉損失設定
     """
-
     # 預設配置
     configs = {
         "basic": {
@@ -733,8 +709,37 @@ def fourier_latent_loss_unified_simple(
     if mode not in configs:
         raise ValueError(f"Unknown mode: {mode}. Available: {list(configs.keys())}")
 
+    return configs[mode]
+
+def fourier_latent_loss_unified_simple(
+    model_pred: torch.Tensor,
+    target: torch.Tensor,
+    mode: str = "balanced",
+    current_step: int = 0,
+    total_steps: int = 1000,
+    **kwargs
+) -> torch.Tensor:
+    """
+    簡化版整合傅立葉損失，提供預設配置
+
+    Args:
+        model_pred: 模型預測張量
+        target: 目標張量
+        mode: 預設模式
+            - "basic": 基礎模式，主要使用單尺度加權
+            - "balanced": 平衡模式，結合多尺度和加權
+            - "detail": 細節模式，重視高頻和多尺度
+            - "adaptive": 自適應模式，強調動態調整
+        current_step: 當前步數
+        total_steps: 總步數
+        **kwargs: 其他參數覆寫
+
+    Returns:
+        傅立葉損失
+    """
+
     # 合併配置和用戶參數
-    config = configs[mode].copy()
+    config = get_fourier_loss_unified_config(mode).copy()
     config.update(kwargs)
 
     return fourier_latent_loss_unified(
@@ -862,7 +867,6 @@ def apply_fourier_loss_to_args(args, quick_mode: str = "balanced"):
     if hasattr(args, "fourier_norm") is False:
         args.fourier_norm = "l2"
     if hasattr(args, "fourier_dims") is False:
-        args.fourier_mode = "weighted"
         args.fourier_dims = (-2, -1)
     if hasattr(args, "fourier_high_freq_weight") is False:
         args.fourier_high_freq_weight = 2.0
@@ -879,45 +883,15 @@ def apply_fourier_loss_to_args(args, quick_mode: str = "balanced"):
     if hasattr(args, "fourier_warmup_steps") is False:
         args.fourier_warmup_steps = 300
 
+    if args.fourier_mode in ["unified_basic", "unified_balanced", "unified_detail", "unified_adaptive"]:
+        # 使用簡化版整合模式
+        mode_map = {
+            "unified_basic": "basic",
+            "unified_balanced": "balanced",
+            "unified_detail": "detail",
+            "unified_adaptive": "adaptive"
+        }
+        args.fourier_unified_config = json.dumps(get_fourier_loss_unified_config(mode_map[args.fourier_mode]))
+
     return args
 
-
-# 實用工具函數
-def validate_fourier_config(config: Dict[str, Any]) -> bool:
-    """
-    驗證傅立葉損失設定的有效性
-
-    Args:
-        config: 設定字典
-
-    Returns:
-        是否有效
-    """
-    required_keys = ["fourier_weight", "fourier_mode"]
-    for key in required_keys:
-        if key not in config:
-            return False
-
-    # 驗證模式
-    valid_modes = ["basic", "weighted", "multiscale", "adaptive"]
-    if config["fourier_mode"] not in valid_modes:
-        return False
-
-    # 驗證權重範圍
-    if not (0.0 <= config["fourier_weight"] <= 1.0):
-        return False
-
-    return True
-
-
-def print_fourier_config(config: Dict[str, Any]):
-    """
-    印出傅立葉損失設定訊息
-
-    Args:
-        config: 設定字典
-    """
-    print("=== 傅立葉損失設定 ===")
-    for key, value in config.items():
-        print(f"{key}: {value}")
-    print("=" * 30)
