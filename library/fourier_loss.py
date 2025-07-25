@@ -891,7 +891,7 @@ def apply_fourier_loss_to_args(args, quick_mode: str = "balanced"):
             "unified_detail": "detail",
             "unified_adaptive": "adaptive"
         }
-        args.fourier_unified_config = json.dumps(get_fourier_loss_unified_config(mode_map[args.fourier_mode]))
+        args.fourier_unified_config = get_fourier_loss_unified_config(mode_map[args.fourier_mode])
 
     return args
 

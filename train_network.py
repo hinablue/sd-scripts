@@ -1075,6 +1075,21 @@ class NetworkTrainer:
             "ss_resize_interpolation": args.resize_interpolation,
         }
 
+        if args.loss_type == "fourier":
+            metadata["ss_fourier_quick_mode"] = args.fourier_quick_mode
+            metadata["ss_fourier_mode"] = args.fourier_mode
+            metadata["ss_fourier_weight"] = args.fourier_weight
+            metadata["ss_fourier_norm"] = args.fourier_norm
+            metadata["ss_fourier_dims"] = args.fourier_dims
+            metadata["ss_fourier_high_freq_weight"] = args.fourier_high_freq_weight
+            metadata["ss_fourier_scales"] = args.fourier_scales
+            metadata["ss_fourier_scale_weights"] = args.fourier_scale_weights
+            metadata["ss_fourier_adaptive_max_weight"] = args.fourier_adaptive_max_weight
+            metadata["ss_fourier_adaptive_min_weight"] = args.fourier_adaptive_min_weight
+            metadata["ss_fourier_eps"] = args.fourier_eps
+            metadata["ss_fourier_warmup_steps"] = args.fourier_warmup_steps
+            metadata["ss_fourier_unified_config"] = args.fourier_unified_config
+
         self.update_metadata(metadata, args)  # architecture specific metadata
 
         if use_user_config:
