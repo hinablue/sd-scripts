@@ -774,7 +774,7 @@ def train(args):
                 )
 
                 # 指定ステップごとにモデルを保存
-                if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                if args.save_every_n_steps is not None and args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
@@ -821,7 +821,7 @@ def train(args):
 
         accelerator.wait_for_everyone()
 
-        if args.save_every_n_epochs is not None:
+        if args.save_every_n_epochs is not None and args.save_every_n_epochs > 0:
             if accelerator.is_main_process:
                 src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
                 sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(

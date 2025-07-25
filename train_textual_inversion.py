@@ -664,7 +664,7 @@ class TextualInversionTrainer:
                     )
 
                     # 指定ステップごとにモデルを保存
-                    if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    if args.save_every_n_steps is not None and args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             updated_embs_list = []
@@ -719,7 +719,7 @@ class TextualInversionTrainer:
                 updated_embs = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[token_ids].data.detach().clone()
                 updated_embs_list.append(updated_embs)
 
-            if args.save_every_n_epochs is not None:
+            if args.save_every_n_epochs is not None and args.save_every_n_epochs > 0:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if accelerator.is_main_process and saving:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
