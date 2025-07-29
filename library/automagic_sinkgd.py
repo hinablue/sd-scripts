@@ -9,14 +9,14 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 2e-4,
+        lr: float = 1e-4,
         allora: bool = True,
         eta: float = 2,
         orthograd: bool = False,
         sinkgd_iters: int = 1,
-        beta1: float = 0.8,
-        decay: float = 0.997,
-        weight_decay: float = 4e-5,
+        beta1: float = 0.9,
+        decay: float = 0.9995,
+        weight_decay: float = 0,
         warmup_steps: int = 200,
     ):
         self.lr = lr
@@ -122,20 +122,15 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 state['step'] += 1
                 self._step = state["step"] + 1
                 beta1 = group["beta1"]
-                gsnr_decay = group["decay"] ** state['step']
-                gsnr = state["gsnr"]
+                beta1_decay = group["decay"] ** state['step']
+                beta1 = beta1 * beta1_decay
 
-                if beta1 > 0:
+                if beta1 > 0.1:
                     if 'exp_avg' not in state:
                         state['exp_avg'] = torch.zeros_like(p.data)
                     exp_avg = state['exp_avg']
                     exp_avg.mul_(beta1).add_(grad, alpha = 1 - beta1)
-                    exp_avg_bar = exp_avg.mul(beta1).add(grad, alpha = 1 - beta1)
-                    # === Grams ===
-                    #Grams: Gradient Descent with Adaptive Momentum Scaling
-                    #https://arxiv.org/abs/2412.17107
-                    #https://github.com/kozistr/pytorch_optimizer/blob/main/pytorch_optimizer/optimizer/grams.py
-                    update = (exp_avg_bar).abs().mul_(grad.sign())
+                    update = exp_avg + grad
                 else:
                     update = grad
 
@@ -143,8 +138,6 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     if group["orthograd"]:
                         update = self.Orthograd(p, update)
                     update = self.SinkGD(update, self.sinkgd_iters)
-                else:
-                    update = update * gsnr
 
                 allora = state.get("row_scaling", 1.0)
                 lr = group["lr"] * allora
