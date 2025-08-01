@@ -109,7 +109,6 @@ class ANLO(torch.optim.Optimizer):
             logger.info(f"Cautious update: {'Enabled' if use_cautious_update else 'Disabled'}")
 
     @staticmethod
-    @torch.jit.script
     def _compute_global_norm(params: List[torch.Tensor]) -> torch.Tensor:
         """
         計算所有參數梯度的全局 L2 範數
@@ -135,7 +134,6 @@ class ANLO(torch.optim.Optimizer):
         return global_norm
 
     @staticmethod
-    @torch.jit.script
     def _compute_layer_norm(param_group: Dict[str, Any]) -> torch.Tensor:
         """
         計算單個參數組內所有梯度的 L2 範數
@@ -161,7 +159,6 @@ class ANLO(torch.optim.Optimizer):
         return layer_norm
 
     @staticmethod
-    @torch.jit.script
     def _adaptive_eps(group: Dict[str, Any], step: int) -> float:
         """
         計算自適應 eps 值
@@ -184,7 +181,6 @@ class ANLO(torch.optim.Optimizer):
         return adaptive_eps
 
     @staticmethod
-    @torch.jit.script
     def _apply_cautious_update_optimized(update: torch.Tensor, grad: torch.Tensor,
                                        threshold: float = 0.1, scale: float = 0.5) -> torch.Tensor:
         """
@@ -292,8 +288,10 @@ class ANLO(torch.optim.Optimizer):
 
             if should_normalize:
                 # 交替正規化決策
-                if self.step_count % 2 == 0:
-                    # 偶數步：全局正規化
+                normalization_count = self.step_count // normalize_frequency
+
+                if normalization_count % 2 == 0:
+                    # 偶數正規化次數：全局正規化
                     if verbose and self.step_count % 100 == 0:
                         logger.info(f"Step {self.step_count}: Applying global normalization")
 
@@ -305,7 +303,7 @@ class ANLO(torch.optim.Optimizer):
                     self._apply_global_normalization(all_params, group)
 
                 else:
-                    # 奇數步：層級正規化
+                    # 奇數正規化次數：層級正規化
                     if verbose and self.step_count % 100 == 0:
                         logger.info(f"Step {self.step_count}: Applying layer normalization")
 
