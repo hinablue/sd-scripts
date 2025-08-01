@@ -36,6 +36,7 @@ from library.custom_hina_adamw_optimizer import HinaAdamWOptimizer
 from library.custom_hina_adaptive_adamw_optimizer import AdaptiveHinaAdamW
 from library.custom_hina_adaptive_adamw_memory_optimized import MemoryOptimizedAdaptiveHinaAdamW
 from library.hina_adaptive import HinaAdaptive
+from library.hina_anlo import ANLO
 from library.automagic_sinkgd import Automagic_Sinkgd
 from library.automagic_splus import Automagic_Splus
 
@@ -4859,6 +4860,11 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
             logger.info(f"Features: {opt_info['features']}")
             logger.info(f"Adaptation: {opt_info['adaptation_config']}")
             logger.info(f"Memory Optimization: {opt_info['memory_optimization']}")
+
+    elif optimizer_type == "HinaANLO".lower():
+        logger.info(f"use Hina ANLO optimizer | {optimizer_kwargs}")
+        optimizer_class = ANLO
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type.endswith("8bit".lower()):
         try:
