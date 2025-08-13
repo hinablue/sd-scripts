@@ -497,6 +497,52 @@ def get_noisy_model_input_and_timesteps(
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
         sigmas = time_shift(mu, 1.0, sigmas)
         timesteps = sigmas * num_timesteps
+    elif args.timestep_sampling == "qinglong_flux":
+        decision_t = torch.rand((bsz,), device=device)
+        mid_mask = decision_t < 0.80  # 80% for mid_shift
+        logsnr_mask = (decision_t >= 0.80) & (decision_t < 0.875)  # 7.5% for logsnr
+        logsnr_mask2 = decision_t >= 0.875  # 12.5% for logsnr with -logit_mean
+
+        t = torch.zeros((bsz,), device=device)
+
+        if mid_mask.any():
+            mid_count = mid_mask.sum().item()
+            h, w = latents.shape[-2:]
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            shift = math.exp(mu)
+            logits_norm_mid = torch.randn(mid_count, device=device)
+            logits_norm_mid = logits_norm_mid * args.sigmoid_scale
+            t_mid = logits_norm_mid.sigmoid()
+            t_mid = (t_mid * shift) / (1 + (shift - 1) * t_mid)
+
+            t[mid_mask] = t_mid
+
+        # Generate logsnr samples for selected indices (7.5%)
+        if logsnr_mask.any():
+            logsnr_count = logsnr_mask.sum().item()
+            logsnr = torch.normal(mean=args.logit_mean, std=args.logit_std, size=(logsnr_count,), device=device)
+            t_logsnr = torch.sigmoid(-logsnr / 2)
+
+            t[logsnr_mask] = t_logsnr
+
+        # Generate logsnr2 samples with -logit_mean for selected indices (12.5%)
+        if logsnr_mask2.any():
+            logsnr2_count = logsnr_mask2.sum().item()
+            logsnr2 = torch.normal(mean=5.36, std=1.0, size=(logsnr2_count,), device=device)
+            t_logsnr2 = torch.sigmoid(-logsnr2 / 2)
+
+            t[logsnr_mask2] = t_logsnr2
+
+        t_min = args.min_timestep if args.min_timestep is not None else 0
+        t_max = args.max_timestep if args.max_timestep is not None else 1000.0
+        t_min /= 1000.0
+        t_max /= 1000.0
+
+        t = t * (t_max - t_min) + t_min
+        timesteps = t * 1000.0
+        timesteps += 1
+
+        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
