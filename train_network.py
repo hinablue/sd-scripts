@@ -24,7 +24,7 @@ from accelerate.utils import set_seed
 from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from library import deepspeed_utils, model_util, strategy_base, strategy_sd
+from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
 
 import library.train_util as train_util
 import library.fourier_loss as fourier_loss
@@ -176,7 +176,7 @@ class NetworkTrainer:
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(64)
 
-    def load_target_model(self, args, weight_dtype, accelerator):
+    def load_target_model(self, args, weight_dtype, accelerator) -> tuple:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
         # モデルに xformers とか memory efficient attention を組み込む
@@ -426,12 +426,13 @@ class NetworkTrainer:
         if text_encoder_outputs_list is not None:
             text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
 
+
         if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
             # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
             with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
                 # Get the text embedding for conditioning
                 if args.weighted_captions:
-                    input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                    input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch['captions'])
                     encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
                         tokenize_strategy,
                         self.get_models_for_text_encoding(args, accelerator, text_encoders),
@@ -677,7 +678,7 @@ class NetworkTrainer:
         net_kwargs = {}
         if args.network_args is not None:
             for net_arg in args.network_args:
-                key, value = net_arg.split("=")
+                key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
@@ -1603,6 +1604,7 @@ class NetworkTrainer:
                     self.sample_images(
                         accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                     )
+                    progress_bar.unpause()
 
                     # 指定ステップごとにモデルを保存
                     if args.save_every_n_steps is not None and args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
@@ -1820,6 +1822,7 @@ class NetworkTrainer:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+            progress_bar.unpause()
             optimizer_train_fn()
 
             # end of epoch
@@ -1848,6 +1851,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, True)
     train_util.add_training_arguments(parser, True)
     train_util.add_masked_loss_arguments(parser)
