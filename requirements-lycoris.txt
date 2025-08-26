@@ -1,2 +1,0 @@
-# LyCORIS for advanced LoRA methods
--e ./lycoris
