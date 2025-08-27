@@ -16,7 +16,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-import lora_flux as lora_flux
+import lora_sd3 as lora_sd3
 from library import sai_model_spec, train_util
 
 
@@ -49,11 +49,12 @@ def save_to_file(file_name, state_dict: Dict[str, Union[Any, torch.Tensor]], dty
         save_file(state_dict, file_name, metadata=metadata)
 
 
-def merge_to_flux_model(
+def merge_to_sd3_model(
     loading_device,
     working_device,
-    flux_path: str,
+    sd3_path: str,
     clip_l_path: str,
+    clip_g_path: str,
     t5xxl_path: str,
     models,
     ratios,
@@ -63,14 +64,14 @@ def merge_to_flux_model(
 ):
     # create module map without loading state_dict
     lora_name_to_module_key = {}
-    if flux_path is not None:
-        logger.info(f"loading keys from FLUX.1 model: {flux_path}")
-        with safe_open(flux_path, framework="pt", device=loading_device) as flux_file:
-            keys = list(flux_file.keys())
+    if sd3_path is not None:
+        logger.info(f"loading keys from SD3 model: {sd3_path}")
+        with safe_open(sd3_path, framework="pt", device=loading_device) as sd3_file:
+            keys = list(sd3_file.keys())
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_FLUX + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_SD3 + "_" + module_name.replace(".", "_")
                     lora_name_to_module_key[lora_name] = key
 
     lora_name_to_clip_l_key = {}
@@ -81,8 +82,19 @@ def merge_to_flux_model(
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP_L + "_" + module_name.replace(".", "_")
                     lora_name_to_clip_l_key[lora_name] = key
+
+    lora_name_to_clip_g_key = {}
+    if clip_g_path is not None:
+        logger.info(f"loading keys from clip_g model: {clip_g_path}")
+        with safe_open(clip_g_path, framework="pt", device=loading_device) as clip_g_file:
+            keys = list(clip_g_file.keys())
+            for key in keys:
+                if key.endswith(".weight"):
+                    module_name = ".".join(key.split(".")[:-1])
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP_G + "_" + module_name.replace(".", "_")
+                    lora_name_to_clip_g_key[lora_name] = key
 
     lora_name_to_t5xxl_key = {}
     if t5xxl_path is not None:
@@ -92,32 +104,40 @@ def merge_to_flux_model(
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_T5 + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_T5 + "_" + module_name.replace(".", "_")
                     lora_name_to_t5xxl_key[lora_name] = key
 
-    flux_state_dict = {}
+    sd3_state_dict = {}
     clip_l_state_dict = {}
+    clip_g_state_dict = {}
     t5xxl_state_dict = {}
     if mem_eff_load_save:
-        if flux_path is not None:
-            with MemoryEfficientSafeOpen(flux_path) as flux_file:
-                for key in tqdm(flux_file.keys()):
-                    flux_state_dict[key] = flux_file.get_tensor(key).to(loading_device)  # dtype is not changed
+        if sd3_path is not None:
+            with MemoryEfficientSafeOpen(sd3_path) as sd3_file:
+                for key in tqdm(sd3_file.keys()):
+                    sd3_state_dict[key] = sd3_file.get_tensor(key).to(loading_device)  # dtype is not changed
 
         if clip_l_path is not None:
             with MemoryEfficientSafeOpen(clip_l_path) as clip_l_file:
                 for key in tqdm(clip_l_file.keys()):
                     clip_l_state_dict[key] = clip_l_file.get_tensor(key).to(loading_device)
 
+        if clip_g_path is not None:
+            with MemoryEfficientSafeOpen(clip_g_path) as clip_g_file:
+                for key in tqdm(clip_g_file.keys()):
+                    clip_g_state_dict[key] = clip_g_file.get_tensor(key).to(loading_device)
+
         if t5xxl_path is not None:
             with MemoryEfficientSafeOpen(t5xxl_path) as t5xxl_file:
                 for key in tqdm(t5xxl_file.keys()):
                     t5xxl_state_dict[key] = t5xxl_file.get_tensor(key).to(loading_device)
     else:
-        if flux_path is not None:
-            flux_state_dict = load_file(flux_path, device=loading_device)
+        if sd3_path is not None:
+            sd3_state_dict = load_file(sd3_path, device=loading_device)
         if clip_l_path is not None:
             clip_l_state_dict = load_file(clip_l_path, device=loading_device)
+        if clip_g_path is not None:
+            clip_g_state_dict = load_file(clip_g_path, device=loading_device)
         if t5xxl_path is not None:
             t5xxl_state_dict = load_file(t5xxl_path, device=loading_device)
 
@@ -134,10 +154,13 @@ def merge_to_flux_model(
 
                 if lora_name in lora_name_to_module_key:
                     module_weight_key = lora_name_to_module_key[lora_name]
-                    state_dict = flux_state_dict
+                    state_dict = sd3_state_dict
                 elif lora_name in lora_name_to_clip_l_key:
                     module_weight_key = lora_name_to_clip_l_key[lora_name]
                     state_dict = clip_l_state_dict
+                elif lora_name in lora_name_to_clip_g_key:
+                    module_weight_key = lora_name_to_clip_g_key[lora_name]
+                    state_dict = clip_g_state_dict
                 elif lora_name in lora_name_to_t5xxl_key:
                     module_weight_key = lora_name_to_t5xxl_key[lora_name]
                     state_dict = t5xxl_state_dict
@@ -188,20 +211,20 @@ def merge_to_flux_model(
         if len(lora_sd) > 0:
             logger.warning(f"Unused keys in LoRA model: {list(lora_sd.keys())}")
 
-    return flux_state_dict, clip_l_state_dict, t5xxl_state_dict
+    return sd3_state_dict, clip_l_state_dict, clip_g_state_dict, t5xxl_state_dict
 
 
-def merge_to_flux_model_diffusers(
-    loading_device, working_device, flux_model, models, ratios, merge_dtype, save_dtype, mem_eff_load_save=False
+def merge_to_sd3_model_diffusers(
+    loading_device, working_device, sd3_model, models, ratios, merge_dtype, save_dtype, mem_eff_load_save=False
 ):
-    logger.info(f"loading keys from FLUX.1 model: {flux_model}")
+    logger.info(f"loading keys from SD3 model: {sd3_model}")
     if mem_eff_load_save:
-        flux_state_dict = {}
-        with MemoryEfficientSafeOpen(flux_model) as flux_file:
-            for key in tqdm(flux_file.keys()):
-                flux_state_dict[key] = flux_file.get_tensor(key).to(loading_device)  # dtype is not changed
+        sd3_state_dict = {}
+        with MemoryEfficientSafeOpen(sd3_model) as sd3_file:
+            for key in tqdm(sd3_file.keys()):
+                sd3_state_dict[key] = sd3_file.get_tensor(key).to(loading_device)  # dtype is not changed
     else:
-        flux_state_dict = load_file(flux_model, device=loading_device)
+        sd3_state_dict = load_file(sd3_model, device=loading_device)
 
     def create_key_map(n_double_layers, n_single_layers):
         key_map = {}
@@ -280,7 +303,7 @@ def merge_to_flux_model_diffusers(
 
     key_map = create_key_map(18, 38)  # 18 double layers, 38 single layers
 
-    def find_matching_key(flux_dict, lora_key):
+    def find_matching_key(sd3_dict, lora_key):
         lora_key = lora_key.replace("diffusion_model.", "")
         lora_key = lora_key.replace("transformer.", "")
         lora_key = lora_key.replace("lora_A", "lora_down").replace("lora_B", "lora_up")
@@ -330,14 +353,14 @@ def merge_to_flux_model_diffusers(
         # print("lora_key after mapping", lora_key)
 
         if lora_key in key_map:
-            flux_key = key_map[lora_key]
-            logger.info(f"Found matching key: {flux_key}")
-            return flux_key
+            sd3_key = key_map[lora_key]
+            logger.info(f"Found matching key: {sd3_key}")
+            return sd3_key
 
         # If not found in key_map, try partial matching
         potential_key = lora_key + ".weight"
         logger.info(f"Searching for key: {potential_key}")
-        matches = [k for k in flux_dict.keys() if potential_key in k]
+        matches = [k for k in sd3_dict.keys() if potential_key in k]
         if matches:
             logger.info(f"Found matching key: {matches[0]}")
             return matches[0]
@@ -356,13 +379,13 @@ def merge_to_flux_model_diffusers(
                 alpha_key = key[: key.index("lora_down" if "lora_down" in key else "lora_A")] + "alpha"
 
                 logger.info(f"Processing LoRA key: {lora_name}")
-                flux_key = find_matching_key(flux_state_dict, lora_name)
+                sd3_key = find_matching_key(sd3_state_dict, lora_name)
 
-                if flux_key is None:
+                if sd3_key is None:
                     logger.warning(f"no module found for LoRA weight: {key}")
                     continue
 
-                logger.info(f"Merging LoRA key {lora_name} into Flux key {flux_key}")
+                logger.info(f"Merging LoRA key {lora_name} into SD3 key {sd3_key}")
 
                 down_weight = lora_sd[key]
                 up_weight = lora_sd[up_key]
@@ -371,7 +394,7 @@ def merge_to_flux_model_diffusers(
                 alpha = lora_sd.get(alpha_key, dim)
                 scale = alpha / dim
 
-                weight = flux_state_dict[flux_key]
+                weight = sd3_state_dict[sd3_key]
 
                 weight = weight.to(working_device, merge_dtype)
                 up_weight = up_weight.to(working_device, merge_dtype)
@@ -380,11 +403,11 @@ def merge_to_flux_model_diffusers(
                 # print(up_weight.size(), down_weight.size(), weight.size())
 
                 if lora_name.startswith("transformer."):
-                    if "qkv" in flux_key or "linear1" in flux_key:  # combined qkv or qkv+mlp
+                    if "qkv" in sd3_key or "linear1" in sd3_key:  # combined qkv or qkv+mlp
                         update = ratio * (up_weight @ down_weight) * scale
                         # print(update.shape)
 
-                        if "img_attn" in flux_key or "txt_attn" in flux_key:
+                        if "img_attn" in sd3_key or "txt_attn" in sd3_key:
                             q, k, v = torch.chunk(weight, 3, dim=0)
                             if "to_q" in lora_name or "add_q_proj" in lora_name:
                                 q += update.reshape(q.shape)
@@ -393,7 +416,7 @@ def merge_to_flux_model_diffusers(
                             elif "to_v" in lora_name or "add_v_proj" in lora_name:
                                 v += update.reshape(v.shape)
                             weight = torch.cat([q, k, v], dim=0)
-                        elif "linear1" in flux_key:
+                        elif "linear1" in sd3_key:
                             q, k, v = torch.chunk(weight[: int(update.shape[-1] * 3)], 3, dim=0)
                             mlp = weight[int(update.shape[-1] * 3) :]
                             # print(q.shape, k.shape, v.shape, mlp.shape)
@@ -433,14 +456,14 @@ def merge_to_flux_model_diffusers(
                         conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
                         weight = weight + ratio * conved * scale
 
-                flux_state_dict[flux_key] = weight.to(loading_device, save_dtype)
-                merged_keys.add(flux_key)
+                sd3_state_dict[sd3_key] = weight.to(loading_device, save_dtype)
+                merged_keys.add(sd3_key)
                 del up_weight
                 del down_weight
                 del weight
 
     logger.info(f"Merged keys: {sorted(list(merged_keys))}")
-    return flux_state_dict
+    return sd3_state_dict
 
 
 def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
@@ -568,26 +591,30 @@ def merge(args):
         save_dtype = merge_dtype
 
     assert (
-        args.save_to or args.clip_l_save_to or args.t5xxl_save_to
-    ), "save_to or clip_l_save_to or t5xxl_save_to must be specified / save_toまたはclip_l_save_toまたはt5xxl_save_toを指定してください"
-    dest_dir = os.path.dirname(args.save_to or args.clip_l_save_to or args.t5xxl_save_to)
+        args.save_to or args.clip_l_save_to or args.clip_g_save_to or args.t5xxl_save_to
+    ), "save_to or clip_l_save_to or clip_g_save_to or t5xxl_save_to must be specified / save_toまたはclip_l_save_toまたはclip_g_save_toまたはt5xxl_save_toを指定してください"
+    dest_dir = os.path.dirname(args.save_to or args.clip_l_save_to or args.clip_g_save_to or args.t5xxl_save_to)
     if not os.path.exists(dest_dir):
         logger.info(f"creating directory: {dest_dir}")
         os.makedirs(dest_dir)
 
-    if args.flux_model is not None or args.clip_l is not None or args.t5xxl is not None:
+    if args.sd3_model is not None or args.clip_l is not None or args.clip_g is not None or args.t5xxl is not None:
         if not args.diffusers:
             assert (args.clip_l is None and args.clip_l_save_to is None) or (
                 args.clip_l is not None and args.clip_l_save_to is not None
             ), "clip_l_save_to must be specified if clip_l is specified / clip_lが指定されている場合はclip_l_save_toも指定してください"
+            assert (args.clip_g is None and args.clip_g_save_to is None) or (
+                args.clip_g is not None and args.clip_g_save_to is not None
+            ), "clip_g_save_to must be specified if clip_g is specified / clip_gが指定されている場合はclip_g_save_toも指定してください"
             assert (args.t5xxl is None and args.t5xxl_save_to is None) or (
                 args.t5xxl is not None and args.t5xxl_save_to is not None
             ), "t5xxl_save_to must be specified if t5xxl is specified / t5xxlが指定されている場合はt5xxl_save_toも指定してください"
-            flux_state_dict, clip_l_state_dict, t5xxl_state_dict = merge_to_flux_model(
+            sd3_state_dict, clip_l_state_dict, clip_g_state_dict, t5xxl_state_dict = merge_to_sd3_model(
                 args.loading_device,
                 args.working_device,
-                args.flux_model,
+                args.sd3_model,
                 args.clip_l,
+                args.clip_g,
                 args.t5xxl,
                 args.models,
                 args.ratios,
@@ -597,12 +624,12 @@ def merge(args):
             )
         else:
             assert (
-                args.clip_l is None and args.t5xxl is None
-            ), "clip_l and t5xxl are not supported with --diffusers / clip_l、t5xxlはDiffusersではサポートされていません"
-            flux_state_dict = merge_to_flux_model_diffusers(
+                args.clip_l is None and args.clip_g is None and args.t5xxl is None
+            ), "clip_l, clip_g and t5xxl are not supported with --diffusers / clip_l、clip_g、t5xxlはDiffusersではサポートされていません"
+            sd3_state_dict = merge_to_sd3_model_diffusers(
                 args.loading_device,
                 args.working_device,
-                args.flux_model,
+                args.sd3_model,
                 args.models,
                 args.ratios,
                 merge_dtype,
@@ -610,44 +637,48 @@ def merge(args):
                 args.mem_eff_load_save,
             )
             clip_l_state_dict = None
+            clip_g_state_dict = None
             t5xxl_state_dict = None
 
-        if args.no_metadata or (flux_state_dict is None or len(flux_state_dict) == 0):
+        if args.no_metadata or (sd3_state_dict is None or len(sd3_state_dict) == 0):
             sai_metadata = None
         else:
-            merged_from = sai_model_spec.build_merged_from([args.flux_model] + args.models)
+            merged_from = sai_model_spec.build_merged_from([args.sd3_model] + args.models)
             title = os.path.splitext(os.path.basename(args.save_to))[0]
 
-            if args.model_type == "dev":
-                model_config = {"flux": "dev"}
-            elif args.model_type == "schnell":
-                model_config = {"flux": "schnell"}
-            elif args.model_type == "chroma":
-                model_config = {"flux": "chroma"}
+            if args.model_type == "large":
+                model_config = {"sd3": "-5-large"}
+            elif args.model_type == "medium":
+                model_config = {"sd3": "-5-medium"}
             else:
                 model_config = None
+
             sai_metadata = sai_model_spec.build_metadata(
                 None, False, False, False, False, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
             )
 
-        if flux_state_dict is not None and len(flux_state_dict) > 0:
-            logger.info(f"saving FLUX model to: {args.save_to}")
-            save_to_file(args.save_to, flux_state_dict, save_dtype, sai_metadata, args.mem_eff_load_save)
+        if sd3_state_dict is not None and len(sd3_state_dict) > 0:
+            logger.info(f"saving SD3 model to: {args.save_to}")
+            save_to_file(args.save_to, sd3_state_dict, save_dtype, sai_metadata, args.mem_eff_load_save)
 
         if clip_l_state_dict is not None and len(clip_l_state_dict) > 0:
             logger.info(f"saving clip_l model to: {args.clip_l_save_to}")
             save_to_file(args.clip_l_save_to, clip_l_state_dict, save_dtype, None, args.mem_eff_load_save)
+
+        if clip_g_state_dict is not None and len(clip_g_state_dict) > 0:
+            logger.info(f"saving clip_g model to: {args.clip_g_save_to}")
+            save_to_file(args.clip_g_save_to, clip_g_state_dict, save_dtype, None, args.mem_eff_load_save)
 
         if t5xxl_state_dict is not None and len(t5xxl_state_dict) > 0:
             logger.info(f"saving t5xxl model to: {args.t5xxl_save_to}")
             save_to_file(args.t5xxl_save_to, t5xxl_state_dict, save_dtype, None, args.mem_eff_load_save)
 
     else:
-        flux_state_dict, metadata = merge_lora_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
+        sd3_state_dict, metadata = merge_lora_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
 
         logger.info("calculating hashes and creating metadata...")
 
-        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(flux_state_dict, metadata)
+        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(sd3_state_dict, metadata)
         metadata["sshs_model_hash"] = model_hash
         metadata["sshs_legacy_hash"] = legacy_hash
 
@@ -655,22 +686,20 @@ def merge(args):
             merged_from = sai_model_spec.build_merged_from(args.models)
             title = os.path.splitext(os.path.basename(args.save_to))[0]
 
-            if args.model_type == "dev":
-                model_config = {"flux": "dev"}
-            elif args.model_type == "schnell":
-                model_config = {"flux": "schnell"}
-            elif args.model_type == "chroma":
-                model_config = {"flux": "chroma"}
+            if args.model_type == "large":
+                model_config = {"sd3": "-5-large"}
+            elif args.model_type == "medium":
+                model_config = {"sd3": "-5-medium"}
             else:
                 model_config = None
 
             sai_metadata = sai_model_spec.build_metadata(
-                flux_state_dict, False, False, False, True, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
+                sd3_state_dict, False, False, False, True, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
             )
             metadata.update(sai_metadata)
 
         logger.info(f"saving model to: {args.save_to}")
-        save_to_file(args.save_to, flux_state_dict, save_dtype, metadata)
+        save_to_file(args.save_to, sd3_state_dict, save_dtype, metadata)
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -690,16 +719,22 @@ def setup_parser() -> argparse.ArgumentParser:
         help="precision in merging (float is recommended) / マージの計算時の精度（floatを推奨）",
     )
     parser.add_argument(
-        "--flux_model",
+        "--sd3_model",
         type=str,
         default=None,
-        help="FLUX.1 model to load, merge LoRA models if omitted / 読み込むモデル、指定しない場合はLoRAモデルをマージする",
+        help="SD3 model to load, merge LoRA models if omitted / 読み込むモデル、指定しない場合はLoRAモデルをマージする",
     )
     parser.add_argument(
         "--clip_l",
         type=str,
         default=None,
         help="path to clip_l (*.sft or *.safetensors), should be float16 / clip_lのパス（*.sftまたは*.safetensors）",
+    )
+    parser.add_argument(
+        "--clip_g",
+        type=str,
+        default=None,
+        help="path to clip_g (*.sft or *.safetensors), should be float16 / clip_gのパス（*.sftまたは*.safetensors）",
     )
     parser.add_argument(
         "--t5xxl",
@@ -710,14 +745,14 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mem_eff_load_save",
         action="store_true",
-        help="use custom memory efficient load and save functions for FLUX.1 model"
-        " / カスタムのメモリ効率の良い読み込みと保存関数をFLUX.1モデルに使用する",
+        help="use custom memory efficient load and save functions for SD3 model"
+        " / カスタムのメモリ効率の良い読み込みと保存関数をSD3モデルに使用する",
     )
     parser.add_argument(
         "--loading_device",
         type=str,
         default="cpu",
-        help="device to load FLUX.1 model. LoRA models are loaded on CPU / FLUX.1モデルを読み込むデバイス。LoRAモデルはCPUで読み込まれます",
+        help="device to load SD3 model. LoRA models are loaded on CPU / SD3モデルを読み込むデバイス。LoRAモデルはCPUで読み込まれます",
     )
     parser.add_argument(
         "--working_device",
@@ -739,6 +774,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="destination file name for clip_l: safetensors file / clip_lの保存先のファイル名、safetensorsファイル",
     )
     parser.add_argument(
+        "--clip_g_save_to",
+        type=str,
+        default=None,
+        help="destination file name for clip_g: safetensors file / clip_gの保存先のファイル名、safetensorsファイル",
+    )
+    parser.add_argument(
         "--t5xxl_save_to",
         type=str,
         default=None,
@@ -747,8 +788,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_type",
         type=str,
-        default="dev",
-        help="FLUX.1 模型類型：例如 dev, schnell, chroma，預設為 dev",
+        default="large",
+        help="SD3 模型類型：例如 large, medium，預設為 large",
     )
     parser.add_argument(
         "--models",

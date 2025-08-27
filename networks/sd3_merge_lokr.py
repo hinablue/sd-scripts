@@ -16,8 +16,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-import lora_flux as lora_flux
-from library import sai_model_spec, train_util
+import lora_sd3 as lora_sd3
+from library import sai_model_spec, train_util, sd3_utils
 
 
 def factorization(dimension: int, factor: int = -1) -> tuple[int, int]:
@@ -75,6 +75,18 @@ def make_kron(w1, w2, scale):
     w2 = w2.contiguous()
 
     try:
+        # 檢查輸入權重的數值範圍，防止極端值
+        w1_max = torch.max(torch.abs(w1))
+        w2_max = torch.max(torch.abs(w2))
+
+        if w1_max > 1000 or w2_max > 1000:
+            logger.warning(f"Input weights have extreme values: w1_max={w1_max}, w2_max={w2_max}, normalizing...")
+            # 正規化權重到合理範圍
+            if w1_max > 1000:
+                w1 = w1 * (1000.0 / w1_max)
+            if w2_max > 1000:
+                w2 = w2 * (1000.0 / w2_max)
+
         rebuild = torch.kron(w1, w2)
 
         # 檢查 Kronecker 乘積結果的有效性
@@ -89,6 +101,12 @@ def make_kron(w1, w2, scale):
             if not torch.isfinite(rebuild).all():
                 logger.warning("Scaled result contains invalid values, cleaning up...")
                 rebuild = torch.nan_to_num(rebuild, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # 檢查結果的數值範圍
+            result_max = torch.max(torch.abs(rebuild))
+            if result_max > 10000:
+                logger.warning(f"Result has extreme values: {result_max}, clamping...")
+                rebuild = torch.clamp(rebuild, -10000, 10000)
 
         return rebuild
 
@@ -116,6 +134,17 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
     Returns:
         torch.Tensor: 重建的權重差異
     """
+    # 調試信息
+    logger.debug(f"rebuild_lokr_weight called with alpha={alpha}, rank={rank}")
+    if w1a is not None:
+        logger.debug(f"w1a stats: min={w1a.min().item():.6f}, max={w1a.max().item():.6f}, mean={w1a.mean().item():.6f}")
+    if w1b is not None:
+        logger.debug(f"w1b stats: min={w1b.min().item():.6f}, max={w1b.max().item():.6f}, mean={w1b.mean().item():.6f}")
+    if w2a is not None:
+        logger.debug(f"w2a stats: min={w2a.min().item():.6f}, max={w2a.max().item():.6f}, mean={w2a.mean().item():.6f}")
+    if w2b is not None:
+        logger.debug(f"w2b stats: min={w2b.min().item():.6f}, max={w2b.max().item():.6f}, mean={w2b.mean().item():.6f}")
+
     # 在 LoKr 中，alpha 實際上是 dim 值，我們需要從權重矩陣中提取真正的 rank
     if w1a is not None:
         rank = w1a.shape[1]
@@ -139,6 +168,14 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
     # 但由於 alpha 實際上是 dim 值，這個計算仍然是正確的
     scale = alpha / rank
 
+    # 限制 scale 的範圍，防止數值不穩定
+    if scale > 1000:
+        logger.warning(f"Scale value {scale} is too large, clamping to 1000")
+        scale = 1000.0
+    elif scale < 0.001:
+        logger.warning(f"Scale value {scale} is too small, clamping to 0.001")
+        scale = 0.001
+
     # 檢查 scale 的有效性
     if not torch.isfinite(torch.tensor(scale)):
         logger.warning(f"Invalid scale value: {scale}, using 1.0 as fallback")
@@ -149,7 +186,10 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
         if w1a is not None and w1b is not None:
             # 檢查輸入權重的有效性
             if torch.isfinite(w1a).all() and torch.isfinite(w1b).all():
-                w1 = w1a @ w1b
+                # 預處理：限制極端值
+                w1a_clamped = torch.clamp(w1a, -100000, 100000)
+                w1b_clamped = torch.clamp(w1b, -100000, 100000)
+                w1 = w1a_clamped @ w1b_clamped
             else:
                 logger.warning("w1a or w1b contains invalid values, using zeros")
                 w1 = torch.zeros(w1a.shape[0], w1b.shape[1], dtype=w1a.dtype, device=w1a.device)
@@ -164,14 +204,18 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
             if w2a is not None and w2b is not None:
                 # 檢查輸入權重的有效性
                 if torch.isfinite(w2a).all() and torch.isfinite(w2b).all():
+                    # 預處理：限制極端值
+                    w2a_clamped = torch.clamp(w2a, -100000, 100000)
+                    w2b_clamped = torch.clamp(w2b, -100000, 100000)
+
                     if w2b.dim() > 2:
                         # 處理卷積層
                         r, o, *k = w2b.shape
-                        w2 = w2a @ w2b.view(r, -1)
+                        w2 = w2a_clamped @ w2b_clamped.view(r, -1)
                         w2 = w2.view(-1, o, *k)
                     else:
                         # 處理線性層
-                        w2 = w2a @ w2b
+                        w2 = w2a_clamped @ w2b_clamped
                 else:
                     logger.warning("w2a or w2b contains invalid values, using zeros")
                     if w2b.dim() > 2:
@@ -228,22 +272,7 @@ def load_state_dict(file_name, dtype):
 
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
-            # 檢查張量的數值有效性
-            if not torch.isfinite(sd[key]).all():
-                logger.warning(f"Tensor {key} contains invalid values during loading, cleaning up...")
-                sd[key] = torch.nan_to_num(sd[key], nan=0.0, posinf=0.0, neginf=0.0)
-
-            # 進行類型轉換
-            try:
-                sd[key] = sd[key].to(dtype)
-            except RuntimeWarning as e:
-                if "invalid value encountered in cast" in str(e):
-                    logger.warning(f"RuntimeWarning during loading dtype conversion for {key}: {e}")
-                    # 再次清理無效值並重試
-                    sd[key] = torch.nan_to_num(sd[key], nan=0.0, posinf=0.0, neginf=0.0)
-                    sd[key] = sd[key].to(dtype)
-                else:
-                    raise
+            sd[key] = sd[key].to(dtype)
 
     return sd, metadata
 
@@ -280,11 +309,12 @@ def save_to_file(file_name, state_dict: Dict[str, Union[Any, torch.Tensor]], dty
         save_file(state_dict, file_name, metadata=metadata)
 
 
-def merge_to_flux_model(
+def merge_to_sd3_model(
     loading_device,
     working_device,
-    flux_path: str,
+    sd3_path: str,
     clip_l_path: str,
+    clip_g_path: str,
     t5xxl_path: str,
     models,
     ratios,
@@ -293,18 +323,18 @@ def merge_to_flux_model(
     mem_eff_load_save=False,
 ):
     """
-    將 LoKr 模型合併至 FLUX 模型
+    將 LoKr 模型合併至 SD3 模型
     """
     # 建立模組映射，不載入狀態字典
     lora_name_to_module_key = {}
-    if flux_path is not None:
-        logger.info(f"從 FLUX.1 模型載入鍵值: {flux_path}")
-        with safe_open(flux_path, framework="pt", device=loading_device) as flux_file:
-            keys = list(flux_file.keys())
+    if sd3_path is not None:
+        logger.info(f"從 SD3 模型載入鍵值: {sd3_path}")
+        with safe_open(sd3_path, framework="pt", device=loading_device) as sd3_file:
+            keys = list(sd3_file.keys())
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_FLUX + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_SD3 + "_" + module_name.replace(".", "_")
                     lora_name_to_module_key[lora_name] = key
 
     lora_name_to_clip_l_key = {}
@@ -315,8 +345,19 @@ def merge_to_flux_model(
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP_L + "_" + module_name.replace(".", "_")
                     lora_name_to_clip_l_key[lora_name] = key
+
+    lora_name_to_clip_g_key = {}
+    if clip_g_path is not None:
+        logger.info(f"從 clip_g 模型載入鍵值: {clip_g_path}")
+        with safe_open(clip_g_path, framework="pt", device=loading_device) as clip_g_file:
+            keys = list(clip_g_file.keys())
+            for key in keys:
+                if key.endswith(".weight"):
+                    module_name = ".".join(key.split(".")[:-1])
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_CLIP_G + "_" + module_name.replace(".", "_")
+                    lora_name_to_clip_g_key[lora_name] = key
 
     lora_name_to_t5xxl_key = {}
     if t5xxl_path is not None:
@@ -326,25 +367,26 @@ def merge_to_flux_model(
             for key in keys:
                 if key.endswith(".weight"):
                     module_name = ".".join(key.split(".")[:-1])
-                    lora_name = lora_flux.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_T5 + "_" + module_name.replace(".", "_")
+                    lora_name = lora_sd3.LoRANetwork.LORA_PREFIX_TEXT_ENCODER_T5 + "_" + module_name.replace(".", "_")
                     lora_name_to_t5xxl_key[lora_name] = key
 
     # 載入基礎模型
-    flux_state_dict = {}
+    sd3_state_dict = {}
     clip_l_state_dict = {}
+    clip_g_state_dict = {}
     t5xxl_state_dict = {}
 
     if mem_eff_load_save:
-        if flux_path is not None:
-            with MemoryEfficientSafeOpen(flux_path) as flux_file:
-                for key in tqdm(flux_file.keys()):
-                    tensor = flux_file.get_tensor(key).to(loading_device)
+        if sd3_path is not None:
+            with MemoryEfficientSafeOpen(sd3_path) as sd3_file:
+                for key in tqdm(sd3_file.keys()):
+                    tensor = sd3_file.get_tensor(key).to(loading_device)
                     # 檢查並清理基礎模型的無效值
                     if torch.isfinite(tensor).all():
-                        flux_state_dict[key] = tensor
+                        sd3_state_dict[key] = tensor
                     else:
                         logger.warning(f"Base model tensor {key} contains invalid values, cleaning up...")
-                        flux_state_dict[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+                        sd3_state_dict[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
         if clip_l_path is not None:
             with MemoryEfficientSafeOpen(clip_l_path) as clip_l_file:
@@ -356,6 +398,16 @@ def merge_to_flux_model(
                         logger.warning(f"CLIP-L tensor {key} contains invalid values, cleaning up...")
                         clip_l_state_dict[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if clip_g_path is not None:
+            with MemoryEfficientSafeOpen(clip_g_path) as clip_g_file:
+                for key in tqdm(clip_g_file.keys()):
+                    tensor = clip_g_file.get_tensor(key).to(loading_device)
+                    if torch.isfinite(tensor).all():
+                        clip_g_state_dict[key] = tensor
+                    else:
+                        logger.warning(f"CLIP-G tensor {key} contains invalid values, cleaning up...")
+                        clip_g_state_dict[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
         if t5xxl_path is not None:
             with MemoryEfficientSafeOpen(t5xxl_path) as t5xxl_file:
                 for key in tqdm(t5xxl_file.keys()):
@@ -366,13 +418,13 @@ def merge_to_flux_model(
                         logger.warning(f"T5XXL tensor {key} contains invalid values, cleaning up...")
                         t5xxl_state_dict[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
     else:
-        if flux_path is not None:
-            flux_state_dict = load_file(flux_path, device=loading_device)
+        if sd3_path is not None:
+            sd3_state_dict = load_file(sd3_path, device=loading_device)
             # 檢查並清理基礎模型的無效值
-            for key in list(flux_state_dict.keys()):
-                if not torch.isfinite(flux_state_dict[key]).all():
+            for key in list(sd3_state_dict.keys()):
+                if not torch.isfinite(sd3_state_dict[key]).all():
                     logger.warning(f"Base model tensor {key} contains invalid values, cleaning up...")
-                    flux_state_dict[key] = torch.nan_to_num(flux_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
+                    sd3_state_dict[key] = torch.nan_to_num(sd3_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
         if clip_l_path is not None:
             clip_l_state_dict = load_file(clip_l_path, device=loading_device)
@@ -380,6 +432,13 @@ def merge_to_flux_model(
                 if not torch.isfinite(clip_l_state_dict[key]).all():
                     logger.warning(f"CLIP-L tensor {key} contains invalid values, cleaning up...")
                     clip_l_state_dict[key] = torch.nan_to_num(clip_l_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
+
+        if clip_g_path is not None:
+            clip_g_state_dict = load_file(clip_g_path, device=loading_device)
+            for key in list(clip_g_state_dict.keys()):
+                if not torch.isfinite(clip_g_state_dict[key]).all():
+                    logger.warning(f"CLIP-G tensor {key} contains invalid values, cleaning up...")
+                    clip_g_state_dict[key] = torch.nan_to_num(clip_g_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
         if t5xxl_path is not None:
             t5xxl_state_dict = load_file(t5xxl_path, device=loading_device)
@@ -418,10 +477,13 @@ def merge_to_flux_model(
             # 確定目標狀態字典
             if module_name in lora_name_to_module_key:
                 module_weight_key = lora_name_to_module_key[module_name]
-                state_dict = flux_state_dict
+                state_dict = sd3_state_dict
             elif module_name in lora_name_to_clip_l_key:
                 module_weight_key = lora_name_to_clip_l_key[module_name]
                 state_dict = clip_l_state_dict
+            elif module_name in lora_name_to_clip_g_key:
+                module_weight_key = lora_name_to_clip_g_key[module_name]
+                state_dict = clip_g_state_dict
             elif module_name in lora_name_to_t5xxl_key:
                 module_weight_key = lora_name_to_t5xxl_key[module_name]
                 state_dict = t5xxl_state_dict
@@ -441,19 +503,6 @@ def merge_to_flux_model(
 
             if isinstance(alpha, torch.Tensor):
                 alpha = alpha.item()
-
-            # 檢查 alpha 值的有效性
-            if not math.isfinite(alpha):
-                logger.warning(f"Invalid alpha value for {module_name}: {alpha}, using 1.0 as fallback")
-                alpha = 1.0
-
-            # 限制 alpha 的範圍
-            if alpha > 10000:
-                logger.warning(f"Alpha value {alpha} is too large for {module_name}, clamping to 10000")
-                alpha = 10000.0
-            elif alpha < 0.001:
-                logger.warning(f"Alpha value {alpha} is too small for {module_name}, clamping to 0.001")
-                alpha = 0.001
 
             # 確定秩
             rank = None
@@ -539,7 +588,7 @@ def merge_to_flux_model(
                 logger.error(f"合併 {module_name} 時發生錯誤: {e}")
                 continue
 
-    return flux_state_dict, clip_l_state_dict, t5xxl_state_dict
+    return sd3_state_dict, clip_l_state_dict, clip_g_state_dict, t5xxl_state_dict
 
 
 def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
@@ -685,6 +734,7 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             elif scale < 0.001:
                 logger.warning(f"Scale value {scale} is too small for {lokr_module_name}, clamping to 0.001")
                 scale = 0.001
+
             # 為上採樣權重使用絕對值
             if "lokr_w1" in key and "lokr_w1_a" not in key:
                 scale = abs(scale)
@@ -772,29 +822,34 @@ def merge(args):
         save_dtype = merge_dtype
 
     assert (
-        args.save_to or args.clip_l_save_to or args.t5xxl_save_to
-    ), "必須指定 save_to 或 clip_l_save_to 或 t5xxl_save_to"
+        args.save_to or args.clip_l_save_to or args.clip_g_save_to or args.t5xxl_save_to
+    ), "必須指定 save_to 或 clip_l_save_to 或 clip_g_save_to 或 t5xxl_save_to"
 
-    dest_dir = os.path.dirname(args.save_to or args.clip_l_save_to or args.t5xxl_save_to)
+    dest_dir = os.path.dirname(args.save_to or args.clip_l_save_to or args.clip_g_save_to or args.t5xxl_save_to)
     if not os.path.exists(dest_dir):
         logger.info(f"建立目錄: {dest_dir}")
         os.makedirs(dest_dir)
 
-    if args.flux_model is not None or args.clip_l is not None or args.t5xxl is not None:
+    if args.sd3_model is not None or args.clip_l is not None or args.clip_g is not None or args.t5xxl is not None:
         # 合併到基礎模型
         assert (args.clip_l is None and args.clip_l_save_to is None) or (
             args.clip_l is not None and args.clip_l_save_to is not None
         ), "如果指定了 clip_l，也必須指定 clip_l_save_to"
 
+        assert (args.clip_g is None and args.clip_g_save_to is None) or (
+            args.clip_g is not None and args.clip_g_save_to is not None
+        ), "如果指定了 clip_g，也必須指定 clip_g_save_to"
+
         assert (args.t5xxl is None and args.t5xxl_save_to is None) or (
             args.t5xxl is not None and args.t5xxl_save_to is not None
         ), "如果指定了 t5xxl，也必須指定 t5xxl_save_to"
 
-        flux_state_dict, clip_l_state_dict, t5xxl_state_dict = merge_to_flux_model(
+        sd3_state_dict, clip_l_state_dict, clip_g_state_dict, t5xxl_state_dict = merge_to_sd3_model(
             args.loading_device,
             args.working_device,
-            args.flux_model,
+            args.sd3_model,
             args.clip_l,
+            args.clip_g,
             args.t5xxl,
             args.models,
             args.ratios,
@@ -803,31 +858,33 @@ def merge(args):
             args.mem_eff_load_save,
         )
 
-        if args.no_metadata or (flux_state_dict is None or len(flux_state_dict) == 0):
+        if args.no_metadata or (sd3_state_dict is None or len(sd3_state_dict) == 0):
             sai_metadata = None
         else:
-            merged_from = sai_model_spec.build_merged_from([args.flux_model] + args.models)
+            merged_from = sai_model_spec.build_merged_from([args.sd3_model] + args.models)
             title = os.path.splitext(os.path.basename(args.save_to))[0]
 
-            if args.model_type == "dev":
-                model_config = {"flux": "dev"}
-            elif args.model_type == "schnell":
-                model_config = {"flux": "schnell"}
-            elif args.model_type == "chroma":
-                model_config = {"flux": "chroma"}
+            if args.model_type == "large":
+                model_config = {"sd3": "5-large"}
+            elif args.model_type == "medium":
+                model_config = {"sd3": "5-medium"}
             else:
                 model_config = None
             sai_metadata = sai_model_spec.build_metadata(
                 None, False, False, False, False, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
             )
 
-        if flux_state_dict is not None and len(flux_state_dict) > 0:
-            logger.info(f"保存 FLUX 模型至: {args.save_to}")
-            save_to_file(args.save_to, flux_state_dict, save_dtype, sai_metadata, args.mem_eff_load_save)
+        if sd3_state_dict is not None and len(sd3_state_dict) > 0:
+            logger.info(f"保存 SD3 模型至: {args.save_to}")
+            save_to_file(args.save_to, sd3_state_dict, save_dtype, sai_metadata, args.mem_eff_load_save)
 
         if clip_l_state_dict is not None and len(clip_l_state_dict) > 0:
             logger.info(f"保存 clip_l 模型至: {args.clip_l_save_to}")
             save_to_file(args.clip_l_save_to, clip_l_state_dict, save_dtype, None, args.mem_eff_load_save)
+
+        if clip_g_state_dict is not None and len(clip_g_state_dict) > 0:
+            logger.info(f"保存 clip_g 模型至: {args.clip_g_save_to}")
+            save_to_file(args.clip_g_save_to, clip_g_state_dict, save_dtype, None, args.mem_eff_load_save)
 
         if t5xxl_state_dict is not None and len(t5xxl_state_dict) > 0:
             logger.info(f"保存 t5xxl 模型至: {args.t5xxl_save_to}")
@@ -835,40 +892,38 @@ def merge(args):
 
     else:
         # 只合併 LoKr 模型
-        flux_state_dict, metadata = merge_lokr_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
+        sd3_state_dict, metadata = merge_lokr_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
 
         logger.info("計算雜湊值並建立元數據...")
 
-        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(flux_state_dict, metadata)
+        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(sd3_state_dict, metadata)
         metadata["sshs_model_hash"] = model_hash
         metadata["sshs_legacy_hash"] = legacy_hash
+
+        if args.model_type == "large":
+            model_config = {"sd3": "-5-large"}
+        elif args.model_type == "medium":
+            model_config = {"sd3": "-5-medium"}
+        else:
+            model_config = None
 
         if not args.no_metadata:
             merged_from = sai_model_spec.build_merged_from(args.models)
             title = os.path.splitext(os.path.basename(args.save_to))[0]
-
-            if args.model_type == "dev":
-                model_config = {"flux": "dev"}
-            elif args.model_type == "schnell":
-                model_config = {"flux": "schnell"}
-            elif args.model_type == "chroma":
-                model_config = {"flux": "chroma"}
-            else:
-                model_config = None
             sai_metadata = sai_model_spec.build_metadata(
-                flux_state_dict, False, False, False, True, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
+                sd3_state_dict, False, False, False, True, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
             )
             metadata.update(sai_metadata)
 
         logger.info(f"保存模型至: {args.save_to}")
-        save_to_file(args.save_to, flux_state_dict, save_dtype, metadata)
+        save_to_file(args.save_to, sd3_state_dict, save_dtype, metadata)
 
 
 def setup_parser() -> argparse.ArgumentParser:
     """
     設定參數解析器
     """
-    parser = argparse.ArgumentParser(description="合併 LoKr 模型到 FLUX 模型")
+    parser = argparse.ArgumentParser(description="合併 LoKr 模型到 SD3 模型")
     parser.add_argument(
         "--save_precision",
         type=str,
@@ -883,16 +938,22 @@ def setup_parser() -> argparse.ArgumentParser:
         help="合併計算精度（建議使用 float）",
     )
     parser.add_argument(
-        "--flux_model",
+        "--sd3_model",
         type=str,
         default=None,
-        help="要載入的 FLUX.1 模型，如果省略則合併 LoKr 模型",
+        help="要載入的 SD3 模型，如果省略則合併 LoKr 模型",
     )
     parser.add_argument(
         "--clip_l",
         type=str,
         default=None,
         help="clip_l 的路徑（*.sft 或 *.safetensors），應該是 float16",
+    )
+    parser.add_argument(
+        "--clip_g",
+        type=str,
+        default=None,
+        help="clip_g 的路徑（*.sft 或 *.safetensors），應該是 float16",
     )
     parser.add_argument(
         "--t5xxl",
@@ -903,13 +964,13 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mem_eff_load_save",
         action="store_true",
-        help="對 FLUX.1 模型使用自訂的記憶體高效載入和保存函數",
+        help="對 SD3 模型使用自訂的記憶體高效載入和保存函數",
     )
     parser.add_argument(
         "--loading_device",
         type=str,
         default="cpu",
-        help="載入 FLUX.1 模型的設備。LoKr 模型在 CPU 上載入",
+        help="載入 SD3 模型的設備。LoKr 模型在 CPU 上載入",
     )
     parser.add_argument(
         "--working_device",
@@ -930,6 +991,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="clip_l 的目標檔案名稱：safetensors 檔案",
     )
     parser.add_argument(
+        "--clip_g_save_to",
+        type=str,
+        default=None,
+        help="clip_g 的目標檔案名稱：safetensors 檔案",
+    )
+    parser.add_argument(
         "--t5xxl_save_to",
         type=str,
         default=None,
@@ -938,8 +1005,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_type",
         type=str,
-        default="dev",
-        help="FLUX.1 模型類型：例如 dev, schnell, chroma，預設為 dev",
+        default="large",
+        help="SD3 模型類型：例如 large, medium，預設為 large",
     )
     parser.add_argument(
         "--models",

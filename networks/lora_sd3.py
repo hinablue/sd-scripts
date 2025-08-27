@@ -20,7 +20,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from networks.lora_flux import LoRAModule, LoRAInfModule
+from lora_flux import LoRAModule, LoRAInfModule
 from library import sd3_models
 
 
