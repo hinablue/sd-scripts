@@ -3,6 +3,7 @@ import torch.optim as optim
 from typing import Optional, Callable, Tuple
 import torch.nn.functional as F
 from torch.nn.functional import normalize
+import math
 
 class Automagic_Sinkgd(torch.optim.Optimizer):
 
@@ -15,8 +16,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         orthograd: bool = False,
         sinkgd_iters: int = 1,
         beta1: float = 0.9,
-        decay: float = 0.9995,
-        weight_decay: float = 0,
+        weight_decay: float = 0.01,
         warmup_steps: int = 200,
     ):
         self.lr = lr
@@ -27,7 +27,6 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
             eta=eta,
             beta1=beta1,
             weight_decay=weight_decay,
-            decay=decay,
             orthograd=orthograd
         )
         super().__init__(params, defaults)
@@ -61,6 +60,17 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         update = g_orth.view_as(update)
         return update
 
+    @staticmethod
+    def centralize_gradient(x):
+        """credit - https://github.com/Yonghongwei/Gradient-Centralization """
+
+        size = x.dim()
+        # print(f"size = {size}")
+
+        if size > 1:
+            x.add_(-x.mean(dim=tuple(range(1, size)), keepdim=True))
+        return x
+
     # === SinkGD ===
     #Gradient Multi-Normalization for Stateless and Scalable LLM Training
     #https://arxiv.org/abs/2502.06742
@@ -77,9 +87,11 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
             sqrt_m = m ** 0.5
             for _ in range(num_sinkgd_iter):
                 row_norm = torch.linalg.vector_norm(update, dim=1, keepdim=True) + eps
-                update = update * (sqrt_n / row_norm)
+                row_scaling = sqrt_n / row_norm
+                update = update * row_scaling
                 col_norm = torch.linalg.vector_norm(update, dim=0, keepdim=True) + eps
-                update = update * (sqrt_m / col_norm)
+                col_scaling = sqrt_m / col_norm
+                update = update * col_scaling
         return update
 
     @torch.no_grad()
@@ -112,32 +124,32 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                     continue
                 state = self.state[p]
                 grad = p.grad.data
+                abs_grad = grad.abs()
+                grad_sum = abs_grad.sum() + 1e-12
+                alpha = abs_grad / grad_sum
+                grad = grad - alpha * grad
+
                 if len(state) == 0:
                     self._init_state(p, group)
-                    sigma = grad.std().nan_to_num()
-                    grad_norm = grad.norm()
-                    grad_norm_snr = (grad_norm / (sigma + 1e-8))
-                    state['gsnr'] = grad_norm_snr
 
                 state['step'] += 1
                 self._step = state["step"] + 1
                 beta1 = group["beta1"]
-                beta1_decay = group["decay"] ** state['step']
-                beta1 = beta1 * beta1_decay
 
-                if beta1 > 0.1:
+                update = grad
+                if beta1 > 0:
                     if 'exp_avg' not in state:
                         state['exp_avg'] = torch.zeros_like(p.data)
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(beta1).add_(grad, alpha = 1 - beta1)
-                    update = exp_avg + grad
-                else:
-                    update = grad
+                    exp_avg.mul_(beta1).add_(grad, alpha=1-beta1)
 
                 if grad.ndim == 2:
                     if group["orthograd"]:
                         update = self.Orthograd(p, update)
                     update = self.SinkGD(update, self.sinkgd_iters)
+
+                if beta1 > 0:
+                    update = update.abs().mul_(exp_avg.sign())
 
                 allora = state.get("row_scaling", 1.0)
                 lr = group["lr"] * allora
@@ -147,7 +159,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
                 if use_weight_decay:
                     #Adaptive Weight Decay for Deep Neural Networks
                     #https://arxiv.org/abs/1907.08931
-                    param_abs_grad = torch.abs(p.grad).mean()
+                    param_abs_grad = torch.abs(grad).mean()
                     norm_grad = (param_abs_grad - mean_norm) / std_norm
                     ada_alpha = 4
                     theta = 2 / (1 + torch.exp(-ada_alpha * norm_grad))
