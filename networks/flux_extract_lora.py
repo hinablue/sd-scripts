@@ -14,7 +14,7 @@ from library import flux_utils, sai_model_spec, model_util, sdxl_model_util
 import lora
 from library.utils import MemoryEfficientSafeOpen
 from library.utils import setup_logging
-from networks import lora_flux
+import lora_flux
 
 setup_logging()
 import logging
@@ -35,6 +35,7 @@ def save_to_file(file_name, state_dict, metadata, dtype):
 
 
 def svd(
+    model_type=None,
     model_org=None,
     model_tuned=None,
     save_to=None,
@@ -140,7 +141,7 @@ def svd(
 
     if not no_metadata:
         title = os.path.splitext(os.path.basename(save_to))[0]
-        sai_metadata = sai_model_spec.build_metadata(lora_sd, False, False, False, True, False, time.time(), title, flux="dev")
+        sai_metadata = sai_model_spec.build_metadata(lora_sd, False, False, False, True, False, time.time(), title, model_config={ "flux": model_type })
         metadata.update(sai_metadata)
 
     save_to_file(save_to, lora_sd, metadata, save_dtype)
@@ -163,6 +164,13 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         required=True,
         help="Original model: safetensors file / 元モデル、safetensors",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="dev",
+        choices=["dev", "schnell", "chroma"],
+        help="Model type: dev, schnell, chroma / モデルタイプ、dev, schnell, chroma",
     )
     parser.add_argument(
         "--model_tuned",
