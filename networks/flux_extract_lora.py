@@ -12,7 +12,7 @@ from safetensors import safe_open
 from tqdm import tqdm
 from library import flux_utils, sai_model_spec, model_util, sdxl_model_util
 import lora
-from library.utils import MemoryEfficientSafeOpen
+from library.safetensors_utils import MemoryEfficientSafeOpen
 from library.utils import setup_logging
 import lora_flux
 
