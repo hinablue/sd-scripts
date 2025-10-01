@@ -628,7 +628,16 @@ def merge(args):
             else:
                 model_config = None
             sai_metadata = sai_model_spec.build_metadata(
-                None, False, False, False, False, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
+                None,
+                False,
+                False,
+                False,
+                False,
+                False,
+                time.time(),
+                title=title,
+                merged_from=merged_from,
+                model_config=model_config,
             )
 
         if flux_state_dict is not None and len(flux_state_dict) > 0:
@@ -666,7 +675,16 @@ def merge(args):
                 model_config = None
 
             sai_metadata = sai_model_spec.build_metadata(
-                flux_state_dict, False, False, False, True, False, time.time(), title=title, merged_from=merged_from, model_config=model_config
+                flux_state_dict,
+                False,
+                False,
+                False,
+                True,
+                False,
+                time.time(),
+                title=title,
+                merged_from=merged_from,
+                model_config=model_config,
             )
             metadata.update(sai_metadata)
 
