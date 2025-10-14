@@ -2,14 +2,13 @@
 
 kohya-ss/sd-scripts on https://modal.com
 Run training with the following command:
-modal run run_modal.py -t flux --config /root/sd-scripts/datasets/config.toml
+modal run run_modal.py --train_type=flux_krea --config_file=/root/sd-scripts/datasets/config.toml
 
 '''
 
 import os
 import subprocess
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import sys
 import modal
 from dotenv import load_dotenv
@@ -17,18 +16,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.insert(0, "/root/sd-scripts")
-# must come before ANY torch or fastai imports
-# import toolkit.cuda_malloc
 
 # turn off diffusers telemetry until I can figure out how to make it opt-in
 os.environ['DISABLE_TELEMETRY'] = 'YES'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# define the volume for storing model outputs, using "creating volumes lazily": https://modal.com/docs/guide/volumes
-# you will find your model, samples and optimizer stored in: https://modal.com/storage/your-username/main/flux-lora-models
-model_volume = modal.Volume.from_name("flux-lora-models", create_if_missing=True)
+LOCAL_SD_SCRIPTS_DIR = "/Users/username/sd-scripts"
+MODAL_APPLICATION_NAME = "flux-lora-training"
+MODAL_GPU = "A100"
+MODAL_APPLICATION_TIMEOUT = 7200
+# For speed up the initialization of the main function, you can download all the models to the volume into models directory.
+# https://huggingface.co/hinablue/modal-for-sd-scripts
+MODAL_VOLUME_NAME = "flux-lora-models"
+HUGGINGFACE_SECRET_NAME = "huggingface-secret"
 
 # modal_output, due to "cannot mount volume on non-empty path" requirement
 MOUNT_DIR = "/root/sd-scripts/modal_output"  # modal_output, due to "cannot mount volume on non-empty path" requirement
+
+# define the volume for storing model outputs, using "creating volumes lazily": https://modal.com/docs/guide/volumes
+# you will find your model, samples and optimizer stored in: https://modal.com/storage/your-username/main/flux-lora-models
+model_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 
 # define modal app
 image = (
@@ -42,7 +49,7 @@ image = (
         index_url="https://download.pytorch.org/whl/cu126"
     )
     .pip_install_from_requirements(
-        "/Volumes/HinaDisk/sd-scripts/requirements_modal.txt",
+        f"{LOCAL_SD_SCRIPTS_DIR}/requirements_modal.txt",
         extra_options="-U"
     )
     .pip_install(
@@ -54,13 +61,13 @@ image = (
 # mount for the entire sd-scripts directory
 # example: "/Users/username/sd-scripts" is the local directory, "/root/sd-scripts" is the remote directory
 image = image.add_local_dir(
-    "/Volumes/HinaDisk/sd-scripts",
+    LOCAL_SD_SCRIPTS_DIR,
     "/root/sd-scripts",
-    ignore=["__pycache__", "*.git", "*.github", "*.egg-info", "*.ai", "build", ".vscode", "wandb", "CLAUDE.md", "GEMINI.md", ".claude", ".gemini", "tests", "docs", "bitsandbytes_windows"]
+    ignore=["__pycache__", "*.egg-info", "*.ai", "build", ".vscode", "wandb", "CLAUDE.md", "GEMINI.md", ".claude", ".gemini", "tests", "docs", "bitsandbytes_windows"]
 )
 
 # create the Modal app with the necessary mounts and volumes
-app = modal.App(name="flux-lora-training", image=image, volumes={MOUNT_DIR: model_volume})
+app = modal.App(name=MODAL_APPLICATION_NAME, image=image, volumes={MOUNT_DIR: model_volume})
 
 # Check if we have DEBUG_TOOLKIT in env
 if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
@@ -73,11 +80,11 @@ import argparse
 @app.function(
     # request a GPU with at least 24GB VRAM
     # more about modal GPU's: https://modal.com/docs/guide/gpu
-    gpu="A100", # gpu="H100"
+    gpu=MODAL_GPU, # gpu="H100"
     # more about modal timeouts: https://modal.com/docs/guide/timeouts
-    timeout=7200,  # 2 hours, increase or decrease if needed
+    timeout=MODAL_APPLICATION_TIMEOUT,  # 2 hours, increase or decrease if needed
     # Add your huggingface read token: https://modal.com/docs/guide/secrets
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[modal.Secret.from_name(HUGGINGFACE_SECRET_NAME)],
 )
 def main(
     config_file: str = None,
@@ -86,12 +93,6 @@ def main(
     train_type: str = "flux",
     pretrained_model: str = None
 ):
-    if config_file is None and additional_args is None:
-        raise ValueError("Config file or additional_args are required")
-
-    if train_type is None:
-        raise ValueError("Train type is required")
-
     import toml
 
     hf_token = os.environ["HF_TOKEN"]
@@ -151,7 +152,7 @@ def main(
 
         # download vae file from huggingface
         if not os.path.exists(f"{MOUNT_DIR}/models/sdxl_vae_fp16_fix.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sdxl_vae_fp16_fix.safetensors -O {MOUNT_DIR}/models/sdxl_vae_fp16_fix.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/sdxl_vae_fp16_fix.safetensors -O {MOUNT_DIR}/models/sdxl_vae_fp16_fix.safetensors", shell=True, check=True)
 
         print(f"VAE downloaded")
 
@@ -170,15 +171,15 @@ def main(
 
         # download clip_l file from huggingface
         if not os.path.exists(f"{MOUNT_DIR}/models/sd35_clip_l.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/sd35_clip_l.safetensors -O {MOUNT_DIR}/models/clip_l.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/sd35_clip_l.safetensors -O {MOUNT_DIR}/models/clip_l.safetensors", shell=True, check=True)
 
         print(f"Clip_l downloaded")
         if not os.path.exists(f"{MOUNT_DIR}/models/sd35_clip_g.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/sd35_clip_g.safetensors -O {MOUNT_DIR}/models/clip_g.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/sd35_clip_g.safetensors -O {MOUNT_DIR}/models/clip_g.safetensors", shell=True, check=True)
 
         print(f"Clip_g downloaded")
         if not os.path.exists(f"{MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/t5xxl_fp8_e4m3fn.safetensors -O {MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/t5xxl_fp8_e4m3fn.safetensors -O {MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors", shell=True, check=True)
 
         print(f"T5xxl downloaded")
 
@@ -207,17 +208,17 @@ def main(
 
         # download vae file from huggingface
         if not os.path.exists(f"{MOUNT_DIR}/models/clip_l.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/clip_l.safetensors -O {MOUNT_DIR}/models/clip_l.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/clip_l.safetensors -O {MOUNT_DIR}/models/clip_l.safetensors", shell=True, check=True)
 
         print(f"Clip_l downloaded")
 
         if not os.path.exists(f"{MOUNT_DIR}/models/flux_vae.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/flux_vae.safetensors -O {MOUNT_DIR}/models/flux_vae.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/flux_vae.safetensors -O {MOUNT_DIR}/models/flux_vae.safetensors", shell=True, check=True)
 
         print(f"Flux_vae downloaded")
 
         if not os.path.exists(f"{MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/t5xxl_fp8_e4m3fn.safetensors -O {MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/t5xxl_fp8_e4m3fn.safetensors -O {MOUNT_DIR}/models/t5xxl_fp8_e4m3fn.safetensors", shell=True, check=True)
 
         print(f"T5xxl downloaded")
 
@@ -245,12 +246,12 @@ def main(
         train_network_script = "lumina_train_network.py"
 
         if not os.path.exists(f"{MOUNT_DIR}/models/flux_vae.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/flux_vae.safetensors -O {MOUNT_DIR}/models/flux_vae.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/flux_vae.safetensors -O {MOUNT_DIR}/models/flux_vae.safetensors", shell=True, check=True)
 
         print(f"Flux_vae downloaded")
 
         if not os.path.exists(f"{MOUNT_DIR}/models/gemma-2-2b-fp16.safetensors"):
-            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modals-for-sd-scripts/resolve/main/gemma-2-2b-fp16.safetensors -O {MOUNT_DIR}/models/gemma-2-2b-fp16.safetensors", shell=True, check=True)
+            subprocess.run(f"wget -q -c --header='Authorization: Bearer {hf_token}' https://huggingface.co/hinablue/modal-for-sd-scripts/resolve/main/gemma-2-2b-fp16.safetensors -O {MOUNT_DIR}/models/gemma-2-2b-fp16.safetensors", shell=True, check=True)
 
         print(f"Gemma-2-2b-fp16 downloaded")
 
@@ -322,5 +323,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.train_type is None:
+        raise ValueError("Train type is required")
+
+    if args.config_file is None and args.additional_args is None:
+        raise ValueError("Config file or additional_args are required")
 
     main.call(config_file=args.config_file, name=args.name, additional_args=args.additional_args, train_type=args.train_type, pretrained_model=args.pretrained_model)
