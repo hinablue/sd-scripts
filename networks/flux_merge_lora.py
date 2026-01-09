@@ -128,10 +128,10 @@ def merge_to_flux_model(
 
         logger.info(f"merging...")
         for key in tqdm(list(lora_sd.keys())):
-            if "lora_down" in key:
-                lora_name = key[: key.rfind(".lora_down")]
-                up_key = key.replace("lora_down", "lora_up")
-                alpha_key = key[: key.index("lora_down")] + "alpha"
+            if "lora_down" in key or "lora_A" in key:
+                lora_name = key[: key.rfind(".lora_down" if "lora_down" in key else ".lora_A")]
+                up_key = key.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
+                alpha_key = key[: key.index("lora_down" if "lora_down" in key else "lora_A")] + "alpha"
 
                 if lora_name in lora_name_to_module_key:
                     module_weight_key = lora_name_to_module_key[lora_name]
@@ -468,8 +468,8 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
                 alphas[lora_module_name] = alpha
                 if lora_module_name not in base_alphas:
                     base_alphas[lora_module_name] = alpha
-            elif "lora_down" in key:
-                lora_module_name = key[: key.rfind(".lora_down")]
+            elif ("lora_down" in key or "lora_A" in key):
+                lora_module_name = key[: key.rfind(".lora_down" if "lora_down" in key else ".lora_A")]
                 dim = lora_sd[key].size()[0]
                 dims[lora_module_name] = dim
                 if lora_module_name not in base_dims:
@@ -490,7 +490,7 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             if "alpha" in key:
                 continue
 
-            if "lora_up" in key and concat:
+            if ("lora_up" in key or "lora_B" in key) and concat:
                 concat_dim = 1
             elif "lora_down" in key and concat:
                 concat_dim = 0
@@ -503,7 +503,7 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             alpha = alphas[lora_module_name]
 
             scale = math.sqrt(alpha / base_alpha) * ratio
-            scale = abs(scale) if "lora_up" in key else scale  # マイナスの重みに対応する。
+            scale = abs(scale) if ("lora_up" in key or "lora_B" in key) else scale  # マイナスの重みに対応する。
 
             if key in merged_sd:
                 assert (

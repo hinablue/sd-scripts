@@ -63,7 +63,7 @@ image = (
 image = image.add_local_dir(
     LOCAL_SD_SCRIPTS_DIR,
     "/root/sd-scripts",
-    ignore=["__pycache__", "*.egg-info", "*.ai", "build", ".vscode", "wandb", "CLAUDE.md", "GEMINI.md", ".claude", ".gemini", "tests", "docs", "bitsandbytes_windows"]
+    ignore=["__pycache__", "*.egg-info", "*.ai", "build", ".vscode", "wandb", "CLAUDE.md", "GEMINI.md", ".claude", ".gemini", "tests", "docs", "bitsandbytes_windows", "venv", "lycoris"]
 )
 
 # create the Modal app with the necessary mounts and volumes

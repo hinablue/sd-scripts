@@ -21,6 +21,48 @@ import lora_flux as lora_flux
 from library import sai_model_spec, train_util
 
 
+def safe_isfinite_check(tensor: torch.Tensor) -> bool:
+    """
+    安全地检查张量是否包含有限值，支持 FP8 数据类型
+
+    Args:
+        tensor: 要检查的张量
+
+    Returns:
+        bool: 如果所有值都是有限的则返回 True，否则返回 False
+    """
+    # 检查是否为 FP8 数据类型
+    if tensor.dtype in [torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz]:
+        # FP8 类型需要先转换为更高精度进行 isfinite 检查
+        try:
+            tensor_float32 = tensor.float()
+            return torch.isfinite(tensor_float32).all()
+        except Exception as e:
+            logger.warning(f"Error checking FP8 tensor finiteness: {e}")
+            # 如果转换失败，尝试使用数值范围检查
+            try:
+                # 检查是否在 FP8 的有效范围内
+                if tensor.dtype == torch.float8_e4m3fn:
+                    max_val = torch.finfo(torch.float8_e4m3fn).max
+                    min_val = torch.finfo(torch.float8_e4m3fn).min
+                elif tensor.dtype == torch.float8_e5m2:
+                    max_val = torch.finfo(torch.float8_e5m2).max
+                    min_val = torch.finfo(torch.float8_e5m2).min
+                else:
+                    # 对于其他 FP8 类型，使用保守的范围检查
+                    return True  # 假设有效
+
+                # 检查是否在有效范围内
+                return torch.all((tensor >= min_val) & (tensor <= max_val))
+            except Exception:
+                # 如果所有检查都失败，假设张量是有效的
+                logger.warning(f"Could not validate FP8 tensor, assuming valid")
+                return True
+    else:
+        # 对于非 FP8 类型，直接使用 isfinite
+        return torch.isfinite(tensor).all()
+
+
 def factorization(dimension: int, factor: int = -1) -> tuple[int, int]:
     """
     回傳輸入維度分解的兩個值，第二個值大於或等於第一個值
@@ -61,13 +103,13 @@ def make_kron(w1, w2, scale):
     使用 Kronecker 乘積重建權重
     """
     # 檢查輸入權重的有效性
-    if not torch.isfinite(w1).all() or not torch.isfinite(w2).all():
+    if not safe_isfinite_check(w1) or not safe_isfinite_check(w2):
         logger.warning("Input weights contain invalid values in make_kron")
         w1 = torch.nan_to_num(w1, nan=0.0, posinf=0.0, neginf=0.0)
         w2 = torch.nan_to_num(w2, nan=0.0, posinf=0.0, neginf=0.0)
 
     # 檢查 scale 的有效性
-    if not torch.isfinite(torch.tensor(scale)):
+    if not safe_isfinite_check(torch.tensor(scale)):
         logger.warning(f"Invalid scale value in make_kron: {scale}, using 1.0")
         scale = 1.0
 
@@ -79,7 +121,7 @@ def make_kron(w1, w2, scale):
         rebuild = torch.kron(w1, w2)
 
         # 檢查 Kronecker 乘積結果的有效性
-        if not torch.isfinite(rebuild).all():
+        if not safe_isfinite_check(rebuild):
             logger.warning("Kronecker product contains invalid values, cleaning up...")
             rebuild = torch.nan_to_num(rebuild, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -87,7 +129,7 @@ def make_kron(w1, w2, scale):
             rebuild = rebuild * scale
 
             # 檢查縮放後結果的有效性
-            if not torch.isfinite(rebuild).all():
+            if not safe_isfinite_check(rebuild):
                 logger.warning("Scaled result contains invalid values, cleaning up...")
                 rebuild = torch.nan_to_num(rebuild, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -112,36 +154,51 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
         w1, w1a, w1b: 第一組權重矩陣
         w2, w2a, w2b: 第二組權重矩陣
         t2: Tucker 分解矩陣（可選）
-        alpha: 縮放係數（在 LoKr 中實際上是 dim 值）
+        alpha: 縮放係數（在 LoKr 中可能為 None）
         rank: 秩
     Returns:
         torch.Tensor: 重建的權重差異
     """
-    # 在 LoKr 中，alpha 實際上是 dim 值，我們需要從權重矩陣中提取真正的 rank
+    # 在 LoKr 中，優先使用從權重矩陣中提取的 rank
     if w1a is not None:
         rank = w1a.shape[1]
     elif w2a is not None:
         rank = w2a.shape[1]
-    else:
-        # 如果沒有 w1a 或 w2a，使用 alpha 作為 rank（因為 alpha 實際上是 dim）
-        rank = alpha if rank is None else rank
+    elif w1 is not None:
+        # 如果沒有分解的權重，使用 w1 的輸出維度
+        rank = w1.shape[0]
+    elif rank is None:
+        # 如果都沒有，使用預設值
+        rank = 1
+        logger.warning("No rank information available, using default rank=1")
 
     # 防止除零錯誤和數值問題
     if rank <= 0:
-        logger.warning(f"Invalid rank value: {rank}, using alpha as fallback")
-        rank = max(1, abs(alpha)) if alpha != 0 else 1
+        logger.warning(f"Invalid rank value: {rank}, using 1 as fallback")
+        rank = 1
 
-    # 檢查 alpha 的有效性
-    if not torch.isfinite(torch.tensor(alpha)):
-        logger.warning(f"Invalid alpha value: {alpha}, using rank as fallback")
-        alpha = float(rank)
+    # 在 LoKr 中，如果 alpha 為 None，則使用 factor-based 方法
+    # 此時 scale 應該基於 rank 來計算，而不是 alpha
+    if alpha is not None:
+        # 檢查 alpha 的有效性
+        if not safe_isfinite_check(torch.tensor(alpha)):
+            logger.warning(f"Invalid alpha value: {alpha}, using rank-based scale")
+            alpha = None
 
-    # 在 LoKr 中，scale 計算應該是 alpha / rank
-    # 但由於 alpha 實際上是 dim 值，這個計算仍然是正確的
-    scale = alpha / rank
+        if alpha is not None:
+            # 在 LoKr 中，scale 計算應該是 alpha / rank
+            scale = alpha / rank
+        else:
+            # 如果 alpha 無效，使用 rank-based scale
+            scale = 1.0
+    else:
+        # 在 LoKr 中，當 alpha 為 None 時，使用 factor-based 方法
+        # 此時 scale 應該基於 rank 來計算
+        scale = 1.0
+        logger.info(f"Using factor-based scale for LoKr (alpha=None, rank={rank})")
 
     # 檢查 scale 的有效性
-    if not torch.isfinite(torch.tensor(scale)):
+    if not safe_isfinite_check(torch.tensor(scale)):
         logger.warning(f"Invalid scale value: {scale}, using 1.0 as fallback")
         scale = 1.0
 
@@ -149,7 +206,7 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
     if w1 is None:
         if w1a is not None and w1b is not None:
             # 檢查輸入權重的有效性
-            if torch.isfinite(w1a).all() and torch.isfinite(w1b).all():
+            if safe_isfinite_check(w1a) and safe_isfinite_check(w1b):
                 w1 = w1a @ w1b
             else:
                 logger.warning("w1a or w1b contains invalid values, using zeros")
@@ -164,7 +221,7 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
             # 標準 LoKr 分解
             if w2a is not None and w2b is not None:
                 # 檢查輸入權重的有效性
-                if torch.isfinite(w2a).all() and torch.isfinite(w2b).all():
+                if safe_isfinite_check(w2a) and safe_isfinite_check(w2b):
                     if w2b.dim() > 2:
                         # 處理卷積層
                         r, o, *k = w2b.shape
@@ -186,7 +243,7 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
         else:
             # Tucker 分解
             if w2a is not None and w2b is not None and t2 is not None:
-                if torch.isfinite(t2).all() and torch.isfinite(w2a).all() and torch.isfinite(w2b).all():
+                if safe_isfinite_check(t2) and safe_isfinite_check(w2a) and safe_isfinite_check(w2b):
                     w2 = rebuild_tucker(t2, w2a, w2b)
                 else:
                     logger.warning("t2, w2a, or w2b contains invalid values, using zeros")
@@ -200,7 +257,7 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
         logger.error("Failed to rebuild weights")
         return None
 
-    if not torch.isfinite(w1).all() or not torch.isfinite(w2).all():
+    if not safe_isfinite_check(w1) or not safe_isfinite_check(w2):
         logger.warning("Rebuilt weights contain invalid values, cleaning up...")
         w1 = torch.nan_to_num(w1, nan=0.0, posinf=0.0, neginf=0.0)
         w2 = torch.nan_to_num(w2, nan=0.0, posinf=0.0, neginf=0.0)
@@ -209,7 +266,7 @@ def rebuild_lokr_weight(w1, w1a, w1b, w2, w2a, w2b, t2, alpha, rank):
     result = make_kron(w1, w2, scale)
 
     # 最終檢查結果的有效性
-    if result is not None and not torch.isfinite(result).all():
+    if result is not None and not safe_isfinite_check(result):
         logger.warning("Final result contains invalid values, cleaning up...")
         result = torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -230,7 +287,7 @@ def load_state_dict(file_name, dtype):
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
             # 檢查張量的數值有效性
-            if not torch.isfinite(sd[key]).all():
+            if not safe_isfinite_check(sd[key]):
                 logger.warning(f"Tensor {key} contains invalid values during loading, cleaning up...")
                 sd[key] = torch.nan_to_num(sd[key], nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -258,7 +315,7 @@ def save_to_file(file_name, state_dict: Dict[str, Union[Any, torch.Tensor]], dty
         for key in tqdm(list(state_dict.keys())):
             if type(state_dict[key]) == torch.Tensor and state_dict[key].dtype.is_floating_point:
                 # 檢查張量的數值有效性
-                if not torch.isfinite(state_dict[key]).all():
+                if not safe_isfinite_check(state_dict[key]):
                     logger.warning(f"Tensor {key} contains invalid values before dtype conversion, cleaning up...")
                     state_dict[key] = torch.nan_to_num(state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -341,7 +398,7 @@ def merge_to_flux_model(
                 for key in tqdm(flux_file.keys()):
                     tensor = flux_file.get_tensor(key).to(loading_device)
                     # 檢查並清理基礎模型的無效值
-                    if torch.isfinite(tensor).all():
+                    if safe_isfinite_check(tensor):
                         flux_state_dict[key] = tensor
                     else:
                         logger.warning(f"Base model tensor {key} contains invalid values, cleaning up...")
@@ -351,7 +408,7 @@ def merge_to_flux_model(
             with MemoryEfficientSafeOpen(clip_l_path) as clip_l_file:
                 for key in tqdm(clip_l_file.keys()):
                     tensor = clip_l_file.get_tensor(key).to(loading_device)
-                    if torch.isfinite(tensor).all():
+                    if safe_isfinite_check(tensor):
                         clip_l_state_dict[key] = tensor
                     else:
                         logger.warning(f"CLIP-L tensor {key} contains invalid values, cleaning up...")
@@ -361,7 +418,7 @@ def merge_to_flux_model(
             with MemoryEfficientSafeOpen(t5xxl_path) as t5xxl_file:
                 for key in tqdm(t5xxl_file.keys()):
                     tensor = t5xxl_file.get_tensor(key).to(loading_device)
-                    if torch.isfinite(tensor).all():
+                    if safe_isfinite_check(tensor):
                         t5xxl_state_dict[key] = tensor
                     else:
                         logger.warning(f"T5XXL tensor {key} contains invalid values, cleaning up...")
@@ -371,21 +428,21 @@ def merge_to_flux_model(
             flux_state_dict = load_file(flux_path, device=loading_device)
             # 檢查並清理基礎模型的無效值
             for key in list(flux_state_dict.keys()):
-                if not torch.isfinite(flux_state_dict[key]).all():
+                if not safe_isfinite_check(flux_state_dict[key]):
                     logger.warning(f"Base model tensor {key} contains invalid values, cleaning up...")
                     flux_state_dict[key] = torch.nan_to_num(flux_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
         if clip_l_path is not None:
             clip_l_state_dict = load_file(clip_l_path, device=loading_device)
             for key in list(clip_l_state_dict.keys()):
-                if not torch.isfinite(clip_l_state_dict[key]).all():
+                if not safe_isfinite_check(clip_l_state_dict[key]):
                     logger.warning(f"CLIP-L tensor {key} contains invalid values, cleaning up...")
                     clip_l_state_dict[key] = torch.nan_to_num(clip_l_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
         if t5xxl_path is not None:
             t5xxl_state_dict = load_file(t5xxl_path, device=loading_device)
             for key in list(t5xxl_state_dict.keys()):
-                if not torch.isfinite(t5xxl_state_dict[key]).all():
+                if not safe_isfinite_check(t5xxl_state_dict[key]):
                     logger.warning(f"T5XXL tensor {key} contains invalid values, cleaning up...")
                     t5xxl_state_dict[key] = torch.nan_to_num(t5xxl_state_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -438,32 +495,45 @@ def merge_to_flux_model(
             w2a = module_weights.get("lokr_w2_a")
             w2b = module_weights.get("lokr_w2_b")
             t2 = module_weights.get("lokr_t2")
-            alpha = module_weights.get("alpha", 1.0)
+            alpha = module_weights.get("alpha")
 
-            if isinstance(alpha, torch.Tensor):
-                alpha = alpha.item()
+            # 在 LoKr 中，alpha 可能為空或 None，此時不應該使用 alpha
+            # 而是應該從 lokr_w1 的 factor 來確定維度
+            if alpha is not None:
+                if isinstance(alpha, torch.Tensor):
+                    alpha = alpha.item()
 
-            # 檢查 alpha 值的有效性
-            if not math.isfinite(alpha):
-                logger.warning(f"Invalid alpha value for {module_name}: {alpha}, using 1.0 as fallback")
-                alpha = 1.0
+                # 檢查 alpha 值的有效性
+                if not math.isfinite(alpha):
+                    logger.warning(f"Invalid alpha value for {module_name}: {alpha}, ignoring alpha")
+                    alpha = None
+                else:
+                    # 限制 alpha 的範圍
+                    if alpha > 10000:
+                        logger.warning(f"Alpha value {alpha} is too large for {module_name}, clamping to 10000")
+                        alpha = 10000.0
+                    elif alpha < 0.001:
+                        logger.warning(f"Alpha value {alpha} is too small for {module_name}, clamping to 0.001")
+                        alpha = 0.001
+            else:
+                logger.info(f"No alpha value found for {module_name}, using factor-based approach")
 
-            # 限制 alpha 的範圍
-            if alpha > 10000:
-                logger.warning(f"Alpha value {alpha} is too large for {module_name}, clamping to 10000")
-                alpha = 10000.0
-            elif alpha < 0.001:
-                logger.warning(f"Alpha value {alpha} is too small for {module_name}, clamping to 0.001")
-                alpha = 0.001
-
-            # 確定秩
+            # 確定秩 - 在 LoKr 中優先使用 w1a 的 factor，然後是 w2a
             rank = None
             if w1a is not None:
                 rank = w1a.shape[1]
             elif w2a is not None:
                 rank = w2a.shape[1]
-            else:
+            elif w1 is not None:
+                # 如果沒有分解的權重，使用 w1 的輸出維度
+                rank = w1.shape[0]
+            elif alpha is not None:
+                # 只有在沒有其他選擇時才使用 alpha
                 rank = alpha
+            else:
+                # 如果都沒有，使用預設值
+                rank = 1
+                logger.warning(f"No rank information found for {module_name}, using default rank=1")
 
             # 重建 LoKr 權重
             try:
@@ -478,11 +548,11 @@ def merge_to_flux_model(
                 weight = state_dict[module_weight_key]
 
                 # 檢查權重的數值有效性
-                if not torch.isfinite(weight).all():
+                if not safe_isfinite_check(weight):
                     logger.warning(f"Original weight contains invalid values for {module_name}, cleaning up...")
                     weight = torch.nan_to_num(weight, nan=0.0, posinf=0.0, neginf=0.0)
 
-                if not torch.isfinite(lokr_weight).all():
+                if not safe_isfinite_check(lokr_weight):
                     logger.warning(f"LoKr weight contains invalid values for {module_name}, cleaning up...")
                     lokr_weight = torch.nan_to_num(lokr_weight, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -514,7 +584,7 @@ def merge_to_flux_model(
                     continue
 
                 # 立即進行數值清理和穩定性檢查
-                if not torch.isfinite(weight).all():
+                if not safe_isfinite_check(weight):
                     logger.warning(f"Merged weight contains invalid values for {module_name}, cleaning up...")
                     weight = torch.nan_to_num(weight, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -525,7 +595,7 @@ def merge_to_flux_model(
                     weight = torch.clamp(weight, -10000, 10000)
 
                 # 最終的數值有效性檢查
-                if not torch.isfinite(weight).all():
+                if not safe_isfinite_check(weight):
                     logger.error(f"Final weight still contains invalid values for {module_name}, using zeros as fallback")
                     weight = torch.zeros_like(weight)
 
@@ -568,39 +638,69 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
         for key in lokr_sd.keys():
             if "alpha" in key:
                 lokr_module_name = key[:key.rfind(".alpha")]
-                # 在 LoKr 中，.alpha 欄位實際儲存的是 dim 值，不是真正的 alpha
-                dim_value = float(lokr_sd[key].detach().numpy())
+                # 在 LoKr 中，.alpha 欄位可能為空或無效
+                try:
+                    alpha_tensor = lokr_sd[key]
+                    if alpha_tensor.numel() == 0:
+                        # alpha 為空，在 LoKr 中這是正常的
+                        logger.info(f"Empty alpha for {lokr_module_name}, using factor-based approach")
+                        dims[lokr_module_name] = None
+                        alphas[lokr_module_name] = None
+                        if lokr_module_name not in base_dims:
+                            base_dims[lokr_module_name] = None
+                        if lokr_module_name not in base_alphas:
+                            base_alphas[lokr_module_name] = None
+                        continue
+
+                    dim_value = float(alpha_tensor.detach().numpy())
+                except Exception as e:
+                    logger.warning(f"Error processing alpha for {lokr_module_name}: {e}, using factor-based approach")
+                    dims[lokr_module_name] = None
+                    alphas[lokr_module_name] = None
+                    if lokr_module_name not in base_dims:
+                        base_dims[lokr_module_name] = None
+                    if lokr_module_name not in base_alphas:
+                        base_alphas[lokr_module_name] = None
+                    continue
 
                 # 檢查 dim 值的有效性
                 if not math.isfinite(dim_value):
                     if math.isnan(dim_value):
-                        logger.warning(f"NaN dim value for {lokr_module_name}, using 1.0 as fallback")
-                        dim_value = 1.0
+                        logger.warning(f"NaN dim value for {lokr_module_name}, using factor-based approach")
+                        dims[lokr_module_name] = None
+                        alphas[lokr_module_name] = None
                     elif math.isinf(dim_value):
                         if dim_value > 0:
                             logger.warning(f"Positive infinity dim value for {lokr_module_name}, clamping to 10000")
-                            dim_value = 10000.0
+                            dim_value = 10000
                         else:
-                            logger.warning(f"Negative infinity dim value for {lokr_module_name}, clamping to 1.0")
-                            dim_value = 1.0
+                            logger.warning(f"Negative infinity dim value for {lokr_module_name}, using factor-based approach")
+                            dims[lokr_module_name] = None
+                            alphas[lokr_module_name] = None
                     else:
-                        logger.warning(f"Unknown invalid dim value for {lokr_module_name}: {dim_value}, using 1.0 as fallback")
-                        dim_value = 1.0
+                        logger.warning(f"Unknown invalid dim value for {lokr_module_name}: {dim_value}, using factor-based approach")
+                        dims[lokr_module_name] = None
+                        alphas[lokr_module_name] = None
+
+                    if lokr_module_name not in base_dims:
+                        base_dims[lokr_module_name] = None
+                    if lokr_module_name not in base_alphas:
+                        base_alphas[lokr_module_name] = None
+                    continue
 
                 # 限制 dim 的範圍
                 if dim_value > 10000:
                     logger.warning(f"Dim value {dim_value} is too large for {lokr_module_name}, clamping to 10000")
-                    dim_value = 10000.0
+                    dim_value = 10000
                 elif dim_value < 0.001:
-                    logger.warning(f"Dim value {dim_value} is too small for {lokr_module_name}, clamping to 0.001")
-                    dim_value = 0.001
+                    logger.warning(f"Dim value {dim_value} is too small for {lokr_module_name}, clamping to 1")
+                    dim_value = 1
 
                 dims[lokr_module_name] = dim_value
                 if lokr_module_name not in base_dims:
                     base_dims[lokr_module_name] = dim_value
 
-                # 在 LoKr 中，alpha 應該被忽略，因為 LoKr 不使用 alpha
-                # 但為了向後相容，我們將 alpha 設為 dim 值
+                # 在 LoKr 中，alpha 可能為空，此時應該使用 factor-based 方法
                 alphas[lokr_module_name] = dim_value
                 if lokr_module_name not in base_alphas:
                     base_alphas[lokr_module_name] = dim_value
@@ -608,8 +708,9 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             elif "lokr_w1" in key or "lokr_w1_a" in key:
                 if "lokr_w1_a" in key:
                     lokr_module_name = key[:key.rfind(".lokr_w1_a")]
-                    # 在 LoKr 中，這實際上是 factor 值，不是 dim
+                    # 在 LoKr 中，這實際上是 factor 值，這是 LoKr 的核心參數
                     factor = lokr_sd[key].size()[1]
+                    logger.info(f"Found LoKr factor for {lokr_module_name}: {factor}")
                     # 如果 dims 中還沒有這個模組，使用 factor 作為 dim 的預設值
                     if lokr_module_name not in dims:
                         dims[lokr_module_name] = factor
@@ -619,6 +720,7 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
                     lokr_module_name = key[:key.rfind(".lokr_w1")]
                     # 這是完整的權重矩陣，第一個維度是輸出維度
                     out_dim = lokr_sd[key].size()[0]
+                    logger.info(f"Found LoKr w1 output dim for {lokr_module_name}: {out_dim}")
                     if lokr_module_name not in dims:
                         dims[lokr_module_name] = out_dim
                         if lokr_module_name not in base_dims:
@@ -627,8 +729,11 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
         # 為沒有 dim 的模組設定預設值
         for lokr_module_name in dims.keys():
             if lokr_module_name not in alphas:
-                # 在 LoKr 中，alpha 應該被忽略，但為了向後相容，使用 dim 值
-                alpha = dims[lokr_module_name]
+                # 在 LoKr 中，如果 alpha 為 None，則使用 factor-based 方法
+                if dims[lokr_module_name] is not None:
+                    alpha = dims[lokr_module_name]
+                else:
+                    alpha = None
                 alphas[lokr_module_name] = alpha
                 if lokr_module_name not in base_alphas:
                     base_alphas[lokr_module_name] = alpha
@@ -645,7 +750,7 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             if "lokr_w1" in key and concat:
                 concat_dim = 1 if "lokr_w1_a" in key else 0
             elif "lokr_w2" in key and concat:
-                concat_dim = 0 if "lokr_w2_a" in key else 1
+                concat_dim = 1 if "lokr_w2_a" in key else 0
             else:
                 concat_dim = None
 
@@ -660,19 +765,25 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             base_alpha = base_alphas[lokr_module_name]
             alpha = alphas[lokr_module_name]
 
-            # 額外檢查 alpha 值的有效性
-            if not math.isfinite(base_alpha) or not math.isfinite(alpha):
-                logger.error(f"Invalid alpha values for {lokr_module_name}: base_alpha={base_alpha}, alpha={alpha}")
-                continue
+            # 在 LoKr 中，alpha 可能為 None，此時使用 factor-based 方法
+            if alpha is None or base_alpha is None:
+                # 使用 factor-based 方法，直接使用 ratio
+                scale = ratio
+                logger.info(f"Using factor-based scale for {lokr_module_name}: {scale}")
+            else:
+                # 額外檢查 alpha 值的有效性
+                if not math.isfinite(base_alpha) or not math.isfinite(alpha):
+                    logger.error(f"Invalid alpha values for {lokr_module_name}: base_alpha={base_alpha}, alpha={alpha}")
+                    continue
 
-            # 防止除零和極端值
-            if base_alpha == 0:
-                logger.warning(f"base_alpha is 0 for {lokr_module_name}, using 1.0 as fallback")
-                base_alpha = 1.0
+                # 防止除零和極端值
+                if base_alpha == 0:
+                    logger.warning(f"base_alpha is 0 for {lokr_module_name}, using 1.0 as fallback")
+                    base_alpha = 1.0
 
-            # 在 LoKr 中，由於 alpha 實際上是 dim 值，我們應該直接使用 ratio
-            # 不需要 sqrt(alpha / base_alpha) 的計算
-            scale = ratio
+                # 在 LoKr 中，由於 alpha 實際上是 dim 值，我們應該直接使用 ratio
+                # 不需要 sqrt(alpha / base_alpha) 的計算
+                scale = ratio
 
             # 檢查 scale 的有效性
             if not math.isfinite(scale):
@@ -693,25 +804,25 @@ def merge_lokr_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             if key in merged_sd:
                 assert (
                     merged_sd[key].size() == lokr_sd[key].size() or concat_dim is not None
-                ), "權重大小不匹配，維度可能不同"
+                ), "factor 權重大小不匹配，維度可能不同"
                 if concat_dim is not None:
                     scaled_weight = lokr_sd[key] * scale
                     # 檢查縮放後權重的有效性
-                    if not torch.isfinite(scaled_weight).all():
+                    if not safe_isfinite_check(scaled_weight):
                         logger.warning(f"Scaled weight contains invalid values for {key}, cleaning up...")
                         scaled_weight = torch.nan_to_num(scaled_weight, nan=0.0, posinf=0.0, neginf=0.0)
                     merged_sd[key] = torch.cat([merged_sd[key], scaled_weight], dim=concat_dim)
                 else:
                     scaled_weight = lokr_sd[key] * scale
                     # 檢查縮放後權重的有效性
-                    if not torch.isfinite(scaled_weight).all():
+                    if not safe_isfinite_check(scaled_weight):
                         logger.warning(f"Scaled weight contains invalid values for {key}, cleaning up...")
                         scaled_weight = torch.nan_to_num(scaled_weight, nan=0.0, posinf=0.0, neginf=0.0)
                     merged_sd[key] = merged_sd[key] + scaled_weight
             else:
                 scaled_weight = lokr_sd[key] * scale
                 # 檢查縮放後權重的有效性
-                if not torch.isfinite(scaled_weight).all():
+                if not safe_isfinite_check(scaled_weight):
                     logger.warning(f"Scaled weight contains invalid values for {key}, cleaning up...")
                     scaled_weight = torch.nan_to_num(scaled_weight, nan=0.0, posinf=0.0, neginf=0.0)
                 merged_sd[key] = scaled_weight
