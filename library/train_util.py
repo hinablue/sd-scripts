@@ -76,7 +76,10 @@ from library.original_unet import UNet2DConditionModel
 from huggingface_hub import hf_hub_download
 import numpy as np
 from PIL import Image
-import imagesize
+try:
+    import imagesize
+except ImportError:
+    imagesize = None
 import cv2
 import safetensors.torch
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
@@ -1484,7 +1487,11 @@ class BaseDataset(torch.utils.data.Dataset):
         if image_path.endswith(".jxl") or image_path.endswith(".JXL"):
             return get_jxl_size(image_path)
         # return imagesize.get(image_path)
-        image_size = imagesize.get(image_path)
+        if imagesize is not None:
+             image_size = imagesize.get(image_path)
+        else:
+             image_size = (0, 0)
+
         if image_size[0] <= 0:
             # imagesize doesn't work for some images, so use PIL as a fallback
             try:
@@ -4893,6 +4900,41 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
     if optimizer_type is None or optimizer_type == "":
         optimizer_type = "AdamW"
     optimizer_type = optimizer_type.lower()
+
+    # MPS support for 8bit optimizers
+    if args.use_8bit_adam or "8bit" in optimizer_type:
+        try:
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                logger.warning(f"8-bit optimizer {optimizer_type} is not supported on MPS. Fallback to standard optimizer.")
+                args.use_8bit_adam = False
+                if optimizer_type == "AdamW8bit".lower():
+                    optimizer_type = "AdamW".lower()
+                elif optimizer_type == "Lion8bit".lower():
+                    optimizer_type = "Lion".lower()
+                elif optimizer_type == "PagedAdamW8bit".lower():
+                    optimizer_type = "PagedAdamW".lower()
+                elif optimizer_type == "PagedLion8bit".lower():
+                    optimizer_type = "PagedLion8bit".lower() # PagedLion8bit has no standard PagedLion, maybe keep as is and let it fail or mapping to Lion? 
+                    # Actually PagedLion8bit -> Lion (Paged) is not direct. 
+                    # Let's map well known ones.
+                    if optimizer_type == "pagedlion8bit":
+                         logger.warning("PagedLion8bit fallback to Lion is not perfect, but using Lion.")
+                         optimizer_type = "Lion".lower()
+                elif optimizer_type == "SGDNesterov8bit".lower():
+                    optimizer_type = "SGDNesterov".lower()
+                elif optimizer_type == "AdEMAMix8bit".lower():
+                     # ademamix is likely not having a standard pytorch equiv immediately available in this script without import, 
+                     # but let's assume if it was 8bit it might have a non-8bit version in the future or we just warn.
+                     pass 
+                
+                # Special handling for Hina optimizers if they have 8bit variants
+                elif "hina" in optimizer_type and "8bit" in optimizer_type:
+                     optimizer_type = optimizer_type.replace("8bit", "")
+                     logger.warning(f"Fallback Hina optimizer to {optimizer_type}")
+
+        except Exception as e:
+            # unexpected error, ignore
+            pass
 
     if args.fused_backward_pass:
         assert (

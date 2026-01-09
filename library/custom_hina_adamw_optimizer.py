@@ -21,7 +21,9 @@ try:
     import bitsandbytes as bnb
     from bitsandbytes.optim import AdamW8bit
 except ImportError:
-    raise ImportError("bitsandbytes is required for this optimizer")
+    bnb = None
+    import torch.optim
+    AdamW8bit = torch.optim.Optimizer # Dummy base class used to allow import
 
 from .utils import setup_logging
 
@@ -114,6 +116,9 @@ class HinaAdamWOptimizer(AdamW8bit):
             wd_decay_factor: 權重衰減減少係數
             wd_min_ratio: 最小權重衰減比例
         """
+        if bnb is None:
+             raise ImportError("bitsandbytes is required for this optimizer")
+
         super().__init__(
             params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
             amsgrad=amsgrad, optim_bits=optim_bits, args=args,

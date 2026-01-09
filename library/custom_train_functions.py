@@ -123,7 +123,7 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--min_snr_gamma_mix_debiased",
         type=float,
         default=None,
-        help="Set % of total train steps for Debiased estimation loss / Debiased estimation lossを組み合わせる",
+        help="Set %% of total train steps for Debiased estimation loss / Debiased estimation lossを組み合わせる",
     )
     parser.add_argument(
         "--fourier_loss",

@@ -1,7 +1,14 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from bitsandbytes.optim import AdamW8bit
+try:
+    from bitsandbytes.optim import AdamW8bit
+except ImportError:
+    import torch.optim
+    AdamW8bit = torch.optim.Optimizer
+    bnb = None
+else:
+    import bitsandbytes as bnb
 from typing import Any, Dict, List, Tuple, Optional
 import math
 from collections import defaultdict
@@ -104,6 +111,10 @@ class AdaptiveHinaAdamW(AdamW8bit):
             wd_decay_factor: 權重衰減減少係數
             wd_min_ratio: 最小權重衰減比例
         """
+
+
+        if bnb is None:
+             raise ImportError("bitsandbytes is required for this optimizer")
 
         super().__init__(
             params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,

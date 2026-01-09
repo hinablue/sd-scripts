@@ -1,7 +1,14 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from bitsandbytes.optim import AdamW8bit
+try:
+    from bitsandbytes.optim import AdamW8bit
+except ImportError:
+    import torch.optim
+    AdamW8bit = torch.optim.Optimizer
+    bnb = None
+else:
+    import bitsandbytes as bnb
 from typing import Any, Dict, List, Tuple, Optional
 import math
 import array
@@ -336,6 +343,9 @@ class MemoryOptimizedAdaptiveHinaAdamW(AdamW8bit):
         max_buffer_memory_mb: int = 500,
         **kwargs
     ):
+        if bnb is None:
+             raise ImportError("bitsandbytes is required for this optimizer")
+        
         super().__init__(
             params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
             amsgrad=amsgrad, optim_bits=optim_bits, args=args,
