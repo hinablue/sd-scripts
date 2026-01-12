@@ -16,7 +16,7 @@ class Automagic_Sinkgd(torch.optim.Optimizer):
         max_lr: int = 300,
         min_lr: int = 10,
         lr_bump: int = 0,
-        use_kahan: bool = False, # [New] Kahan switch
+        use_kahan: bool = True, # [New] Kahan switch
     ):
         self.sinkgd_iters = int(sinkgd_iters)
         self.weight_decay = float(weight_decay)
