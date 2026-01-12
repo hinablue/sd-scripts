@@ -5684,15 +5684,38 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = [i for i in kwargs_handlers if i is not None]
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
+    # MPS workaround for mixed precision
+    # accelerate<1.0.0 usually crashes with "fp16 mixed precision requires a GPU" if device is mps.
+    # We workaround this by setting mixed_precision="no" for the accelerator, and then patching autocast.
+    original_mixed_precision = args.mixed_precision
+    mixed_precision_arg = args.mixed_precision
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built() and args.mixed_precision in ["fp16", "bf16"]:
+        print(f"MPS detected with mixed precision {args.mixed_precision}. Forcing mixed_precision='no' for Accelerator init to bypass validation.")
+        mixed_precision_arg = "no"
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
+        mixed_precision=mixed_precision_arg,
         log_with=log_with,
         project_dir=logging_dir,
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
         deepspeed_plugin=deepspeed_plugin,
     )
+
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built() and original_mixed_precision in ["fp16", "bf16"]:
+        import contextlib
+        print(f"Enabling naive autocast patch for MPS with {original_mixed_precision}.")
+        
+        mp_dtype = torch.float16 if original_mixed_precision == "fp16" else torch.bfloat16
+        
+        @contextlib.contextmanager
+        def mps_autocast_wrapper():
+            with torch.autocast(device_type="mps", dtype=mp_dtype):
+                yield
+        
+        # Patch the instance method
+        accelerator.autocast = mps_autocast_wrapper
     print("accelerator device:", accelerator.device)
     return accelerator
 
