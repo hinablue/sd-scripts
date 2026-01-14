@@ -469,7 +469,7 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
 
 
 def get_noisy_model_input_and_timesteps(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
+    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype, is_reg: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, _, h, w = latents.shape
     assert bsz > 0, "Batch size not large enough"
@@ -533,14 +533,45 @@ def get_noisy_model_input_and_timesteps(
 
             t[logsnr_mask2] = t_logsnr2
 
-        t_min = args.min_timestep if args.min_timestep is not None else 0
-        t_max = args.max_timestep if args.max_timestep is not None else 1000.0
-        t_min /= 1000.0
-        t_max /= 1000.0
+        # 根據 is_reg 使用不同的 timestep 範圍
+        if is_reg is not None and is_reg.any():
+            # 分別處理訓練和正則化圖像
+            train_mask = ~is_reg
+            reg_mask = is_reg
 
-        t = t * (t_max - t_min) + t_min
-        timesteps = t * 1000.0
-        timesteps += 1
+            train_t_min = args.min_timestep if args.min_timestep is not None else 0
+            train_t_max = args.max_timestep if args.max_timestep is not None else 1000.0
+            reg_t_min = args.reg_min_timestep if args.reg_min_timestep is not None else train_t_min
+            reg_t_max = args.reg_max_timestep if args.reg_max_timestep is not None else train_t_max
+
+            train_t_min /= 1000.0
+            train_t_max /= 1000.0
+            reg_t_min /= 1000.0
+            reg_t_max /= 1000.0
+
+            # 對訓練圖像應用範圍
+            t_result = torch.zeros((bsz,), device=device)
+            if train_mask.any():
+                t_train = t[train_mask] * (train_t_max - train_t_min) + train_t_min
+                t_result[train_mask] = t_train
+
+            # 對正則化圖像應用範圍
+            if reg_mask.any():
+                t_reg = t[reg_mask] * (reg_t_max - reg_t_min) + reg_t_min
+                t_result[reg_mask] = t_reg
+
+            timesteps = t_result * 1000.0
+            timesteps += 1
+        else:
+            # 原有邏輯：所有樣本使用相同的範圍
+            t_min = args.min_timestep if args.min_timestep is not None else 0
+            t_max = args.max_timestep if args.max_timestep is not None else 1000.0
+            t_min /= 1000.0
+            t_max /= 1000.0
+
+            t = t * (t_max - t_min) + t_min
+            timesteps = t * 1000.0
+            timesteps += 1
 
         sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
     else:

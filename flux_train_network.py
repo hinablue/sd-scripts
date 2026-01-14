@@ -328,9 +328,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
+        # 獲取 is_reg 信息（如果可用）
+        is_reg = batch.get("is_reg", None)
+
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, is_reg=is_reg
         )
 
         # pack latents and get img_ids

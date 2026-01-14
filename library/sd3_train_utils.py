@@ -915,7 +915,7 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
 # endregion
 
 
-def get_noisy_model_input_and_timesteps(args, latents, noise, device, dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_noisy_model_input_and_timesteps(args, latents, noise, device, dtype, is_reg: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz = latents.shape[0]
 
     # Sample a random timestep for each image
@@ -927,15 +927,39 @@ def get_noisy_model_input_and_timesteps(args, latents, noise, device, dtype) -> 
         logit_std=args.logit_std,
         mode_scale=args.mode_scale,
     )
-    t_min = args.min_timestep if args.min_timestep is not None else 0
-    t_max = args.max_timestep if args.max_timestep is not None else 1000
     shift = args.training_shift
 
     # weighting shift, value >1 will shift distribution to noisy side (focus more on overall structure), value <1 will shift towards less-noisy side (focus more on details)
     u = (u * shift) / (1 + (shift - 1) * u)
 
-    indices = (u * (t_max - t_min) + t_min).long()
-    timesteps = indices.to(device=device, dtype=dtype)
+    # 根據 is_reg 使用不同的 timestep 範圍
+    if is_reg is not None and is_reg.any():
+        # 分別處理訓練和正則化圖像
+        train_mask = ~is_reg
+        reg_mask = is_reg
+
+        train_min = args.min_timestep if args.min_timestep is not None else 0
+        train_max = args.max_timestep if args.max_timestep is not None else 1000
+        reg_min = args.reg_min_timestep if args.reg_min_timestep is not None else train_min
+        reg_max = args.reg_max_timestep if args.reg_max_timestep is not None else train_max
+
+        indices = torch.zeros((bsz,), dtype=torch.long, device=device)
+        if train_mask.any():
+            train_u = u[train_mask]
+            train_indices = (train_u * (train_max - train_min) + train_min).long()
+            indices[train_mask] = train_indices
+        if reg_mask.any():
+            reg_u = u[reg_mask]
+            reg_indices = (reg_u * (reg_max - reg_min) + reg_min).long()
+            indices[reg_mask] = reg_indices
+
+        timesteps = indices.to(device=device, dtype=dtype)
+    else:
+        # 原有邏輯：所有樣本使用相同的範圍
+        t_min = args.min_timestep if args.min_timestep is not None else 0
+        t_max = args.max_timestep if args.max_timestep is not None else 1000
+        indices = (u * (t_max - t_min) + t_min).long()
+        timesteps = indices.to(device=device, dtype=dtype)
 
     # sigmas according to flowmatching
     sigmas = timesteps / 1000

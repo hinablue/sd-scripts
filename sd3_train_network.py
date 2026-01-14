@@ -329,9 +329,12 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
 
+        # 獲取 is_reg 信息（如果可用）
+        is_reg = batch.get("is_reg", None)
+
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = sd3_train_utils.get_noisy_model_input_and_timesteps(
-            args, latents, noise, accelerator.device, weight_dtype
+            args, latents, noise, accelerator.device, weight_dtype, is_reg=is_reg
         )
 
         # ensure the hidden state will require grad

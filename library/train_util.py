@@ -1580,6 +1580,7 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         custom_attributes = []
+        is_reg_list = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1589,6 +1590,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
             # in case of fine tuning, is_reg is always False
             loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
+            is_reg_list.append(image_info.is_reg)
 
             flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
@@ -1793,6 +1795,7 @@ class BaseDataset(torch.utils.data.Dataset):
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
         example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example["is_reg"] = torch.BoolTensor(is_reg_list)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
 
@@ -4179,6 +4182,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
     )
     parser.add_argument(
+        "--reg_min_timestep",
+        type=int,
+        default=None,
+        help="set minimum time step for regularization images (0~999, default is same as min_timestep) / 正則化画像のtime stepの最小値を設定する（0~999で指定、省略時はmin_timestepと同じ）",
+    )
+    parser.add_argument(
+        "--reg_max_timestep",
+        type=int,
+        default=None,
+        help="set maximum time step for regularization images (1~1000, default is same as max_timestep) / 正則化画像のtime stepの最大値を設定する（1~1000で指定、省略時はmax_timestepと同じ）",
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="l2",
@@ -6541,21 +6556,87 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device, use_log_norm_timesteps=None, loss_type=None, global_step=None, max_train_steps=None) -> torch.Tensor:
-    if min_timestep < max_timestep:
-        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
-    else:
-        timesteps = torch.full((b_size,), max_timestep, device="cpu")
+def get_timesteps(
+    min_timestep: int,
+    max_timestep: int,
+    b_size: int,
+    device: torch.device,
+    use_log_norm_timesteps=None,
+    loss_type=None,
+    global_step=None,
+    max_train_steps=None,
+    is_reg: Optional[torch.Tensor] = None,
+    reg_min_timestep: Optional[int] = None,
+    reg_max_timestep: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Sample timesteps for a batch. If is_reg is provided, use different timestep ranges
+    for regularization images.
 
+    Args:
+        is_reg: Boolean tensor of shape (b_size,) indicating which samples are regularization images
+        reg_min_timestep: Minimum timestep for regularization images (if None, use min_timestep)
+        reg_max_timestep: Maximum timestep for regularization images (if None, use max_timestep)
+    """
+    if is_reg is not None and reg_min_timestep is not None and reg_max_timestep is not None:
+        # 為訓練圖像和正則化圖像分別生成 timesteps
+        timesteps = torch.zeros((b_size,), dtype=torch.long, device="cpu")
+
+        # 訓練圖像的 timesteps
+        train_mask = ~is_reg
+        if train_mask.any():
+            train_count = train_mask.sum().item()
+            if min_timestep < max_timestep:
+                train_timesteps = torch.randint(min_timestep, max_timestep, (train_count,), device="cpu")
+            else:
+                train_timesteps = torch.full((train_count,), max_timestep, device="cpu")
+            timesteps[train_mask] = train_timesteps
+
+        # 正則化圖像的 timesteps
+        reg_mask = is_reg
+        if reg_mask.any():
+            reg_count = reg_mask.sum().item()
+            if reg_min_timestep < reg_max_timestep:
+                reg_timesteps = torch.randint(reg_min_timestep, reg_max_timestep, (reg_count,), device="cpu")
+            else:
+                reg_timesteps = torch.full((reg_count,), reg_max_timestep, device="cpu")
+            timesteps[reg_mask] = reg_timesteps
+    else:
+        # 原有邏輯：所有樣本使用相同的範圍
+        if min_timestep < max_timestep:
+            timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+        else:
+            timesteps = torch.full((b_size,), max_timestep, device="cpu")
+
+    # 處理 log_norm_timesteps（需要分別處理訓練和正則化圖像）
     if use_log_norm_timesteps and loss_type == "l2":
         if global_step and max_train_steps:
             m = torch.distributions.LogNormal(0 + (0.65 * global_step / max_train_steps), 1)
         else:
             m = torch.distributions.LogNormal(0.65, 1)
-        timesteps = m.sample((b_size,)).to(device) * 250
-        while torch.any(timesteps > max_timestep - 1):
+
+        if is_reg is not None and reg_min_timestep is not None and reg_max_timestep is not None:
+            # 分別處理訓練和正則化圖像
+            train_mask = ~is_reg
+            reg_mask = is_reg
+
+            if train_mask.any():
+                train_timesteps_log = m.sample((train_mask.sum().item(),)).to(device) * 250
+                while torch.any(train_timesteps_log > max_timestep - 1):
+                    train_timesteps_log = m.sample((train_mask.sum().item(),)).to(device) * 250
+                timesteps[train_mask] = torch.round(train_timesteps_log).long()
+
+            if reg_mask.any():
+                reg_timesteps_log = m.sample((reg_mask.sum().item(),)).to(device) * 250
+                while torch.any(reg_timesteps_log > reg_max_timestep - 1):
+                    reg_timesteps_log = m.sample((reg_mask.sum().item(),)).to(device) * 250
+                timesteps[reg_mask] = torch.round(reg_timesteps_log).long()
+        else:
+            # 原有邏輯
             timesteps = m.sample((b_size,)).to(device) * 250
-        timesteps = torch.round(timesteps)
+            while torch.any(timesteps > max_timestep - 1):
+                timesteps = m.sample((b_size,)).to(device) * 250
+            timesteps = torch.round(timesteps)
 
     timesteps = timesteps.long().to(device)
 
@@ -6563,7 +6644,7 @@ def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: tor
 
 
 def get_noise_noisy_latents_and_timesteps(
-    args, noise_scheduler, latents: torch.FloatTensor, global_step=None
+    args, noise_scheduler, latents: torch.FloatTensor, global_step=None, is_reg: Optional[torch.Tensor] = None
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
@@ -6583,7 +6664,28 @@ def get_noise_noisy_latents_and_timesteps(
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, args.use_log_norm_timesteps, args.loss_type, global_step, args.max_train_steps)
+    # 處理正則化圖像的 timestep 範圍
+    reg_min_timestep = None
+    reg_max_timestep = None
+    if is_reg is not None and is_reg.any():
+        # 如果提供了 reg_min_timestep 或 reg_max_timestep，使用它們
+        # 否則使用與訓練圖像相同的範圍
+        reg_min_timestep = args.reg_min_timestep if args.reg_min_timestep is not None else min_timestep
+        reg_max_timestep = args.reg_max_timestep if args.reg_max_timestep is not None else max_timestep
+
+    timesteps = get_timesteps(
+        min_timestep,
+        max_timestep,
+        b_size,
+        latents.device,
+        args.use_log_norm_timesteps,
+        args.loss_type,
+        global_step,
+        args.max_train_steps,
+        is_reg=is_reg,
+        reg_min_timestep=reg_min_timestep,
+        reg_max_timestep=reg_max_timestep,
+    )
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)

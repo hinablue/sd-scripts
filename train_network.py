@@ -275,7 +275,15 @@ class NetworkTrainer:
     ):
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
-        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, global_step)
+        # 獲取 is_reg 信息（如果可用）
+        is_reg = batch.get("is_reg", None)
+        if is_reg is not None:
+            # 確保 is_reg 在 CPU 上（因為 get_timesteps 在 CPU 上生成 timesteps）
+            is_reg = is_reg.cpu()
+
+        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+            args, noise_scheduler, latents, global_step, is_reg=is_reg
+        )
 
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
@@ -1510,7 +1518,7 @@ class NetworkTrainer:
             elif accelerator.device.type == "xpu":
                 gpu_rng_state = torch.xpu.get_rng_state()
             elif accelerator.device.type == "mps":
-                gpu_rng_state = torch.cuda.get_rng_state()
+                gpu_rng_state = torch.mps.get_rng_state()
             else:
                 gpu_rng_state = None
             python_rng_state = random.getstate()
@@ -1529,7 +1537,7 @@ class NetworkTrainer:
                 elif accelerator.device.type == "xpu":
                     torch.xpu.set_rng_state(gpu_rng_state)
                 elif accelerator.device.type == "mps":
-                    torch.cuda.set_rng_state(gpu_rng_state)
+                    torch.mps.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):

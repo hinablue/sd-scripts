@@ -536,9 +536,12 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
 
+        # 獲取 is_reg 信息（如果可用）
+        is_reg = batch.get("is_reg", None)
+
         # get noisy model input and timesteps
         noisy_model_input, _, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, is_reg=is_reg
         )
         # bfloat16 is too low precision for 0-1000 TODO fix get_noisy_model_input_and_timesteps
         timesteps = (sigmas[:, 0, 0, 0] * 1000).to(torch.int64)
