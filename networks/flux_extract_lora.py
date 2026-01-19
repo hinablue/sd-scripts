@@ -140,13 +140,7 @@ def svd(
 
     if not no_metadata:
         title = os.path.splitext(os.path.basename(save_to))[0]
-<<<<<<< HEAD
         sai_metadata = sai_model_spec.build_metadata(lora_sd, False, False, False, True, False, time.time(), title, model_config={ "flux": model_type })
-=======
-        sai_metadata = sai_model_spec.build_metadata(
-            lora_sd, False, False, False, True, False, time.time(), title, model_config={"flux": "dev"}
-        )
->>>>>>> sd3
         metadata.update(sai_metadata)
 
     save_to_file(save_to, lora_sd, metadata, save_dtype)
