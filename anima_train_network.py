@@ -263,7 +263,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
-        is_train=True,
+        global_step=global_step,
+        is_train=True
     ):
         anima: anima_models.Anima = unet
 
@@ -339,6 +340,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
+        step=None,
+        global_step=None,
     ) -> torch.Tensor:
         """Override base process_batch for caption dropout with cached text encoder outputs."""
 
@@ -371,9 +374,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             is_train,
             train_text_encoder,
             train_unet,
+            step=step,
+            global_step=global_step,
         )
 
-    def post_process_loss(self, loss, args, timesteps, noise_scheduler):
+    def post_process_loss(self, loss, args, timesteps, noise_scheduler, global_step=None):
         return loss
 
     def get_sai_model_spec(self, args):
