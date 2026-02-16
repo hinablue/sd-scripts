@@ -263,7 +263,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         network,
         weight_dtype,
         train_unet,
-        global_step=global_step,
+        global_step=None,
         is_train=True
     ):
         anima: anima_models.Anima = unet
