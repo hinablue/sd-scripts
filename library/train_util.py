@@ -4974,22 +4974,22 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = ANLO
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-    elfi optimizer_type.lower().endswith("_adv") or optimizer_type.lower() == ("simplified_ademamix"):
+    elif optimizer_type.lower().endswith("_adv") or optimizer_type.lower() == ("simplified_ademamix"):
         try:
-            import Adam_Adv, Adopt_Adv, Prodigy_Adv, Simplified_AdEMAMix, Lion_Adv, Prodigy_Lion_Adv from adv_optm
+            from adv_optm import AdamW_adv, Adopt_adv, Prodigy_adv, Simplified_AdEMAMix, Lion_adv, Lion_Prodigy_adv
 
-            if optimizer_type.lower() == "adam_adv":
-                optimizer_class = Adam_Adv
+            if optimizer_type.lower() == "adamw_adv":
+                optimizer_class = AdamW_adv
             elif optimizer_type.lower() == "adopt_adv":
-                optimizer_class = Adopt_Adv
+                optimizer_class = Adopt_adv
             elif optimizer_type.lower() == "prodigy_adv":
-                optimizer_class = Prodigy_Adv
+                optimizer_class = Prodigy_adv
             elif optimizer_type.lower() == "simplified_ademamix":
                 optimizer_class = Simplified_AdEMAMix
             elif optimizer_type.lower() == "lion_adv":
-                optimizer_class = Lion_Adv
-            elif optimizer_type.lower() == "prodigy_lion_adv":
-                optimizer_class = Prodigy_Lion_Adv
+                optimizer_class = Lion_adv
+            elif optimizer_type.lower() == "lion_prodigy_adv":
+                optimizer_class = Lion_Prodigy_adv
             else:
                 raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
