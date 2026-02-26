@@ -4974,6 +4974,49 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = ANLO
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elfi optimizer_type.lower().endswith("_adv") or optimizer_type.lower() == ("simplified_ademamix"):
+        try:
+            import Adam_Adv, Adopt_Adv, Prodigy_Adv, Simplified_AdEMAMix, Lion_Adv, Prodigy_Lion_Adv from adv_optm
+
+            if optimizer_type.lower() == "adam_adv":
+                optimizer_class = Adam_Adv
+            elif optimizer_type.lower() == "adopt_adv":
+                optimizer_class = Adopt_Adv
+            elif optimizer_type.lower() == "prodigy_adv":
+                optimizer_class = Prodigy_Adv
+            elif optimizer_type.lower() == "simplified_ademamix":
+                optimizer_class = Simplified_AdEMAMix
+            elif optimizer_type.lower() == "lion_adv":
+                optimizer_class = Lion_Adv
+            elif optimizer_type.lower() == "prodigy_lion_adv":
+                optimizer_class = Prodigy_Lion_Adv
+            else:
+                raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+            if optimizer_type.lower().startswith("prodigy"):
+                actual_lr = lr
+                lr_count = 1
+                if type(trainable_params) == list and type(trainable_params[0]) == dict:
+                    lrs = set()
+                    actual_lr = trainable_params[0].get("lr", actual_lr)
+                    for group in trainable_params:
+                        lrs.add(group.get("lr", actual_lr))
+                    lr_count = len(lrs)
+
+                if actual_lr <= 0.1:
+                    logger.warning(
+                        f"learning rate is too low. If using D-Adaptation or Prodigy, set learning rate around 1.0 / 学習率が低すぎるようです。D-AdaptationまたはProdigyの使用時は1.0前後の値を指定してください: lr={actual_lr}"
+                    )
+                    logger.warning("recommend option: lr=1.0 / 推奨は1.0です")
+                if lr_count > 1:
+                    logger.warning(
+                        f"when multiple learning rates are specified with dadaptation (e.g. for Text Encoder and U-Net), only the first one will take effect / D-AdaptationまたはProdigyで複数の学習率を指定した場合（Text EncoderとU-Netなど）、最初の学習率のみが有効になります: lr={actual_lr}"
+                    )
+
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+        except ImportError:
+            raise ImportError("No adv_optm / adv_optmがインストールされていないようです")
+
     elif optimizer_type.endswith("8bit".lower()):
         try:
             import bitsandbytes as bnb
