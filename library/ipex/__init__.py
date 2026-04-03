@@ -57,7 +57,6 @@ def ipex_init(): # pylint: disable=too-many-statements
             torch.cuda.__path__ = torch.xpu.__path__
             torch.cuda.set_stream = torch.xpu.set_stream
             torch.cuda.torch = torch.xpu.torch
-            torch.cuda.Union = torch.xpu.Union
             torch.cuda.__annotations__ = torch.xpu.__annotations__
             torch.cuda.__package__ = torch.xpu.__package__
             torch.cuda.__builtins__ = torch.xpu.__builtins__
@@ -65,9 +64,7 @@ def ipex_init(): # pylint: disable=too-many-statements
             torch.cuda.StreamContext = torch.xpu.StreamContext
             torch.cuda._lazy_call = torch.xpu._lazy_call
             torch.cuda.random = torch.xpu.random
-            torch.cuda._device = torch.xpu._device
             torch.cuda.__name__ = torch.xpu.__name__
-            torch.cuda._device_t = torch.xpu._device_t
             torch.cuda.__spec__ = torch.xpu.__spec__
             torch.cuda.__file__ = torch.xpu.__file__
             # torch.cuda.is_current_stream_capturing = torch.xpu.is_current_stream_capturing
@@ -125,6 +122,11 @@ def ipex_init(): # pylint: disable=too-many-statements
             if torch_version < version.parse("2.7"):
                 torch.cuda.Tuple = torch.xpu.Tuple
                 torch.cuda.List = torch.xpu.List
+
+            if torch_version < version.parse("2.11"):
+                torch.cuda._device_t = torch.xpu._device_t
+                torch.cuda._device = torch.xpu._device
+                torch.cuda.Union = torch.xpu.Union
 
 
             # Memory:
