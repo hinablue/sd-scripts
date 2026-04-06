@@ -47,6 +47,9 @@ If you find this project helpful, please consider supporting its development via
 
 ### Change History
 
+- The following are the main changes planned for the next release. Please note that these changes may be subject to change without notice before the release.
+    - Improved compatibility with Intel GPUs. Thanks to WhitePr for [PR #2307](https://github.com/kohya-ss/sd-scripts/pull/2307).
+
 - **Version 0.10.3 (2026-04-02):**
     - Stability when training with fp16 on Anima has been further improved. See [PR #2302](https://github.com/kohya-ss/sd-scripts/pull/2302) for details. We deeply appreciate those who reported the issue.
 
