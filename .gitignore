@@ -12,3 +12,5 @@ GEMINI.md
 .gemini
 MagicMock
 .DS_Store
+.codex-tmp
+references
